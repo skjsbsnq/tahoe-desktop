@@ -99,17 +99,29 @@ pub fn region_to_non_overlapping_rects(
 
     output.clear();
 
+    // A malformed or animation-oscillated blur region can carry rects whose
+    // loc + size overflows i32 (observed via Quickshell's BackgroundEffect
+    // when a blur-region item's geometry is driven by a spring). Drop those
+    // rects entirely instead of clamping: clamping to i32::MAX produced a
+    // near-infinite rect that covered the whole screen and corrupted the
+    // blur pass (full-screen blur + shader color blowup). Dropping means
+    // the worst case is that surface losing its blur for a frame, never a
+    // global artifact. Screen coordinates are in the low thousands, so any
+    // overflow here is by definition a client bug, not legitimate geometry.
+    let checked_rects: Vec<_> = region
+        .rects
+        .iter()
+        .filter(|(_, r)| {
+            r.loc.y.checked_add(r.size.h).is_some()
+                && r.loc.x.checked_add(r.size.w).is_some()
+        })
+        .collect();
+
     // Collect all unique Y coordinates.
-    // saturating_add: a malformed or animation-oscillated blur region can
-    // carry rects whose loc.y + size.h overflows i32 (observed via
-    // Quickshell's BackgroundEffect when a blur-region item's geometry is
-    // driven by a spring). Use saturating so the compositor clamps to
-    // i32::MAX instead of panicking on debug builds / wrapping on release.
     let ys = BTreeSet::from_iter(
-        region
-            .rects
+        checked_rects
             .iter()
-            .flat_map(|(_, r)| [r.loc.y, r.loc.y.saturating_add(r.size.h)]),
+            .flat_map(|(_, r)| [r.loc.y, r.loc.y + r.size.h]),
     );
 
     let mut ys = ys.into_iter();
@@ -125,14 +137,15 @@ pub fn region_to_non_overlapping_rects(
     for hi in ys {
         spans.clear();
 
-        'region: for (kind, r) in &region.rects {
+        'region: for (kind, r) in &checked_rects {
             // Skip rects that don't overlap with the Y band.
-            if hi <= r.loc.y || r.loc.y.saturating_add(r.size.h) <= lo {
+            // Safe: overflowing rects were filtered out above.
+            if hi <= r.loc.y || r.loc.y + r.size.h <= lo {
                 continue;
             }
 
             let mut x1 = r.loc.x;
-            let mut x2 = r.loc.x.saturating_add(r.size.w);
+            let mut x2 = r.loc.x + r.size.w;
             if x1 == x2 {
                 // Empty rect.
                 continue;
