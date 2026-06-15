@@ -32,18 +32,28 @@ float value_noise(vec2 p) {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+float glass_surface_detail() {
+    float long_edge = max(max(geo_size.x, geo_size.y), 1.0);
+    float area = max(geo_size.x * geo_size.y, 1.0);
+    float long_fade = 1.0 - smoothstep(620.0, 980.0, long_edge);
+    float area_fade = 1.0 - smoothstep(180000.0, 420000.0, area);
+
+    return clamp(min(long_fade, area_fade), 0.0, 1.0);
+}
+
 float glass_rim(vec2 coords_geo) {
     vec2 coords = clamp(coords_geo, vec2(0.0), vec2(1.0));
-    vec2 edge = min(coords, vec2(1.0) - coords);
+    vec2 size = max(geo_size, vec2(1.0));
+    vec2 edge = min(coords * size, (vec2(1.0) - coords) * size);
     float edge_dist = min(edge.x, edge.y);
-    float size = max(max(geo_size.x, geo_size.y), 1.0);
-    float pixel = max(1.5 / size, 0.001);
+    float rim_width = clamp(min(size.x, size.y) * 0.12, 10.0, 34.0);
 
-    return 1.0 - smoothstep(0.01, 0.11 + pixel * 8.0, edge_dist);
+    return 1.0 - smoothstep(2.0, rim_width, edge_dist);
 }
 
 float glass_height(vec2 coords_geo) {
     vec2 coords = clamp(coords_geo, vec2(0.0), vec2(1.0));
+    float detail = glass_surface_detail();
     vec2 centered = coords * 2.0 - vec2(1.0);
     centered *= vec2(0.92, 1.08);
 
@@ -55,7 +65,7 @@ float glass_height(vec2 coords_geo) {
         value_noise(p * 0.072 + vec2(2.8, 29.4)) * 0.38 -
         0.5;
 
-    return dome * 0.38 + rim * 0.55 + turbulence * 0.10;
+    return dome * (0.18 * detail) + rim * 0.42 + turbulence * (0.035 + detail * 0.045);
 }
 
 vec3 glass_normal(vec2 coords_geo) {
@@ -63,13 +73,15 @@ vec3 glass_normal(vec2 coords_geo) {
     float h = glass_height(coords_geo);
     float hx = glass_height(coords_geo + vec2(texel.x, 0.0)) - h;
     float hy = glass_height(coords_geo + vec2(0.0, texel.y)) - h;
-    vec2 gradient = vec2(hx / texel.x, hy / texel.y);
+    vec2 gradient = vec2(hx, hy);
 
-    return normalize(vec3(-gradient * 0.045, 1.0));
+    return normalize(vec3(-gradient * 10.0, 1.0));
 }
 
 float glass_light_strength(vec2 coords_geo) {
     vec2 coords = clamp(coords_geo, vec2(0.0), vec2(1.0));
+    vec2 size = max(geo_size, vec2(1.0));
+    float detail = glass_surface_detail();
     vec3 normal = glass_normal(coords);
     vec3 light_dir = normalize(vec3(-0.55, -0.72, 0.86));
     vec3 half_dir = normalize(light_dir + vec3(0.0, 0.0, 1.0));
@@ -77,21 +89,21 @@ float glass_light_strength(vec2 coords_geo) {
     float rim = glass_rim(coords);
     float diffuse = max(dot(normal, light_dir), 0.0);
     float specular = pow(max(dot(normal, half_dir), 0.0), 42.0);
-    float top_light = 1.0 - smoothstep(0.0, 0.42, coords.y);
-    float left_light = 1.0 - smoothstep(0.0, 0.34, coords.x);
+    float top_light = 1.0 - smoothstep(0.0, min(size.y * 0.42, 150.0), coords.y * size.y);
+    float left_light = 1.0 - smoothstep(0.0, min(size.x * 0.34, 140.0), coords.x * size.x);
     float caustic = smoothstep(
         0.48,
         1.0,
-        value_noise(coords * max(geo_size, vec2(1.0)) * 0.026 + vec2(8.3, 17.1))
+        value_noise(coords * size * 0.026 + vec2(8.3, 17.1))
     );
 
     return clamp(
-        rim * 0.40 +
-        diffuse * 0.24 +
-        specular * 0.72 +
-        top_light * 0.10 +
-        left_light * 0.06 +
-        caustic * rim * 0.14,
+        rim * 0.34 +
+        diffuse * (0.16 + detail * 0.08) +
+        specular * (0.42 * detail) +
+        top_light * 0.08 +
+        left_light * 0.04 +
+        caustic * rim * (0.08 + detail * 0.04),
         0.0,
         1.0
     );
@@ -111,8 +123,10 @@ vec2 niri_refraction_offset(vec2 coords_geo) {
         value_noise(p * 0.044 + vec2(3.1, 9.7)) - 0.5,
         value_noise(p * 0.044 + vec2(21.4, 6.2)) - 0.5
     );
+    float detail = glass_surface_detail();
+    float amount_scale = 0.35 + detail * 0.65;
 
-    return (normal.xy * (0.55 + rim * 1.45) + turbulence * (0.18 + rim * 0.26)) * amount;
+    return (normal.xy * (0.55 + rim * 1.45) + turbulence * (0.18 + rim * 0.26)) * amount * amount_scale;
 }
 
 vec4 postprocess(vec4 color, vec2 coords_geo) {

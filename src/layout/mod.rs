@@ -5127,10 +5127,10 @@ impl<W: LayoutElement> Layout<W> {
 
         if alpha > 0.08 && !self.options.blur.off {
             let glass = GlassOptions {
-                tint_color: [0.86, 0.94, 1., 1.],
-                tint_amount: 0.12 * alpha,
-                edge_highlight: 0.46 * alpha,
-                refraction: 0.05 * alpha,
+                tint_color: [1., 1., 1., 1.],
+                tint_amount: 0.10 * alpha,
+                edge_highlight: 0.20 * alpha,
+                refraction: 0.006 * alpha,
             };
             let params = RenderParams {
                 geometry: rect,
