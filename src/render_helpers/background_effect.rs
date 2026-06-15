@@ -292,17 +292,12 @@ fn render_params_for_tile(
                 surface_geo.loc += geometry.loc;
 
                 if client_blur_region_geometry == ClientBlurRegionGeometry::BoundingBox {
-                    let mut bbox = blur_region_bounding_box(&rects)?
-                        .to_f64()
-                        .upscale(surface_anim_scale);
-                    bbox.loc += surface_geo.loc;
-
-                    // Malformed clients may send rectangles outside their surface. Clamp the
-                    // transition geometry to the actual surface rather than letting an oversized
-                    // region affect the whole output.
-                    let bbox = bbox.intersection(surface_geo)?;
-                    let bbox = bbox.to_physical_precise_round(scale).to_logical(scale);
-
+                    let bbox = transformed_blur_region_bounding_box(
+                        &rects,
+                        surface_geo,
+                        surface_anim_scale,
+                        scale,
+                    )?;
                     effect_geometry = bbox;
                     clip_geometry = bbox;
                     clip = true;
@@ -333,6 +328,71 @@ fn render_params_for_tile(
     })
 }
 
+fn transformed_blur_region_bounding_box(
+    rects: &[Rectangle<i32, Logical>],
+    surface_geo: Rectangle<f64, Logical>,
+    surface_anim_scale: Scale<f64>,
+    scale: f64,
+) -> Option<Rectangle<f64, Logical>> {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut any = false;
+
+    for rect in rects {
+        if rect.is_empty() {
+            continue;
+        }
+
+        let Some(x2) = rect.loc.x.checked_add(rect.size.w) else {
+            continue;
+        };
+        let Some(y2) = rect.loc.y.checked_add(rect.size.h) else {
+            continue;
+        };
+
+        if x2 <= rect.loc.x || y2 <= rect.loc.y {
+            continue;
+        }
+
+        let mut a = rect.loc.to_f64();
+        let mut b = Point::new(x2, y2).to_f64();
+
+        a = a.upscale(surface_anim_scale);
+        b = b.upscale(surface_anim_scale);
+
+        a += surface_geo.loc;
+        b += surface_geo.loc;
+
+        let rect = Rectangle::from_extremities(a, b);
+        let Some(rect) = rect.intersection(surface_geo) else {
+            continue;
+        };
+
+        if rect.is_empty() {
+            continue;
+        }
+
+        let x2 = rect.loc.x + rect.size.w;
+        let y2 = rect.loc.y + rect.size.h;
+
+        min_x = min_x.min(rect.loc.x);
+        min_y = min_y.min(rect.loc.y);
+        max_x = max_x.max(x2);
+        max_y = max_y.max(y2);
+        any = true;
+    }
+
+    if !any {
+        return None;
+    }
+
+    let bbox = Rectangle::from_extremities(Point::new(min_x, min_y), Point::new(max_x, max_y));
+    Some(bbox.to_physical_precise_round(scale).to_logical(scale))
+}
+
+#[cfg(test)]
 fn blur_region_bounding_box(rects: &[Rectangle<i32, Logical>]) -> Option<Rectangle<i32, Logical>> {
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
@@ -449,8 +509,8 @@ pub fn render_for_tile(
 
 #[cfg(test)]
 mod tests {
-    use super::blur_region_bounding_box;
-    use smithay::utils::{Logical, Point, Rectangle, Size};
+    use super::{blur_region_bounding_box, transformed_blur_region_bounding_box};
+    use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
     #[test]
     fn blur_region_bbox_ignores_empty_and_overflowing_rects() {
@@ -474,5 +534,35 @@ mod tests {
         ];
 
         assert!(blur_region_bounding_box(&rects).is_none());
+    }
+
+    #[test]
+    fn transformed_blur_region_bbox_ignores_rects_outside_surface() {
+        let rects: Vec<Rectangle<i32, Logical>> = vec![
+            Rectangle::new(Point::new(50, 40), Size::new(20, 10)),
+            Rectangle::new(Point::new(10_000, 40), Size::new(20, 10)),
+        ];
+        let surface_geo = Rectangle::new(Point::new(0., 0.), Size::new(200., 100.));
+
+        let bbox =
+            transformed_blur_region_bounding_box(&rects, surface_geo, Scale::from(1.), 1.).unwrap();
+
+        assert_eq!(bbox.loc, Point::new(50., 40.));
+        assert_eq!(bbox.size, Size::new(20., 10.));
+    }
+
+    #[test]
+    fn transformed_blur_region_bbox_clamps_partially_outside_rects() {
+        let rects: Vec<Rectangle<i32, Logical>> = vec![
+            Rectangle::new(Point::new(180, 80), Size::new(50, 40)),
+            Rectangle::new(Point::new(i32::MAX - 1, 0), Size::new(8, 8)),
+        ];
+        let surface_geo = Rectangle::new(Point::new(10., 20.), Size::new(200., 100.));
+
+        let bbox =
+            transformed_blur_region_bounding_box(&rects, surface_geo, Scale::from(1.), 1.).unwrap();
+
+        assert_eq!(bbox.loc, Point::new(190., 100.));
+        assert_eq!(bbox.size, Size::new(20., 20.));
     }
 }
