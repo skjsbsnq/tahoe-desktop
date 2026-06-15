@@ -39,7 +39,8 @@ use std::time::Duration;
 use monitor::{InsertHint, InsertPosition, InsertWorkspace, MonitorAddWindowTarget};
 use niri_config::utils::MergeWith as _;
 use niri_config::{
-    Config, CornerRadius, LayoutPart, PresetSize, Workspace as WorkspaceConfig, WorkspaceReference,
+    Color, Config, CornerRadius, GradientInterpolation, LayoutPart, PresetSize,
+    Workspace as WorkspaceConfig, WorkspaceReference,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
@@ -60,7 +61,12 @@ use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
 use crate::niri_render_elements;
-use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::background_effect::{
+    BackgroundEffectElement, GlassOptions, RenderParams,
+};
+use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::border::BorderRenderElement;
+use crate::render_helpers::framebuffer_effect::FramebufferEffect;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
@@ -116,6 +122,16 @@ niri_render_elements! {
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
         BackgroundEffect = BackgroundEffectElement,
+    }
+}
+
+// Snap preview is compositor UI, not a real layout element. Keep it separate
+// from window/tile render elements while still reusing existing shaders.
+niri_render_elements! {
+    SnapPreviewRenderElement => {
+        BackgroundEffect = BackgroundEffectElement,
+        Border = BorderRenderElement,
+        SolidColor = SolidColorRenderElement,
     }
 }
 
@@ -503,6 +519,7 @@ struct SnapPreviewState {
     target: Option<SnapTarget>,
     render_target: Option<SnapTarget>,
     opacity: Animation,
+    effect: FramebufferEffect,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -643,6 +660,7 @@ impl SnapPreviewState {
             target: None,
             render_target: None,
             opacity: Animation::new(clock, 0., 0., 0., niri_config::Animation::new_off()),
+            effect: FramebufferEffect::new(),
         }
     }
 
@@ -666,9 +684,15 @@ impl SnapPreviewState {
         } else {
             self.opacity = Animation::new(clock, current, 0., 0., hide_config);
         }
+
+        self.effect.damage();
     }
 
     fn advance_animations(&mut self) {
+        if self.render_target.is_some() && !self.opacity.is_done() {
+            self.effect.damage();
+        }
+
         if self.target.is_none() && self.opacity.is_done() {
             self.render_target = None;
         }
@@ -5070,7 +5094,7 @@ impl<W: LayoutElement> Layout<W> {
     pub fn render_snap_preview_for_output(
         &self,
         output: &Output,
-        push: &mut dyn FnMut(SolidColorRenderElement),
+        push: &mut dyn FnMut(SnapPreviewRenderElement),
     ) {
         let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move else {
             return;
@@ -5091,44 +5115,90 @@ impl<W: LayoutElement> Layout<W> {
 
         let config = self.options.layout.snap_assist;
         let mut rect = target.rect;
-        let margin = 8_f64.min(rect.size.w / 4.).min(rect.size.h / 4.);
+        let margin = 10_f64.min(rect.size.w / 4.).min(rect.size.h / 4.);
         rect.loc.x += margin;
         rect.loc.y += margin;
         rect.size.w = (rect.size.w - margin * 2.).max(1.);
         rect.size.h = (rect.size.h - margin * 2.).max(1.);
 
-        let fill = SolidColorBuffer::new(rect.size, config.preview_color * alpha);
-        push(SolidColorRenderElement::from_buffer(
-            &fill,
-            rect.loc,
+        let scale = move_.output.current_scale().fractional_scale();
+        let radius = CornerRadius::from(15.).fit_to(rect.size.w as f32, rect.size.h as f32);
+        let local_rect = Rectangle::from_size(rect.size);
+
+        if alpha > 0.08 && !self.options.blur.off {
+            let glass = GlassOptions {
+                tint_color: [0.86, 0.94, 1., 1.],
+                tint_amount: 0.12 * alpha,
+                edge_highlight: 0.46 * alpha,
+                refraction: 0.05 * alpha,
+            };
+            let params = RenderParams {
+                geometry: rect,
+                subregion: None,
+                clip: Some((rect, radius)),
+                scale,
+            };
+            let elem = move_.snap_preview.effect.render(
+                None,
+                params,
+                Some(BlurOptions::from(self.options.blur)),
+                0.018 * alpha,
+                1.12,
+                glass,
+            );
+            push(BackgroundEffectElement::from(elem).into());
+        }
+
+        let fill = BorderRenderElement::new(
+            rect.size,
+            local_rect,
+            GradientInterpolation::default(),
+            Color::new_unpremul(1., 1., 1., 0.22 * alpha),
+            config.preview_color * (0.62 * alpha),
+            120_f32.to_radians(),
+            local_rect,
+            0.,
+            radius,
+            scale as f32,
             1.,
-            Kind::Unspecified,
-        ));
+        )
+        .with_location(rect.loc);
+        push(fill.into());
 
-        let border_width = 2.;
-        let border_color = config.preview_border_color * alpha;
-        let border_rects = [
-            Rectangle::new(rect.loc, Size::from((rect.size.w, border_width))),
-            Rectangle::new(
-                Point::from((rect.loc.x, rect.loc.y + rect.size.h - border_width)),
-                Size::from((rect.size.w, border_width)),
-            ),
-            Rectangle::new(rect.loc, Size::from((border_width, rect.size.h))),
-            Rectangle::new(
-                Point::from((rect.loc.x + rect.size.w - border_width, rect.loc.y)),
-                Size::from((border_width, rect.size.h)),
-            ),
-        ];
+        let border = BorderRenderElement::new(
+            rect.size,
+            local_rect,
+            GradientInterpolation::default(),
+            Color::new_unpremul(1., 1., 1., 0.72 * alpha),
+            config.preview_border_color * alpha,
+            115_f32.to_radians(),
+            local_rect,
+            1.5,
+            radius,
+            scale as f32,
+            1.,
+        )
+        .with_location(rect.loc);
+        push(border.into());
 
-        for border in border_rects {
-            let buffer = SolidColorBuffer::new(border.size, border_color);
-            push(SolidColorRenderElement::from_buffer(
-                &buffer,
-                border.loc,
+        let highlight_margin = 18_f64.min(rect.size.w / 4.);
+        let highlight_rect = Rectangle::new(
+            Point::from((rect.loc.x + highlight_margin, rect.loc.y + 1.5)),
+            Size::from(((rect.size.w - highlight_margin * 2.).max(1.), 1.)),
+        );
+        let highlight = SolidColorBuffer::new(
+            highlight_rect.size,
+            Color::new_unpremul(1., 1., 1., 0.52 * alpha),
+        );
+        push(
+            SolidColorRenderElement::from_buffer(
+                &highlight,
+                highlight_rect.loc,
                 1.,
                 Kind::Unspecified,
-            ));
-        }
+            )
+            .into(),
+        );
     }
 
     pub fn refresh(&mut self, is_active: bool) {
