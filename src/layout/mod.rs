@@ -5131,6 +5131,9 @@ impl<W: LayoutElement> Layout<W> {
                 tint_amount: 0.10 * alpha,
                 edge_highlight: 0.20 * alpha,
                 refraction: 0.006 * alpha,
+                inner_shadow: 0.10 * alpha,
+                chromatic: 0.0,
+                lens_depth: 0.03 * alpha,
             };
             let params = RenderParams {
                 geometry: rect,

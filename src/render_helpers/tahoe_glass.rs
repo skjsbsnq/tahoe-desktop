@@ -188,6 +188,20 @@ fn render_region(
         effect.blur = Some(false);
     }
 
+    // Compositor-side material easing: a per-region interaction scalar in
+    // [0, 1] pushes the glass beyond its rest values. We scale the
+    // highlight/refraction/inner-shadow/lens params so hover/press/enter states
+    // intensify the glass without any shader or region-geometry change.
+    let interaction = region.interaction as f64;
+    if interaction > 0.0 {
+        let boost = |v: Option<f64>| v.map(|x| x * (1.0 + interaction));
+        effect.edge_highlight = boost(effect.edge_highlight);
+        effect.refraction = boost(effect.refraction);
+        effect.inner_shadow = boost(effect.inner_shadow);
+        effect.chromatic = boost(effect.chromatic);
+        effect.lens_depth = boost(effect.lens_depth);
+    }
+
     renderer.background_effect.update_config(blur_config);
     renderer
         .background_effect

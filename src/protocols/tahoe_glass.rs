@@ -13,7 +13,7 @@ use super::raw::tahoe_glass::v1::server::tahoe_glass_surface_v1::{self, TahoeGla
 use crate::niri::State;
 use crate::utils::surface_geo;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 pub const MAX_REGIONS_PER_SURFACE: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,9 @@ pub struct TahoeGlassRegion {
     pub radius: CornerRadius,
     pub material: String,
     pub flags: TahoeGlassFlags,
+    /// Per-region interaction scalar in [0, 1] that drives compositor-side
+    /// material easing (higher highlight/refraction/inner shadow). 0 = at rest.
+    pub interaction: f32,
 }
 
 pub struct TahoeGlassSurfaceUserData {
@@ -214,6 +217,7 @@ fn make_region(
     radius_bl: i32,
     material: String,
     flags: u32,
+    interaction: f64,
 ) -> Option<TahoeGlassRegion> {
     if width <= 0 || height <= 0 {
         return None;
@@ -237,6 +241,7 @@ fn make_region(
             material
         },
         flags: TahoeGlassFlags::from_bits(flags),
+        interaction: interaction.clamp(0., 1.) as f32,
     })
 }
 
@@ -325,10 +330,11 @@ where
                 radius_bl,
                 material,
                 flags,
+                interaction,
             } => {
                 let Some(region) = make_region(
                     id, x, y, width, height, radius_tl, radius_tr, radius_br, radius_bl, material,
-                    flags,
+                    flags, interaction,
                 ) else {
                     debug!(surface = %data.surface.id(), id, "discarding invalid Tahoe glass region");
                     return;

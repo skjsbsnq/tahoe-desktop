@@ -101,7 +101,7 @@ impl FramebufferEffectElement {
         &self,
         crop: Rectangle<f64, Logical>,
         transform: Transform,
-    ) -> [Uniform<'static>; 11] {
+    ) -> [Uniform<'static>; 14] {
         let offset = crop.loc - (self.clip_geo.loc - self.geometry.loc);
         let offset = Vec2::new(offset.x as f32, offset.y as f32);
         let crop_size = Vec2::new(crop.size.w as f32, crop.size.h as f32);
@@ -131,6 +131,9 @@ impl FramebufferEffectElement {
             Uniform::new("tint_amount", self.glass.tint_amount),
             Uniform::new("edge_highlight", self.glass.edge_highlight),
             Uniform::new("refraction", self.glass.refraction),
+            Uniform::new("inner_shadow", self.glass.inner_shadow),
+            Uniform::new("chromatic", self.glass.chromatic),
+            Uniform::new("lens_depth", self.glass.lens_depth),
         ]
     }
 }

@@ -1427,6 +1427,22 @@ mod tests {
                         },
                     ),
                 },
+                snap_assist: SnapAssist {
+                    off: true,
+                    threshold: 36.0,
+                    preview_color: Color {
+                        r: 0.47058824,
+                        g: 0.74509805,
+                        b: 1.0,
+                        a: 0.2509804,
+                    },
+                    preview_border_color: Color {
+                        r: 0.47058824,
+                        g: 0.74509805,
+                        b: 1.0,
+                        a: 0.7058824,
+                    },
+                },
                 preset_column_widths: [
                     Proportion(
                         0.25,
@@ -1668,7 +1684,9 @@ mod tests {
                 materials: {
                     "backdrop": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
-                            xray: None,
+                            xray: Some(
+                                false,
+                            ),
                             blur: Some(
                                 true,
                             ),
@@ -1693,6 +1711,15 @@ mod tests {
                                 0.0,
                             ),
                             refraction: Some(
+                                0.0,
+                            ),
+                            inner_shadow: Some(
+                                0.0,
+                            ),
+                            chromatic: Some(
+                                0.0,
+                            ),
+                            lens_depth: Some(
                                 0.0,
                             ),
                         },
@@ -1720,7 +1747,9 @@ mod tests {
                     },
                     "dock": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
-                            xray: None,
+                            xray: Some(
+                                false,
+                            ),
                             blur: Some(
                                 true,
                             ),
@@ -1745,6 +1774,15 @@ mod tests {
                                 0.0,
                             ),
                             refraction: Some(
+                                0.0,
+                            ),
+                            inner_shadow: Some(
+                                0.0,
+                            ),
+                            chromatic: Some(
+                                0.0,
+                            ),
+                            lens_depth: Some(
                                 0.0,
                             ),
                         },
@@ -1772,7 +1810,9 @@ mod tests {
                     },
                     "menu": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
-                            xray: None,
+                            xray: Some(
+                                false,
+                            ),
                             blur: Some(
                                 true,
                             ),
@@ -1797,6 +1837,15 @@ mod tests {
                                 0.0,
                             ),
                             refraction: Some(
+                                0.0,
+                            ),
+                            inner_shadow: Some(
+                                0.0,
+                            ),
+                            chromatic: Some(
+                                0.0,
+                            ),
+                            lens_depth: Some(
                                 0.0,
                             ),
                         },
@@ -1824,7 +1873,9 @@ mod tests {
                     },
                     "panel": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
-                            xray: None,
+                            xray: Some(
+                                false,
+                            ),
                             blur: Some(
                                 true,
                             ),
@@ -1849,6 +1900,15 @@ mod tests {
                                 0.0,
                             ),
                             refraction: Some(
+                                0.0,
+                            ),
+                            inner_shadow: Some(
+                                0.0,
+                            ),
+                            chromatic: Some(
+                                0.0,
+                            ),
+                            lens_depth: Some(
                                 0.0,
                             ),
                         },
@@ -1876,7 +1936,9 @@ mod tests {
                     },
                     "pill": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
-                            xray: None,
+                            xray: Some(
+                                false,
+                            ),
                             blur: Some(
                                 true,
                             ),
@@ -1901,6 +1963,15 @@ mod tests {
                                 0.0,
                             ),
                             refraction: Some(
+                                0.0,
+                            ),
+                            inner_shadow: Some(
+                                0.0,
+                            ),
+                            chromatic: Some(
+                                0.0,
+                            ),
+                            lens_depth: Some(
                                 0.0,
                             ),
                         },
@@ -1928,7 +1999,9 @@ mod tests {
                     },
                     "toast": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
-                            xray: None,
+                            xray: Some(
+                                false,
+                            ),
                             blur: Some(
                                 true,
                             ),
@@ -1953,6 +2026,15 @@ mod tests {
                                 0.0,
                             ),
                             refraction: Some(
+                                0.0,
+                            ),
+                            inner_shadow: Some(
+                                0.0,
+                            ),
+                            chromatic: Some(
+                                0.0,
+                            ),
+                            lens_depth: Some(
                                 0.0,
                             ),
                         },
@@ -2218,6 +2300,9 @@ mod tests {
                         tint_amount: None,
                         edge_highlight: None,
                         refraction: None,
+                        inner_shadow: None,
+                        chromatic: None,
+                        lens_depth: None,
                     },
                     popups: PopupsRule {
                         opacity: None,
@@ -2231,6 +2316,9 @@ mod tests {
                             tint_amount: None,
                             edge_highlight: None,
                             refraction: None,
+                            inner_shadow: None,
+                            chromatic: None,
+                            lens_depth: None,
                         },
                     },
                 },
@@ -2277,6 +2365,9 @@ mod tests {
                         tint_amount: None,
                         edge_highlight: None,
                         refraction: None,
+                        inner_shadow: None,
+                        chromatic: None,
+                        lens_depth: None,
                     },
                     popups: PopupsRule {
                         opacity: None,
@@ -2290,6 +2381,9 @@ mod tests {
                             tint_amount: None,
                             edge_highlight: None,
                             refraction: None,
+                            inner_shadow: None,
+                            chromatic: None,
+                            lens_depth: None,
                         },
                     },
                 },

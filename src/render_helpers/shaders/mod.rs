@@ -110,6 +110,7 @@ impl Shaders {
                 concat!(
                     include_str!("clipped_surface.frag"),
                     include_str!("rounding_alpha.frag"),
+                    include_str!("rounded_rect_sdf.frag"),
                     include_str!("postprocess.frag"),
                 ),
                 &[
@@ -124,6 +125,9 @@ impl Shaders {
                     UniformName::new("tint_amount", UniformType::_1f),
                     UniformName::new("edge_highlight", UniformType::_1f),
                     UniformName::new("refraction", UniformType::_1f),
+                    UniformName::new("inner_shadow", UniformType::_1f),
+                    UniformName::new("chromatic", UniformType::_1f),
+                    UniformName::new("lens_depth", UniformType::_1f),
                 ],
             )
             .map_err(|err| {

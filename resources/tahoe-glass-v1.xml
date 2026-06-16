@@ -36,7 +36,7 @@
     </request>
   </interface>
 
-  <interface name="tahoe_glass_surface_v1" version="1">
+  <interface name="tahoe_glass_surface_v1" version="2">
     <description summary="per-surface Tahoe glass regions">
       Regions are double-buffered and committed with the associated wl_surface.
       Region coordinates are surface-local logical coordinates.
@@ -60,6 +60,10 @@
       <description summary="set or update a rounded glass region">
         If a region with the same id already exists, it is replaced. Otherwise
         a new region is appended, up to the compositor limit.
+
+        The interaction scalar (0..1) drives compositor-side material easing so
+        a region can intensify its glass (higher highlight, refraction, inner
+        shadow) during hover, press, or enter animations. 0 means at rest.
       </description>
       <arg name="id" type="uint"/>
       <arg name="x" type="int"/>
@@ -72,6 +76,7 @@
       <arg name="radius_bl" type="int"/>
       <arg name="material" type="string"/>
       <arg name="flags" type="uint"/>
+      <arg name="interaction" type="fixed" summary="0..1 interaction scalar; 0=rest"/>
     </request>
 
     <request name="remove_region">

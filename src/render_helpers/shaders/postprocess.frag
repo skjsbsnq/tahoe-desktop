@@ -5,6 +5,9 @@ uniform vec4 tint_color;
 uniform float tint_amount;
 uniform float edge_highlight;
 uniform float refraction;
+uniform float inner_shadow;
+uniform float chromatic;
+uniform float lens_depth;
 
 // Sin-less white noise by David Hoskins (MIT License).
 // https://www.shadertoy.com/view/4djSRW
@@ -41,11 +44,17 @@ float glass_surface_detail() {
     return clamp(min(long_fade, area_fade), 0.0, 1.0);
 }
 
+// Distance from the pixel to the rounded-rect edge, in geometry-space pixels.
+// Positive inside, negative outside. Uses the SDF so the edge band follows the
+// rounded corners instead of the bounding rectangle.
+float glass_edge_distance(vec2 coords_geo) {
+    vec2 p = clamp(coords_geo, vec2(0.0), vec2(1.0)) * geo_size;
+    return -niri_sd_rounded_rect(p, geo_size, corner_radius);
+}
+
 float glass_rim(vec2 coords_geo) {
-    vec2 coords = clamp(coords_geo, vec2(0.0), vec2(1.0));
     vec2 size = max(geo_size, vec2(1.0));
-    vec2 edge = min(coords * size, (vec2(1.0) - coords) * size);
-    float edge_dist = min(edge.x, edge.y);
+    float edge_dist = glass_edge_distance(coords_geo);
     float rim_width = clamp(min(size.x, size.y) * 0.12, 10.0, 34.0);
 
     return 1.0 - smoothstep(2.0, rim_width, edge_dist);
@@ -109,9 +118,33 @@ float glass_light_strength(vec2 coords_geo) {
     );
 }
 
+// Bottom-right inner shadow: darker where the SDF outward normal points away
+// from a bottom-right light, concentrated in the inner edge band. Driven by the
+// `inner_shadow` material parameter.
+float glass_inner_shadow(vec2 coords_geo) {
+    vec2 coords = clamp(coords_geo, vec2(0.0), vec2(1.0));
+    vec2 p = coords * geo_size;
+    vec2 grad = niri_sd_rounded_rect_grad(p, geo_size, corner_radius);
+    // Light comes from the bottom-right, so the inner top-left side of the band
+    // (outward normal pointing up-left) darkens.
+    vec3 light_dir = normalize(vec3(0.6, 0.7, 0.7));
+    float facing = clamp(-dot(vec3(grad, 0.0), light_dir), 0.0, 1.0);
+    float edge_dist = glass_edge_distance(coords);
+    float band = 1.0 - smoothstep(0.0, 26.0, edge_dist);
+
+    return facing * band;
+}
+
+// Circular ease: 0 at the deep interior edge of the rim band, 1 at the very
+// rim, matching the reference lens shader.
+float glass_circle_map(float x) {
+    return 1.0 - sqrt(clamp(1.0 - x * x, 0.0, 1.0));
+}
+
 vec2 niri_refraction_offset(vec2 coords_geo) {
     float amount = clamp(refraction, 0.0, 0.12);
-    if (amount <= 0.0) {
+    float lens = clamp(lens_depth, 0.0, 0.3);
+    if (amount <= 0.0 && lens <= 0.0) {
         return vec2(0.0);
     }
 
@@ -126,7 +159,20 @@ vec2 niri_refraction_offset(vec2 coords_geo) {
     float detail = glass_surface_detail();
     float amount_scale = 0.35 + detail * 0.65;
 
-    return (normal.xy * (0.55 + rim * 1.45) + turbulence * (0.18 + rim * 0.26)) * amount * amount_scale;
+    vec2 offset = (normal.xy * (0.55 + rim * 1.45) + turbulence * (0.18 + rim * 0.26))
+        * amount * amount_scale;
+
+    // Center radial lensing: a gentle bulge toward the middle, strongest away
+    // from the edges. `lens_depth` drives it; it fades out on large surfaces.
+    if (lens > 0.0) {
+        vec2 half_size = max(geo_size, vec2(1.0)) * 0.5;
+        vec2 centered = p - half_size;
+        float edge_dist = glass_edge_distance(coords);
+        float bulge = glass_circle_map(clamp(edge_dist / max(half_size.x, half_size.y), 0.0, 1.0));
+        offset += normalize(centered + 0.00001) * lens * bulge * (0.4 + detail * 0.6);
+    }
+
+    return offset;
 }
 
 vec4 postprocess(vec4 color, vec2 coords_geo) {
@@ -150,6 +196,11 @@ vec4 postprocess(vec4 color, vec2 coords_geo) {
     float highlight = glass_light_strength(coords_geo) * clamp(edge_highlight, 0.0, 2.0);
     if (highlight > 0.0) {
         color.rgb += vec3(highlight * color.a * 0.28);
+    }
+
+    float inner = glass_inner_shadow(coords_geo) * clamp(inner_shadow, 0.0, 0.5);
+    if (inner > 0.0) {
+        color.rgb *= 1.0 - inner * 0.5;
     }
 
     return color;

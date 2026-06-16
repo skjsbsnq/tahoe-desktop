@@ -48,6 +48,12 @@ pub struct TahoeGlassMaterialRule {
     pub edge_highlight: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub refraction: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub inner_shadow: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub chromatic: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub lens_depth: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, default)]
     pub shadow: ShadowRule,
 }
@@ -104,6 +110,9 @@ impl Default for TahoeGlassMaterial {
                 tint_amount: Some(0.04),
                 edge_highlight: Some(0.),
                 refraction: Some(0.),
+                inner_shadow: Some(0.),
+                chromatic: Some(0.),
+                lens_depth: Some(0.),
                 ..Default::default()
             },
             shadow: Shadow {
@@ -151,6 +160,9 @@ impl MergeWith<TahoeGlassMaterialRule> for TahoeGlassMaterial {
             tint_amount: part.tint_amount,
             edge_highlight: part.edge_highlight,
             refraction: part.refraction,
+            inner_shadow: part.inner_shadow,
+            chromatic: part.chromatic,
+            lens_depth: part.lens_depth,
         });
         self.shadow.merge_with(&part.shadow);
     }
@@ -175,6 +187,9 @@ mod tests {
                     tint-amount 0.04
                     edge-highlight 0.01
                     refraction 0.002
+                    inner-shadow 0.12
+                    chromatic 0.006
+                    lens-depth 0.04
 
                     shadow {
                         on
@@ -195,6 +210,9 @@ mod tests {
         assert_eq!(material.background_effect.noise, Some(0.006));
         assert_eq!(material.background_effect.edge_highlight, Some(0.01));
         assert_eq!(material.background_effect.refraction, Some(0.002));
+        assert_eq!(material.background_effect.inner_shadow, Some(0.12));
+        assert_eq!(material.background_effect.chromatic, Some(0.006));
+        assert_eq!(material.background_effect.lens_depth, Some(0.04));
         assert!(material.shadow.on);
         assert_eq!(material.shadow.softness, 28.);
     }

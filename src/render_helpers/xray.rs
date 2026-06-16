@@ -263,7 +263,7 @@ impl Xray {
 }
 
 impl XrayElement {
-    fn compute_uniforms(&self) -> [Uniform<'static>; 11] {
+    fn compute_uniforms(&self) -> [Uniform<'static>; 14] {
         [
             Uniform::new("niri_scale", self.scale),
             Uniform::new("geo_size", <[f32; 2]>::from(self.clip_geo_size)),
@@ -276,6 +276,9 @@ impl XrayElement {
             Uniform::new("tint_amount", self.glass.tint_amount),
             Uniform::new("edge_highlight", self.glass.edge_highlight),
             Uniform::new("refraction", self.glass.refraction),
+            Uniform::new("inner_shadow", self.glass.inner_shadow),
+            Uniform::new("chromatic", self.glass.chromatic),
+            Uniform::new("lens_depth", self.glass.lens_depth),
         ]
     }
 }

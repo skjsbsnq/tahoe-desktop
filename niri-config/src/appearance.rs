@@ -1073,6 +1073,12 @@ pub struct BackgroundEffectRule {
     pub edge_highlight: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub refraction: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub inner_shadow: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub chromatic: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub lens_depth: Option<FloatOrInt<0, 1000>>,
 }
 
 /// Resolved background effect rule.
@@ -1099,6 +1105,9 @@ pub struct BackgroundEffect {
     pub tint_amount: Option<f64>,
     pub edge_highlight: Option<f64>,
     pub refraction: Option<f64>,
+    pub inner_shadow: Option<f64>,
+    pub chromatic: Option<f64>,
+    pub lens_depth: Option<f64>,
 }
 
 impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
@@ -1124,6 +1133,18 @@ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
         if let Some(x) = part.refraction {
             self.refraction = Some(x.0);
         }
+
+        if let Some(x) = part.inner_shadow {
+            self.inner_shadow = Some(x.0);
+        }
+
+        if let Some(x) = part.chromatic {
+            self.chromatic = Some(x.0);
+        }
+
+        if let Some(x) = part.lens_depth {
+            self.lens_depth = Some(x.0);
+        }
     }
 }
 
@@ -1144,6 +1165,9 @@ mod tests {
                     tint-amount 0.12
                     edge-highlight 0.34
                     refraction 0.014
+                    inner-shadow 0.12
+                    chromatic 0.006
+                    lens-depth 0.04
                 }
             }
             "##,
@@ -1155,6 +1179,9 @@ mod tests {
         assert_eq!(rule.tint_amount.map(|x| x.0), Some(0.12));
         assert_eq!(rule.edge_highlight.map(|x| x.0), Some(0.34));
         assert_eq!(rule.refraction.map(|x| x.0), Some(0.014));
+        assert_eq!(rule.inner_shadow.map(|x| x.0), Some(0.12));
+        assert_eq!(rule.chromatic.map(|x| x.0), Some(0.006));
+        assert_eq!(rule.lens_depth.map(|x| x.0), Some(0.04));
 
         let mut resolved = BackgroundEffect::default();
         resolved.merge_with(rule);
@@ -1162,6 +1189,9 @@ mod tests {
         assert_eq!(resolved.tint_amount, Some(0.12));
         assert_eq!(resolved.edge_highlight, Some(0.34));
         assert_eq!(resolved.refraction, Some(0.014));
+        assert_eq!(resolved.inner_shadow, Some(0.12));
+        assert_eq!(resolved.chromatic, Some(0.006));
+        assert_eq!(resolved.lens_depth, Some(0.04));
     }
 
     #[test]

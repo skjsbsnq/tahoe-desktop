@@ -25,6 +25,7 @@ uniform float niri_scale;
 uniform vec2 geo_size;
 uniform vec4 corner_radius;
 uniform mat3 input_to_geo;
+uniform float chromatic;
 
 float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);
 vec2 niri_refraction_offset(vec2 coords_geo);
@@ -33,13 +34,26 @@ vec4 postprocess(vec4 color, vec2 coords_geo);
 void main() {
     vec3 coords_geo = input_to_geo * vec3(v_coords, 1.0);
 
-    // Sample the texture.
-    vec2 sample_coords = clamp(
-        v_coords + niri_refraction_offset(coords_geo.xy),
-        vec2(0.001),
-        vec2(0.999)
-    );
-    vec4 color = texture2D(tex, sample_coords);
+    // Refraction displacement in texture (v_coords) space.
+    vec2 offset = niri_refraction_offset(coords_geo.xy);
+
+    // Chromatic aberration: split the R/G/B samples along the displacement
+    // direction. `chromatic` is shared with postprocess.frag and defaults to 0.
+    vec4 color;
+    if (chromatic > 0.0) {
+        vec2 dir = normalize(offset + vec2(0.00001));
+        float split = length(offset) * chromatic * 6.0;
+        vec2 rcoord = clamp(v_coords + offset + dir * split, vec2(0.001), vec2(0.999));
+        vec2 gcoord = clamp(v_coords + offset, vec2(0.001), vec2(0.999));
+        vec2 bcoord = clamp(v_coords + offset - dir * split, vec2(0.001), vec2(0.999));
+        vec4 cr = texture2D(tex, rcoord);
+        vec4 cg = texture2D(tex, gcoord);
+        vec4 cb = texture2D(tex, bcoord);
+        color = vec4(cr.r, cg.g, cb.b, max(cr.a, max(cg.a, cb.a)));
+    } else {
+        vec2 sample_coords = clamp(v_coords + offset, vec2(0.001), vec2(0.999));
+        color = texture2D(tex, sample_coords);
+    }
 #if defined(NO_ALPHA)
     color = vec4(color.rgb, 1.0);
 #endif
