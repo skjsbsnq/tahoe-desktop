@@ -6,8 +6,10 @@ uniform float tint_amount;
 uniform float edge_highlight;
 uniform float refraction;
 uniform float inner_shadow;
-uniform float chromatic;
 uniform float lens_depth;
+// Note: `chromatic` is declared in clipped_surface.frag (where the RGB-split
+// sampling lives) and shared with this translation unit. Declaring it here too
+// triggers a GLSL "redeclared" error and fails the postprocess_and_clip program.
 
 // Sin-less white noise by David Hoskins (MIT License).
 // https://www.shadertoy.com/view/4djSRW

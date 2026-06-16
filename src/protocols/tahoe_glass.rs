@@ -13,7 +13,12 @@ use super::raw::tahoe_glass::v1::server::tahoe_glass_surface_v1::{self, TahoeGla
 use crate::niri::State;
 use crate::utils::surface_geo;
 
-const VERSION: u32 = 2;
+// Version of the *manager* interface global. The manager interface itself is
+// still v1 (only `get_tahoe_glass_surface`); the surface interface is v2, which
+// carries the `interaction` arg on `set_region`. Bumping this to the surface
+// version makes wayland-backend reject the global ("implemented version higher
+// than interface version") and panic, so it must stay at the manager's version.
+const VERSION: u32 = 1;
 pub const MAX_REGIONS_PER_SURFACE: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
