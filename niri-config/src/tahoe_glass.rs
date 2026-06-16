@@ -96,6 +96,7 @@ impl Default for TahoeGlassMaterial {
     fn default() -> Self {
         Self {
             background_effect: BackgroundEffect {
+                xray: Some(false),
                 blur: Some(true),
                 noise: Some(0.006),
                 saturation: Some(1.16),
@@ -189,6 +190,7 @@ mod tests {
         .unwrap();
 
         let material = config.tahoe_glass.material("panel");
+        assert_eq!(material.background_effect.xray, Some(false));
         assert_eq!(material.background_effect.blur, Some(true));
         assert_eq!(material.background_effect.noise, Some(0.006));
         assert_eq!(material.background_effect.edge_highlight, Some(0.01));
