@@ -14,8 +14,8 @@ use crate::niri::State;
 use crate::utils::surface_geo;
 
 // Version of the *manager* interface global. The manager interface itself is
-// still v1 (only `get_tahoe_glass_surface`); the surface interface is v2, which
-// carries the `interaction` arg on `set_region`. Bumping this to the surface
+// still v1 (only `get_tahoe_glass_surface`); the surface interface is v3, which
+// carries the `interaction` and `material_alpha` args on `set_region`. Bumping this to the surface
 // version makes wayland-backend reject the global ("implemented version higher
 // than interface version") and panic, so it must stay at the manager's version.
 const VERSION: u32 = 1;
@@ -48,6 +48,9 @@ pub struct TahoeGlassRegion {
     /// Per-region interaction scalar in [0, 1] that drives compositor-side
     /// material easing (higher highlight/refraction/inner shadow). 0 = at rest.
     pub interaction: f32,
+    /// Per-region material alpha in [0, 1] for compositor-side enter/exit fades.
+    /// 1 = fully visible; 0 = material parameters faded out.
+    pub material_alpha: f32,
 }
 
 pub struct TahoeGlassSurfaceUserData {
@@ -223,6 +226,7 @@ fn make_region(
     material: String,
     flags: u32,
     interaction: f64,
+    material_alpha: f64,
 ) -> Option<TahoeGlassRegion> {
     if width <= 0 || height <= 0 {
         return None;
@@ -247,6 +251,7 @@ fn make_region(
         },
         flags: TahoeGlassFlags::from_bits(flags),
         interaction: interaction.clamp(0., 1.) as f32,
+        material_alpha: material_alpha.clamp(0., 1.) as f32,
     })
 }
 
@@ -336,10 +341,22 @@ where
                 material,
                 flags,
                 interaction,
+                material_alpha,
             } => {
                 let Some(region) = make_region(
-                    id, x, y, width, height, radius_tl, radius_tr, radius_br, radius_bl, material,
-                    flags, interaction,
+                    id,
+                    x,
+                    y,
+                    width,
+                    height,
+                    radius_tl,
+                    radius_tr,
+                    radius_br,
+                    radius_bl,
+                    material,
+                    flags,
+                    interaction,
+                    material_alpha,
                 ) else {
                     debug!(surface = %data.surface.id(), id, "discarding invalid Tahoe glass region");
                     return;

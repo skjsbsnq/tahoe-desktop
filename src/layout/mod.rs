@@ -5137,6 +5137,7 @@ impl<W: LayoutElement> Layout<W> {
             };
             let params = RenderParams {
                 geometry: rect,
+                alpha: 1.,
                 subregion: None,
                 clip: Some((rect, radius)),
                 scale,

@@ -39,6 +39,7 @@ pub struct FramebufferEffectElement {
     noise: f32,
     saturation: f32,
     glass: GlassOptions,
+    alpha: f32,
 }
 
 #[derive(Debug)]
@@ -92,6 +93,7 @@ impl FramebufferEffect {
             noise,
             saturation,
             glass,
+            alpha: params.alpha,
         }
     }
 }
@@ -412,7 +414,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             &[],
             // The intermediate texture has the same transform as the frame.
             frame.transformation().invert(),
-            1.,
+            self.alpha,
             program.as_ref(),
             uniforms,
         )

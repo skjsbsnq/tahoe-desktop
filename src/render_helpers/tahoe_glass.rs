@@ -172,12 +172,17 @@ fn render_region(
 ) {
     let rect = region.rect.to_f64();
     let geometry = Rectangle::new(surface_location + rect.loc, rect.size);
+    let material_alpha = region.material_alpha.clamp(0., 1.);
 
-    if region.flags.shadow {
+    if region.flags.shadow && material_alpha > 0. {
         renderer.shadow.update_config(material.shadow);
-        renderer
-            .shadow
-            .update_render_elements(geometry.size, true, region.radius, scale, 1.);
+        renderer.shadow.update_render_elements(
+            geometry.size,
+            true,
+            region.radius,
+            scale,
+            material_alpha,
+        );
         renderer
             .shadow
             .render(ctx.renderer, geometry.loc, &mut |elem| push(elem.into()));
@@ -188,12 +193,19 @@ fn render_region(
         effect.blur = Some(false);
     }
 
-    // Compositor-side material easing: a per-region interaction scalar in
-    // [0, 1] pushes the glass beyond its rest values. We scale the
-    // highlight/refraction/inner-shadow/lens params so hover/press/enter states
-    // intensify the glass without any shader or region-geometry change.
+    // Compositor-side material easing: `material_alpha` fades the material in
+    // and out for popup/backdrop enter/exit without touching region geometry.
+    // `interaction` then boosts the refractive terms for hover/press/active states.
+    let fade = |v: Option<f64>| v.map(|x| x * f64::from(material_alpha));
+    effect.tint_amount = fade(effect.tint_amount);
+    effect.edge_highlight = fade(effect.edge_highlight);
+    effect.refraction = fade(effect.refraction);
+    effect.inner_shadow = fade(effect.inner_shadow);
+    effect.chromatic = fade(effect.chromatic);
+    effect.lens_depth = fade(effect.lens_depth);
+
     let interaction = region.interaction as f64;
-    if interaction > 0.0 {
+    if interaction > 0.0 && material_alpha > 0.0 {
         let boost = |v: Option<f64>| v.map(|x| x * (1.0 + interaction));
         effect.edge_highlight = boost(effect.edge_highlight);
         effect.refraction = boost(effect.refraction);
@@ -213,6 +225,7 @@ fn render_region(
 
     let params = RenderParams {
         geometry,
+        alpha: material_alpha,
         subregion: None,
         clip: region.flags.clip.then_some((geometry, region.radius)),
         scale,

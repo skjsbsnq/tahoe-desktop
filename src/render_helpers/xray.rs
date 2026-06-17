@@ -80,6 +80,7 @@ pub struct XrayElement {
     noise: f32,
     saturation: f32,
     glass: GlassOptions,
+    alpha: f32,
     bg_color: Color32F,
     program: Option<GlesTexProgram>,
 }
@@ -203,6 +204,7 @@ impl Xray {
                     noise,
                     saturation,
                     glass,
+                    alpha: params.alpha,
                     bg_color: *bg_color,
                     program: program.clone(),
                 };
@@ -254,6 +256,7 @@ impl Xray {
                 noise,
                 saturation,
                 glass,
+                alpha: params.alpha,
                 bg_color: self.backdrop_color,
                 program: program.clone(),
             };
@@ -361,7 +364,7 @@ impl RenderElement<GlesRenderer> for XrayElement {
             // FIXME: opaque regions need to be filtered like damage.
             &[],
             Transform::Normal,
-            1.,
+            self.alpha,
             self.program.as_ref(),
             uniforms,
         )

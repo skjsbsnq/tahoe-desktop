@@ -36,7 +36,7 @@
     </request>
   </interface>
 
-  <interface name="tahoe_glass_surface_v1" version="2">
+  <interface name="tahoe_glass_surface_v1" version="3">
     <description summary="per-surface Tahoe glass regions">
       Regions are double-buffered and committed with the associated wl_surface.
       Region coordinates are surface-local logical coordinates.
@@ -64,6 +64,10 @@
         The interaction scalar (0..1) drives compositor-side material easing so
         a region can intensify its glass (higher highlight, refraction, inner
         shadow) during hover, press, or enter animations. 0 means at rest.
+
+        The material alpha scalar (0..1) fades compositor material parameters
+        without changing the region bounds. Clients use it for popup/backdrop
+        enter and exit transitions while keeping geometry stable.
       </description>
       <arg name="id" type="uint"/>
       <arg name="x" type="int"/>
@@ -77,6 +81,7 @@
       <arg name="material" type="string"/>
       <arg name="flags" type="uint"/>
       <arg name="interaction" type="fixed" summary="0..1 interaction scalar; 0=rest"/>
+      <arg name="material_alpha" type="fixed" summary="0..1 material alpha scalar; 1=fully visible"/>
     </request>
 
     <request name="remove_region">

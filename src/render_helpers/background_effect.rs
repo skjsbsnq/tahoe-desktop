@@ -107,6 +107,8 @@ impl Options {
 pub struct RenderParams {
     /// Geometry of the background effect.
     pub geometry: Rectangle<f64, Logical>,
+    /// Final opacity for the rendered effect.
+    pub alpha: f32,
     /// Effect subregion, will be clipped to `geometry`.
     ///
     /// `subregion.iter()` should return `geometry`-relative rectangles.
@@ -336,6 +338,7 @@ fn render_params_for_tile(
 
     Some(RenderParams {
         geometry: effect_geometry,
+        alpha: 1.,
         subregion,
         clip,
         scale,
