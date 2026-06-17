@@ -444,11 +444,9 @@ fn blur_region_bounding_box(rects: &[Rectangle<i32, Logical>]) -> Option<Rectang
         return None;
     }
 
-    let width = max_x.checked_sub(min_x)?;
-    let height = max_y.checked_sub(min_y)?;
-    Some(Rectangle::new(
+    Some(Rectangle::from_extremities(
         Point::new(min_x, min_y),
-        Size::new(width, height),
+        Point::new(max_x, max_y),
     ))
 }
 

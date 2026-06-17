@@ -1477,7 +1477,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 1.,
                 0.,
                 1.,
-                0.96,
+                1.,
                 self.options.animations.window_close.anim,
                 true,
             );
