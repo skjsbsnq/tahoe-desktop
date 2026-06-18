@@ -708,39 +708,41 @@ impl SnapPreviewState {
 }
 
 fn compute_snap_target(
-    working_area: Rectangle<f64, Logical>,
+    target_area: Rectangle<f64, Logical>,
+    trigger_area: Rectangle<f64, Logical>,
     pointer_pos: Point<f64, Logical>,
     threshold: f64,
 ) -> Option<SnapTarget> {
     let threshold = threshold.max(0.);
-    let left = working_area.loc.x;
-    let right = working_area.loc.x + working_area.size.w;
-    let top = working_area.loc.y;
+    let trigger_left = trigger_area.loc.x;
+    let trigger_right = trigger_area.loc.x + trigger_area.size.w;
+    let trigger_top = trigger_area.loc.y;
 
-    if pointer_pos.y <= top + threshold {
+    if pointer_pos.y <= trigger_top + threshold {
         return Some(SnapTarget {
             edge: SnapEdge::Top,
-            rect: working_area,
+            rect: target_area,
         });
     }
 
-    let half_width = working_area.size.w / 2.;
-    if pointer_pos.x <= left + threshold {
+    let left = target_area.loc.x;
+    let half_width = target_area.size.w / 2.;
+    if pointer_pos.x <= trigger_left + threshold {
         return Some(SnapTarget {
             edge: SnapEdge::Left,
             rect: Rectangle::new(
-                working_area.loc,
-                Size::from((half_width, working_area.size.h)),
+                target_area.loc,
+                Size::from((half_width, target_area.size.h)),
             ),
         });
     }
 
-    if pointer_pos.x >= right - threshold {
+    if pointer_pos.x >= trigger_right - threshold {
         return Some(SnapTarget {
             edge: SnapEdge::Right,
             rect: Rectangle::new(
-                Point::from((left + half_width, working_area.loc.y)),
-                Size::from((half_width, working_area.size.h)),
+                Point::from((left + half_width, target_area.loc.y)),
+                Size::from((half_width, target_area.size.h)),
             ),
         });
     }
@@ -884,8 +886,10 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let mon = self.monitor_for_output(output)?;
+        let output_area = Rectangle::from_size(output_size(output));
         compute_snap_target(
             mon.working_area(),
+            output_area,
             pointer_pos_within_output,
             config.threshold,
         )
