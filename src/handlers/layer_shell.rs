@@ -105,8 +105,9 @@ impl State {
         let mut map = layer_map_for_output(&output);
 
         // Arrange the layers before sending the initial configure to respect any size the
-        // client may have sent.
-        map.arrange();
+        // client may have sent. For already-mapped content-only commits this usually returns
+        // false, and we can avoid the heavier output_resized() path below.
+        let mut needs_output_resize = map.arrange();
 
         let layer = map
             .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
@@ -117,6 +118,8 @@ impl State {
 
             // Resolve rules for newly mapped layer surfaces.
             if was_unmapped {
+                needs_output_resize = true;
+
                 let config = self.niri.config.borrow();
 
                 let rules = &config.layer_rules;
@@ -153,6 +156,7 @@ impl State {
                             .recompute_layer_rules(&config.layer_rules, self.niri.is_at_startup)
                         {
                             mapped.update_config(&config);
+                            needs_output_resize = true;
                         }
                     }
                 } else {
@@ -183,6 +187,8 @@ impl State {
         } else {
             // The surface is unmapped.
             if self.niri.mapped_layer_surfaces.remove(layer).is_some() {
+                needs_output_resize = true;
+
                 // A mapped surface got unmapped via a null commit. Now it needs to do a new
                 // initial commit again.
                 self.niri.unmapped_layer_surfaces.insert(surface.clone());
@@ -214,8 +220,12 @@ impl State {
 
         drop(map);
 
-        // This will call queue_redraw() inside.
-        self.niri.output_resized(&output);
+        if needs_output_resize {
+            // This will call queue_redraw() inside.
+            self.niri.output_resized(&output);
+        } else {
+            self.niri.queue_redraw(&output);
+        }
 
         true
     }

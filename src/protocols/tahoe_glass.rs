@@ -160,7 +160,11 @@ fn mark_pending_dirty(surface: &WlSurface) {
             });
 
             if changed {
-                state.niri.queue_redraw_all();
+                if let Some(output) = state.niri.output_for_root(surface).cloned() {
+                    state.niri.queue_redraw(&output);
+                } else {
+                    state.niri.queue_redraw_all();
+                }
             }
         });
     }
@@ -362,63 +366,79 @@ where
                     return;
                 };
 
-                let inserted = with_states(&data.surface, |states| {
+                let changed = with_states(&data.surface, |states| {
                     let state = states
                         .data_map
                         .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
                     let mut guard = state.0.lock().unwrap();
                     if let Some(existing) = guard.pending.iter_mut().find(|r| r.id == id) {
+                        if *existing == region {
+                            return Some(false);
+                        }
+
                         *existing = region;
-                        true
+                        Some(true)
                     } else if guard.pending.len() < MAX_REGIONS_PER_SURFACE {
                         guard.pending.push(region);
-                        true
+                        Some(true)
                     } else {
-                        false
+                        None
                     }
                 });
 
-                if !inserted {
+                let Some(changed) = changed else {
                     debug!(
                         surface = %data.surface.id(),
                         id,
                         "discarding Tahoe glass region beyond per-surface limit"
                     );
                     return;
-                }
+                };
 
-                debug!(
-                    surface = %data.surface.id(),
-                    id,
-                    "set Tahoe glass region"
-                );
-                mark_pending_dirty(&data.surface);
+                if changed {
+                    debug!(
+                        surface = %data.surface.id(),
+                        id,
+                        "set Tahoe glass region"
+                    );
+                    mark_pending_dirty(&data.surface);
+                }
             }
             tahoe_glass_surface_v1::Request::RemoveRegion { id } => {
-                with_states(&data.surface, |states| {
+                let removed = with_states(&data.surface, |states| {
                     let state = states
                         .data_map
                         .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
-                    state.0.lock().unwrap().pending.retain(|r| r.id != id);
+                    let mut guard = state.0.lock().unwrap();
+                    let old_len = guard.pending.len();
+                    guard.pending.retain(|r| r.id != id);
+                    guard.pending.len() != old_len
                 });
 
-                debug!(
-                    surface = %data.surface.id(),
-                    id,
-                    "removed Tahoe glass region"
-                );
-                mark_pending_dirty(&data.surface);
+                if removed {
+                    debug!(
+                        surface = %data.surface.id(),
+                        id,
+                        "removed Tahoe glass region"
+                    );
+                    mark_pending_dirty(&data.surface);
+                }
             }
             tahoe_glass_surface_v1::Request::ClearRegions => {
-                with_states(&data.surface, |states| {
+                let cleared = with_states(&data.surface, |states| {
                     let state = states
                         .data_map
                         .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
-                    state.0.lock().unwrap().pending.clear();
+                    let mut guard = state.0.lock().unwrap();
+                    let cleared = !guard.pending.is_empty();
+                    guard.pending.clear();
+                    cleared
                 });
 
-                debug!(surface = %data.surface.id(), "cleared Tahoe glass regions");
-                mark_pending_dirty(&data.surface);
+                if cleared {
+                    debug!(surface = %data.surface.id(), "cleared Tahoe glass regions");
+                    mark_pending_dirty(&data.surface);
+                }
             }
         }
     }
