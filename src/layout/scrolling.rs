@@ -76,8 +76,8 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// Windows in the closing animation.
     closing_windows: Vec<ClosingWindow>,
 
-    /// Windows in the minimize animation.
-    minimize_animations: Vec<MinimizeWindowAnimation>,
+    /// Windows in the minimize animation, paired with their window id for interruption handling.
+    minimize_animations: Vec<(W::Id, MinimizeWindowAnimation)>,
 
     /// Windows in the restore animation, paired with their window id for cleanup.
     restore_animations: Vec<(W::Id, MinimizeWindowAnimation)>,
@@ -357,6 +357,41 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
+    fn take_minimize_animation(&mut self, id: &W::Id) -> Option<MinimizeWindowAnimation> {
+        let idx = self
+            .minimize_animations
+            .iter()
+            .position(|(minimize_id, _)| minimize_id == id)?;
+        Some(self.minimize_animations.remove(idx).1)
+    }
+
+    fn take_restore_animation(&mut self, id: &W::Id) -> Option<MinimizeWindowAnimation> {
+        let idx = self
+            .restore_animations
+            .iter()
+            .position(|(restore_id, _)| restore_id == id)?;
+        Some(self.restore_animations.remove(idx).1)
+    }
+
+    fn has_minimize_animation(&self, id: &W::Id) -> bool {
+        self.minimize_animations
+            .iter()
+            .any(|(minimize_id, _)| minimize_id == id)
+    }
+
+    fn has_restore_animation(&self, id: &W::Id) -> bool {
+        self.restore_animations
+            .iter()
+            .any(|(restore_id, _)| restore_id == id)
+    }
+
+    fn clear_minimize_restore_animations(&mut self, id: &W::Id) {
+        self.minimize_animations
+            .retain(|(minimize_id, _)| minimize_id != id);
+        self.restore_animations
+            .retain(|(restore_id, _)| restore_id != id);
+    }
+
     pub fn advance_animations(&mut self) {
         if let ViewOffset::Animation(anim) = &self.view_offset {
             if anim.is_done() {
@@ -398,7 +433,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             closing.are_animations_ongoing()
         });
 
-        self.minimize_animations.retain_mut(|minimize| {
+        self.minimize_animations.retain_mut(|(_, minimize)| {
             minimize.advance_animations();
             minimize.are_animations_ongoing()
         });
@@ -1107,6 +1142,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         transaction: Transaction,
         anim_config: Option<niri_config::Animation>,
     ) -> RemovedTile<W> {
+        let id = self.columns[column_idx].tiles[tile_idx]
+            .window()
+            .id()
+            .clone();
+        self.clear_minimize_restore_animations(&id);
+
         // If this is the only tile in the column, remove the whole column.
         if self.columns[column_idx].tiles.len() == 1 {
             let mut column = self.remove_column_by_idx(column_idx, anim_config);
@@ -1508,18 +1549,29 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let Some(column_idx) = self.columns.iter().position(|col| col.contains(window)) else {
             return false;
         };
-        let column = &mut self.columns[column_idx];
-        let tile_idx = column.position(window).unwrap();
+        let tile_idx = self.columns[column_idx].position(window).unwrap();
 
-        let changed = column.tiles[tile_idx].window_mut().set_minimized(minimized);
+        let changed = self.columns[column_idx].tiles[tile_idx]
+            .window_mut()
+            .set_minimized(minimized);
         if !changed {
             return false;
         }
 
         if minimized {
-            self.restore_animations
-                .retain(|(restore_id, _)| restore_id != window);
-            column.tiles[tile_idx].show_after_restore_animation();
+            if let Some(mut restore) = self.take_restore_animation(window) {
+                restore.reverse_to_minimize(
+                    self.options.animations.window_close.anim,
+                    _animation_rect.map(|rect| rect.rect.to_f64()),
+                );
+                self.minimize_animations
+                    .retain(|(minimize_id, _)| minimize_id != window);
+                self.minimize_animations.push((window.clone(), restore));
+            } else {
+                self.restore_animations
+                    .retain(|(restore_id, _)| restore_id != window);
+            }
+            self.columns[column_idx].tiles[tile_idx].show_after_restore_animation();
 
             if self
                 .interactive_resize
@@ -1527,14 +1579,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 .is_some_and(|resize| &resize.window == window)
             {
                 self.interactive_resize = None;
-                column.tiles[tile_idx]
+                self.columns[column_idx].tiles[tile_idx]
                     .window_mut()
                     .cancel_interactive_resize();
             }
 
-            if column.active_tile_idx == tile_idx {
-                if let Some(idx) = column.first_visible_tile_idx() {
-                    column.activate_idx(idx);
+            if self.columns[column_idx].active_tile_idx == tile_idx {
+                if let Some(idx) = self.columns[column_idx].first_visible_tile_idx() {
+                    self.columns[column_idx].activate_idx(idx);
                 }
             }
 
@@ -1546,10 +1598,25 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 self.activate_column(idx);
             }
         } else {
+            let mut restore = self.take_minimize_animation(window);
+
             self.columns[column_idx].activate_window(window);
             self.activate_column(column_idx);
             let tile_idx = self.columns[column_idx].position(window).unwrap();
-            if _animation_rect.is_none() {
+
+            if let Some(restore) = &mut restore {
+                restore.reverse_to_restore(
+                    self.options.animations.window_open.anim,
+                    _animation_rect.map(|rect| rect.rect.to_f64()),
+                );
+            }
+
+            if let Some(restore) = restore {
+                self.restore_animations
+                    .retain(|(restore_id, _)| restore_id != window);
+                self.restore_animations.push((window.clone(), restore));
+                self.columns[column_idx].tiles[tile_idx].hide_for_restore_animation();
+            } else if _animation_rect.is_none() {
                 self.columns[column_idx].tiles[tile_idx].animate_alpha_scale(
                     0.,
                     1.,
@@ -1583,6 +1650,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return false;
         }
 
+        if self.has_restore_animation(window) {
+            return self.set_minimized(window, true, animation_rect);
+        }
+
         let view_size = self.view_size;
         let view_pos = self.view_pos();
         let (snapshot, mut tile_pos) = {
@@ -1614,6 +1685,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         self.start_minimize_animation_for_tile(
             renderer,
+            window.clone(),
             snapshot,
             tile_pos,
             animation_rect.map(|rect| rect.rect.to_f64()),
@@ -1631,15 +1703,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         window: &W::Id,
         animation_rect: Option<&MinimizeRect>,
     ) -> bool {
-        if animation_rect.is_none() {
-            return self.set_minimized(window, false, None);
-        }
-
         let Some(column_idx) = self.columns.iter().position(|col| col.contains(window)) else {
             return false;
         };
         let column = &self.columns[column_idx];
         let tile_idx = column.position(window).unwrap();
+
+        if self.has_minimize_animation(window) {
+            return self.set_minimized(window, false, animation_rect);
+        }
+
+        if animation_rect.is_none() {
+            return self.set_minimized(window, false, None);
+        }
 
         if !column.tiles[tile_idx].window().is_minimized()
             || self
@@ -1791,6 +1867,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     fn start_minimize_animation_for_tile(
         &mut self,
         renderer: &mut GlesRenderer,
+        id: W::Id,
         snapshot: TileRenderSnapshot,
         tile_pos: Point<f64, Logical>,
         target_rect: Option<Rectangle<f64, Logical>>,
@@ -1814,7 +1891,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         );
         match res {
             Ok(minimize) => {
-                self.minimize_animations.push(minimize);
+                self.minimize_animations.push((id, minimize));
             }
             Err(err) => {
                 warn!("error creating a minimizing window animation: {err:?}");
@@ -3235,7 +3312,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             push(elem.into());
         }
 
-        for minimize in self.minimize_animations.iter().rev() {
+        for (_, minimize) in self.minimize_animations.iter().rev() {
             let elem = minimize.render(ctx.as_gles(), view_rect, scale);
             push(elem.into());
         }

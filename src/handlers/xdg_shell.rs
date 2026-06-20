@@ -41,7 +41,7 @@ use crate::input::move_grab::MoveGrab;
 use crate::input::resize_grab::ResizeGrab;
 use crate::input::touch_resize_grab::TouchResizeGrab;
 use crate::input::{PointerOrTouchStartData, DOUBLE_CLICK_TIME};
-use crate::layout::ActivateWindow;
+use crate::layout::{ActivateWindow, MinimizeRect};
 use crate::niri::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -827,7 +827,11 @@ impl XdgShellHandler for State {
         };
 
         let window = mapped.window.clone();
-        if self.minimize_window_with_animation(&window, None) {
+        let target_rect = mapped.foreign_toplevel_rect().map(|rect| MinimizeRect {
+            output: rect.output.clone(),
+            rect: rect.rect,
+        });
+        if self.minimize_window_with_animation(&window, target_rect) {
             self.niri.layer_shell_on_demand_focus = None;
             self.niri.queue_redraw_all();
         }

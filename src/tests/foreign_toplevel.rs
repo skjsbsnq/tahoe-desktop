@@ -28,7 +28,7 @@ fn foreign_toplevel_set_rectangle_tracks_layer_surface_rect() {
     f.add_output(2, (1280, 720));
 
     let id = f.add_client();
-    create_window(&mut f, id);
+    let window_surface = create_window(&mut f, id);
 
     let wl_output = f.client(id).output("headless-2");
     let layer = f
@@ -73,6 +73,16 @@ fn foreign_toplevel_set_rectangle_tracks_layer_surface_rect() {
     f.double_roundtrip(id);
     let mapped = f.niri().layout.windows().next().unwrap().1;
     assert!(!mapped.is_minimized());
+    assert_eq!(mapped.foreign_toplevel_rect().unwrap().rect, stored_rect);
+
+    handle.set_rectangle(&window_surface, 10, 20, 30, 40);
+    f.double_roundtrip(id);
+    let mapped = f.niri().layout.windows().next().unwrap().1;
+    assert!(mapped.foreign_toplevel_rect().is_none());
+
+    handle.set_rectangle(&layer_surface, 10, 20, 30, 40);
+    f.double_roundtrip(id);
+    let mapped = f.niri().layout.windows().next().unwrap().1;
     assert_eq!(mapped.foreign_toplevel_rect().unwrap().rect, stored_rect);
 
     handle.set_rectangle(&layer_surface, 10, 20, 0, 40);

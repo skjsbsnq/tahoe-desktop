@@ -22,6 +22,8 @@ use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::{render_to_encompassing_texture, RenderCtx, RenderTarget};
 
+const GENIE_AREA_PADDING: f64 = 24.;
+
 #[derive(Debug, Clone, Copy)]
 pub enum GenieDirection {
     Minimize,
@@ -238,6 +240,46 @@ impl MinimizeWindowAnimation {
         !self.anim.is_done()
     }
 
+    pub fn reverse_to_restore(
+        &mut self,
+        config: niri_config::Animation,
+        source_rect: Option<Rectangle<f64, Logical>>,
+    ) {
+        let morph = self.morph_progress();
+        self.restart_progress(1. - morph, 1., config);
+        self.alpha_from = 0.;
+        self.alpha_to = 1.;
+        self.direction = GenieDirection::Restore;
+        self.target_rect = source_rect;
+    }
+
+    pub fn reverse_to_minimize(
+        &mut self,
+        config: niri_config::Animation,
+        target_rect: Option<Rectangle<f64, Logical>>,
+    ) {
+        let morph = self.morph_progress();
+        self.restart_progress(morph, 1., config);
+        self.alpha_from = 1.;
+        self.alpha_to = 0.;
+        self.direction = GenieDirection::Minimize;
+        self.target_rect = target_rect;
+    }
+
+    fn morph_progress(&self) -> f64 {
+        let progress = self.anim.clamped_value().clamp(0., 1.);
+        match self.direction {
+            GenieDirection::Minimize => progress,
+            GenieDirection::Restore => 1. - progress,
+        }
+    }
+
+    fn restart_progress(&mut self, from: f64, to: f64, config: niri_config::Animation) {
+        let mut anim = self.anim.restarted(from.clamp(0., 1.), to, 0.);
+        anim.replace_config(config);
+        self.anim = anim;
+    }
+
     pub fn render(
         &self,
         ctx: RenderCtx<GlesRenderer>,
@@ -375,15 +417,43 @@ fn genie_area(
     window_rect: Rectangle<f64, Logical>,
     target_rect: Rectangle<f64, Logical>,
 ) -> Rectangle<f64, Logical> {
-    let padding = 24.;
-    let min_x = window_rect.loc.x.min(target_rect.loc.x) - padding;
-    let min_y = window_rect.loc.y.min(target_rect.loc.y) - padding;
+    let min_x = window_rect.loc.x.min(target_rect.loc.x) - GENIE_AREA_PADDING;
+    let min_y = window_rect.loc.y.min(target_rect.loc.y) - GENIE_AREA_PADDING;
     let max_x = (window_rect.loc.x + window_rect.size.w)
         .max(target_rect.loc.x + target_rect.size.w)
-        + padding;
+        + GENIE_AREA_PADDING;
     let max_y = (window_rect.loc.y + window_rect.size.h)
         .max(target_rect.loc.y + target_rect.size.h)
-        + padding;
+        + GENIE_AREA_PADDING;
 
     Rectangle::from_extremities(Point::from((min_x, min_y)), Point::from((max_x, max_y)))
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::Size;
+
+    use super::*;
+
+    #[test]
+    fn genie_area_is_window_target_union_with_padding() {
+        let window = Rectangle::new(Point::from((100., 100.)), Size::from((400., 300.)));
+        let target = Rectangle::new(Point::from((40., 700.)), Size::from((48., 48.)));
+
+        let area = genie_area(window, target);
+
+        assert_eq!(area.loc, Point::from((16., 76.)));
+        assert_eq!(area.size, Size::from((508., 696.)));
+    }
+
+    #[test]
+    fn genie_area_does_not_expand_beyond_local_union() {
+        let window = Rectangle::new(Point::from((100., 100.)), Size::from((400., 300.)));
+        let target = Rectangle::new(Point::from((200., 320.)), Size::from((48., 48.)));
+
+        let area = genie_area(window, target);
+
+        assert_eq!(area.loc, Point::from((76., 76.)));
+        assert_eq!(area.size, Size::from((448., 348.)));
+    }
 }

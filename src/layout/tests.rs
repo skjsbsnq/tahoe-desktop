@@ -1778,6 +1778,46 @@ fn minimize_restore_with_rect_keeps_ipc_layout() {
 }
 
 #[test]
+fn repeated_minimize_restore_with_rect_keeps_ipc_layout() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    let output = layout.outputs().next().unwrap().clone();
+    let rect = MinimizeRect {
+        output,
+        rect: Rectangle::new(Point::from((24, 680)), Size::from((48, 48))),
+    };
+    let before = window_ipc_state(&layout, 2);
+
+    for _ in 0..3 {
+        assert!(layout.minimize_window_with_target(&2, Some(rect.clone())));
+        assert!(!layout.minimize_window_with_target(&2, Some(rect.clone())));
+        layout.verify_invariants();
+
+        let minimized = window_ipc_state(&layout, 2);
+        assert!(minimized.0);
+        assert_stable_window_layout(&before, &minimized);
+        assert_eq!(layout.focus().map(|win| *win.id()), Some(1));
+
+        assert!(layout.restore_window_with_source(&2, Some(rect.clone())));
+        assert!(!layout.restore_window_with_source(&2, Some(rect.clone())));
+        layout.verify_invariants();
+
+        let restored = window_ipc_state(&layout, 2);
+        assert!(!restored.0);
+        assert_stable_window_layout(&before, &restored);
+        assert_eq!(layout.focus().map(|win| *win.id()), Some(2));
+    }
+}
+
+#[test]
 fn minimize_restore_floating_window_keeps_position_and_size() {
     let mut params = TestWindowParams::new(1);
     params.is_floating = true;

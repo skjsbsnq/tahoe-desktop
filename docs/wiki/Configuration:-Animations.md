@@ -227,6 +227,7 @@ animations {
 <sup>Since: 0.1.5</sup>
 
 Window closing animation.
+Tahoe builds also use this animation timing for snapshot-based minimize-to-dock animations when a dock provides a valid foreign-toplevel rectangle.
 
 This one uses an easing type by default.
 
@@ -238,6 +239,9 @@ animations {
     }
 }
 ```
+
+When no valid dock rectangle is available, when the rectangle belongs to another output, or when the Genie shader is unavailable, minimize and restore fall back to the regular fade path.
+Restore animations use the `window-open` timing.
 
 ##### `custom-shader`
 
