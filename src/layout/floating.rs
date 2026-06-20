@@ -13,12 +13,16 @@ use super::scrolling::ColumnWidth;
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
-    ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
+    ConfigureIntent, InteractiveResizeData, LayoutElement, MinimizeRect, Options, RemovedTile,
+    SizeFrac,
 };
 use crate::animation::{Animation, Clock};
+use crate::layout::minimize_window_animation::{
+    MinimizeWindowAnimation, MinimizeWindowAnimationRenderElement,
+};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::xray::XrayPos;
+use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::transaction::TransactionBlocker;
 use crate::utils::{
@@ -53,6 +57,12 @@ pub struct FloatingSpace<W: LayoutElement> {
     /// Windows in the closing animation.
     closing_windows: Vec<ClosingWindow>,
 
+    /// Windows in the minimize animation.
+    minimize_animations: Vec<MinimizeWindowAnimation>,
+
+    /// Windows in the restore animation, paired with their window id for cleanup.
+    restore_animations: Vec<(W::Id, MinimizeWindowAnimation)>,
+
     /// View size for this space.
     view_size: Size<f64, Logical>,
 
@@ -73,6 +83,7 @@ niri_render_elements! {
     FloatingSpaceRenderElement<R> => {
         Tile = TileRenderElement<R>,
         ClosingWindow = ClosingWindowRenderElement,
+        MinimizeWindow = MinimizeWindowAnimationRenderElement,
     }
 }
 
@@ -213,6 +224,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
             active_window_id: None,
             interactive_resize: None,
             closing_windows: Vec::new(),
+            minimize_animations: Vec::new(),
+            restore_animations: Vec::new(),
             view_size,
             working_area,
             scale,
@@ -255,20 +268,49 @@ impl<W: LayoutElement> FloatingSpace<W> {
             closing.advance_animations();
             closing.are_animations_ongoing()
         });
+
+        self.minimize_animations.retain_mut(|minimize| {
+            minimize.advance_animations();
+            minimize.are_animations_ongoing()
+        });
+
+        let mut finished_restore_ids = Vec::new();
+        self.restore_animations.retain_mut(|(id, restore)| {
+            restore.advance_animations();
+            let ongoing = restore.are_animations_ongoing();
+            if !ongoing {
+                finished_restore_ids.push(id.clone());
+            }
+            ongoing
+        });
+        for id in finished_restore_ids {
+            if let Some(idx) = self.idx_of(&id) {
+                self.tiles[idx].show_after_restore_animation();
+            }
+        }
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.tiles.iter().any(Tile::are_animations_ongoing) || !self.closing_windows.is_empty()
+        self.tiles.iter().any(Tile::are_animations_ongoing)
+            || !self.closing_windows.is_empty()
+            || !self.minimize_animations.is_empty()
+            || !self.restore_animations.is_empty()
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
-        self.tiles.iter().any(Tile::are_transitions_ongoing) || !self.closing_windows.is_empty()
+        self.tiles.iter().any(Tile::are_transitions_ongoing)
+            || !self.closing_windows.is_empty()
+            || !self.minimize_animations.is_empty()
+            || !self.restore_animations.is_empty()
     }
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
         let active = self.active_window_id.clone();
         for (tile, offset) in self.tiles_with_offsets_mut() {
             if tile.window().is_minimized() && !tile.should_render_minimized_animation() {
+                continue;
+            }
+            if tile.is_hidden_for_restore_animation() {
                 continue;
             }
 
@@ -600,7 +642,12 @@ impl<W: LayoutElement> FloatingSpace<W> {
         true
     }
 
-    pub fn set_minimized(&mut self, id: &W::Id, minimized: bool) -> bool {
+    pub fn set_minimized(
+        &mut self,
+        id: &W::Id,
+        minimized: bool,
+        _animation_rect: Option<&MinimizeRect>,
+    ) -> bool {
         let Some(idx) = self.idx_of(id) else {
             return false;
         };
@@ -611,14 +658,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
 
         if minimized {
-            self.tiles[idx].animate_alpha_scale(
-                1.,
-                0.,
-                1.,
-                1.,
-                self.options.animations.window_close.anim,
-                true,
-            );
+            self.restore_animations
+                .retain(|(restore_id, _)| restore_id != id);
+            self.tiles[idx].show_after_restore_animation();
 
             if self
                 .interactive_resize
@@ -641,15 +683,134 @@ impl<W: LayoutElement> FloatingSpace<W> {
             self.active_window_id = Some(id.clone());
             self.bring_up_descendants_of(0);
 
-            self.tiles[0].animate_alpha_scale(
-                0.,
-                1.,
-                1.,
-                1.,
-                self.options.animations.window_open.anim,
-                false,
-            );
+            if _animation_rect.is_none() {
+                self.tiles[0].animate_alpha_scale(
+                    0.,
+                    1.,
+                    1.,
+                    1.,
+                    self.options.animations.window_open.anim,
+                    false,
+                );
+            }
         }
+
+        true
+    }
+
+    pub fn minimize_with_snapshot(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        xray: Option<&mut Xray>,
+        xray_has_blocked_out_layers: bool,
+        xray_pos: XrayPos,
+        id: &W::Id,
+        animation_rect: Option<&MinimizeRect>,
+    ) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        if self.tiles[idx].window().is_minimized() {
+            return false;
+        }
+
+        let view_size = self.view_size;
+        let (snapshot, tile_pos) = {
+            let (tile, tile_pos) = self
+                .tiles_with_render_positions_mut(false)
+                .find(|(tile, _)| tile.window().id() == id)
+                .unwrap();
+
+            let view_pos = Point::from((-tile_pos.x, -tile_pos.y));
+            let view_rect = Rectangle::new(view_pos, view_size);
+            tile.update_render_elements(false, view_rect);
+
+            let xray_pos = xray_pos.offset(tile_pos);
+            let snapshot = tile.render_animation_snapshot(
+                renderer,
+                xray,
+                xray_has_blocked_out_layers,
+                xray_pos,
+            );
+
+            (snapshot, tile_pos)
+        };
+
+        if !self.set_minimized(id, true, animation_rect) {
+            return false;
+        }
+
+        self.start_minimize_animation_for_tile(
+            renderer,
+            snapshot,
+            tile_pos,
+            animation_rect.map(|rect| rect.rect.to_f64()),
+        );
+
+        true
+    }
+
+    pub fn restore_with_snapshot(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        xray: Option<&mut Xray>,
+        xray_has_blocked_out_layers: bool,
+        xray_pos: XrayPos,
+        id: &W::Id,
+        animation_rect: Option<&MinimizeRect>,
+    ) -> bool {
+        if animation_rect.is_none() {
+            return self.set_minimized(id, false, None);
+        }
+
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        if !self.tiles[idx].window().is_minimized()
+            || self
+                .restore_animations
+                .iter()
+                .any(|(restore_id, _)| restore_id == id)
+        {
+            return false;
+        }
+
+        if !self.set_minimized(id, false, animation_rect) {
+            return false;
+        }
+
+        let view_size = self.view_size;
+        let (snapshot, tile_pos) = {
+            let (tile, tile_pos) = self
+                .tiles_with_render_positions_mut(false)
+                .find(|(tile, _)| tile.window().id() == id)
+                .unwrap();
+
+            let view_pos = Point::from((-tile_pos.x, -tile_pos.y));
+            let view_rect = Rectangle::new(view_pos, view_size);
+            tile.update_render_elements(false, view_rect);
+
+            let xray_pos = xray_pos.offset(tile_pos);
+            let snapshot = tile.render_animation_snapshot(
+                renderer,
+                xray,
+                xray_has_blocked_out_layers,
+                xray_pos,
+            );
+            tile.hide_for_restore_animation();
+
+            (snapshot, tile_pos)
+        };
+
+        self.start_restore_animation_for_tile(
+            renderer,
+            id.clone(),
+            snapshot,
+            tile_pos,
+            animation_rect.map(|rect| rect.rect.to_f64()),
+        );
 
         true
     }
@@ -695,6 +856,78 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
             Err(err) => {
                 warn!("error creating a closing window animation: {err:?}");
+            }
+        }
+    }
+
+    fn start_minimize_animation_for_tile(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        snapshot: TileRenderSnapshot,
+        tile_pos: Point<f64, Logical>,
+        target_rect: Option<Rectangle<f64, Logical>>,
+    ) {
+        let anim = Animation::new(
+            self.clock.clone(),
+            0.,
+            1.,
+            0.,
+            self.options.animations.window_close.anim,
+        );
+
+        let scale = Scale::from(self.scale);
+        let res = MinimizeWindowAnimation::new_with_target(
+            renderer,
+            snapshot,
+            scale,
+            tile_pos,
+            anim,
+            target_rect,
+        );
+        match res {
+            Ok(minimize) => {
+                self.minimize_animations.push(minimize);
+            }
+            Err(err) => {
+                warn!("error creating a minimizing window animation: {err:?}");
+            }
+        }
+    }
+
+    fn start_restore_animation_for_tile(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        id: W::Id,
+        snapshot: TileRenderSnapshot,
+        tile_pos: Point<f64, Logical>,
+        source_rect: Option<Rectangle<f64, Logical>>,
+    ) {
+        let anim = Animation::new(
+            self.clock.clone(),
+            0.,
+            1.,
+            0.,
+            self.options.animations.window_open.anim,
+        );
+
+        let scale = Scale::from(self.scale);
+        let res = MinimizeWindowAnimation::new_with_source(
+            renderer,
+            snapshot,
+            scale,
+            tile_pos,
+            anim,
+            source_rect,
+        );
+        match res {
+            Ok(restore) => {
+                self.restore_animations.push((id, restore));
+            }
+            Err(err) => {
+                warn!("error creating a restoring window animation: {err:?}");
+                if let Some(idx) = self.idx_of(&id) {
+                    self.tiles[idx].show_after_restore_animation();
+                }
             }
         }
     }
@@ -1145,9 +1378,22 @@ impl<W: LayoutElement> FloatingSpace<W> {
             push(elem.into());
         }
 
+        for minimize in self.minimize_animations.iter().rev() {
+            let elem = minimize.render(ctx.as_gles(), view_rect, scale);
+            push(elem.into());
+        }
+
+        for (_, restore) in self.restore_animations.iter().rev() {
+            let elem = restore.render(ctx.as_gles(), view_rect, scale);
+            push(elem.into());
+        }
+
         let active = self.active_window_id.clone();
         for (tile, tile_pos) in self.tiles_with_render_positions() {
             if tile.window().is_minimized() && !tile.should_render_minimized_animation() {
+                continue;
+            }
+            if tile.is_hidden_for_restore_animation() {
                 continue;
             }
 

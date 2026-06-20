@@ -47,6 +47,15 @@ pub trait ForeignToplevelHandler {
     fn unset_maximized(&mut self, wl_surface: WlSurface);
     fn set_minimized(&mut self, wl_surface: WlSurface);
     fn unset_minimized(&mut self, wl_surface: WlSurface);
+    fn set_rectangle(
+        &mut self,
+        wl_surface: WlSurface,
+        source_surface: WlSurface,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    );
 }
 
 struct ToplevelData {
@@ -608,7 +617,13 @@ where
             zwlr_foreign_toplevel_handle_v1::Request::Close => {
                 state.close(surface);
             }
-            zwlr_foreign_toplevel_handle_v1::Request::SetRectangle { .. } => (),
+            zwlr_foreign_toplevel_handle_v1::Request::SetRectangle {
+                surface: source_surface,
+                x,
+                y,
+                width,
+                height,
+            } => state.set_rectangle(surface, source_surface, x, y, width, height),
             zwlr_foreign_toplevel_handle_v1::Request::Destroy => (),
             zwlr_foreign_toplevel_handle_v1::Request::SetFullscreen { output } => {
                 state.set_fullscreen(surface, output);

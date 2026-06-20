@@ -102,6 +102,9 @@ pub struct Tile<W: LayoutElement> {
     /// The animation of the tile's opacity.
     pub(super) alpha_animation: Option<AlphaAnimation>,
 
+    /// Whether normal tile rendering is hidden while a restore snapshot fades in.
+    restore_animation_hidden: bool,
+
     /// Offset during the initial interactive move rubberband.
     pub(super) interactive_move_offset: Point<f64, Logical>,
 
@@ -198,6 +201,19 @@ impl AlphaAnimation {
     }
 }
 
+fn offscreen_render_location(
+    location: Point<f64, Logical>,
+    offset: Point<f64, Logical>,
+    scale: Scale<f64>,
+) -> Point<f64, Logical> {
+    // Match the normal render path, where the tile location and each element's local geometry are
+    // rounded to physical pixels separately.
+    let location = location.to_physical_precise_round(scale);
+    let offset = offset.to_physical_precise_round(scale);
+
+    (location + offset).to_logical(scale)
+}
+
 impl<W: LayoutElement> Tile<W> {
     pub fn new(
         window: W,
@@ -230,6 +246,7 @@ impl<W: LayoutElement> Tile<W> {
             move_x_animation: None,
             move_y_animation: None,
             alpha_animation: None,
+            restore_animation_hidden: false,
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
@@ -696,6 +713,19 @@ impl<W: LayoutElement> Tile<W> {
         self.alpha_animation
             .as_ref()
             .is_some_and(|alpha| alpha.render_when_minimized && !alpha.anim.is_done())
+    }
+
+    pub fn hide_for_restore_animation(&mut self) {
+        self.restore_animation_hidden = true;
+        self.alpha_animation = None;
+    }
+
+    pub fn show_after_restore_animation(&mut self) {
+        self.restore_animation_hidden = false;
+    }
+
+    pub fn is_hidden_for_restore_animation(&self) -> bool {
+        self.restore_animation_hidden
     }
 
     pub fn ensure_alpha_animates_to_1(&mut self) {
@@ -1426,6 +1456,7 @@ impl<W: LayoutElement> Tile<W> {
                     let offset = elem.offset();
                     let alpha_scale = alpha.current_scale().max(0.);
                     let elem = elem.with_alpha(tile_alpha);
+                    let render_location = offscreen_render_location(location, offset, scale);
                     if (alpha_scale - 1.).abs() > f64::EPSILON {
                         let center = self.animated_tile_size().to_point().downscale(2.);
                         let elem = RescaleRenderElement::from_element(
@@ -1435,12 +1466,12 @@ impl<W: LayoutElement> Tile<W> {
                         );
                         let elem = RelocateRenderElement::from_element(
                             elem,
-                            (location + offset).to_physical_precise_round(scale),
+                            render_location.to_physical_precise_round(scale),
                             Relocate::Relative,
                         );
                         push(elem.into());
                     } else {
-                        let elem = elem.with_offset(location + offset);
+                        let elem = elem.with_offset(render_location);
                         push(elem.into());
                     }
 
@@ -1471,6 +1502,16 @@ impl<W: LayoutElement> Tile<W> {
 
         self.unmap_snapshot =
             Some(self.render_snapshot(renderer, xray, xray_has_blocked_out_layers, xray_pos));
+    }
+
+    pub fn render_animation_snapshot(
+        &self,
+        renderer: &mut GlesRenderer,
+        xray: Option<&mut Xray>,
+        xray_has_blocked_out_layers: bool,
+        xray_pos: XrayPos,
+    ) -> TileRenderSnapshot {
+        self.render_snapshot(renderer, xray, xray_has_blocked_out_layers, xray_pos)
     }
 
     fn render_snapshot(
@@ -1621,5 +1662,30 @@ impl<W: LayoutElement> Tile<W> {
         let rounded = size.to_physical_precise_round(scale).to_logical(scale);
         assert_abs_diff_eq!(size.w, rounded.w, epsilon = 1e-5);
         assert_abs_diff_eq!(size.h, rounded.h, epsilon = 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::utils::Physical;
+
+    #[test]
+    fn offscreen_render_location_preserves_physical_pixel_anchor() {
+        for scale in [1., 1.25, 1.5] {
+            let scale = Scale::from(scale);
+            let location = Point::from((0.4, 10.4));
+            let offset = Point::from((0.4, -0.4));
+
+            let render_location = offscreen_render_location(location, offset, scale);
+
+            let expected: Point<i32, Physical> =
+                location.to_physical_precise_round(scale) + offset.to_physical_precise_round(scale);
+            assert_eq!(render_location.to_physical_precise_round(scale), expected);
+
+            let combined: Point<i32, Physical> =
+                (location + offset).to_physical_precise_round(scale);
+            assert_ne!(combined.x, expected.x);
+        }
     }
 }

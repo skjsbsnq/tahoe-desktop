@@ -827,7 +827,7 @@ impl XdgShellHandler for State {
         };
 
         let window = mapped.window.clone();
-        if self.niri.layout.minimize_window(&window) {
+        if self.minimize_window_with_animation(&window, None) {
             self.niri.layer_shell_on_demand_focus = None;
             self.niri.queue_redraw_all();
         }

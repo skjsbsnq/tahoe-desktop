@@ -6,6 +6,7 @@ mod server;
 
 mod animations;
 mod floating;
+mod foreign_toplevel;
 mod fullscreen;
 mod layer_shell;
 mod remove_output;

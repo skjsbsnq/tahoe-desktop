@@ -479,6 +479,8 @@ impl CompositorHandler for State {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        self.clear_foreign_toplevel_rects_for_source(surface);
+
         // Clients may destroy their subsurfaces before the main surface. Ensure we have a snapshot
         // when that happens, so that the closing animation includes all these subsurfaces.
         //

@@ -16,6 +16,10 @@ use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
+use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1,
+    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
+};
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{
     self, ZwlrLayerShellV1,
 };
@@ -53,11 +57,13 @@ pub struct State {
     pub compositor: Option<WlCompositor>,
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
+    pub foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
+    pub foreign_toplevels: Vec<ZwlrForeignToplevelHandleV1>,
 }
 
 pub struct Window {
@@ -180,10 +186,12 @@ impl Client {
             compositor: None,
             xdg_wm_base: None,
             layer_shell: None,
+            foreign_toplevel_manager: None,
             spbm: None,
             viewporter: None,
             windows: Vec::new(),
             layers: Vec::new(),
+            foreign_toplevels: Vec::new(),
         };
 
         Self {
@@ -232,6 +240,10 @@ impl Client {
 
     pub fn layer(&mut self, surface: &WlSurface) -> &mut LayerSurface {
         self.state.layer(surface)
+    }
+
+    pub fn foreign_toplevel(&self, idx: usize) -> ZwlrForeignToplevelHandleV1 {
+        self.state.foreign_toplevels[idx].clone()
     }
 
     pub fn output(&mut self, name: &str) -> WlOutput {
@@ -518,6 +530,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwlrLayerShellV1::interface().name {
                     let version = min(version, ZwlrLayerShellV1::interface().version);
                     state.layer_shell = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwlrForeignToplevelManagerV1::interface().name {
+                    let version = min(version, ZwlrForeignToplevelManagerV1::interface().version);
+                    state.foreign_toplevel_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpSinglePixelBufferManagerV1::interface().name {
                     let version = min(version, WpSinglePixelBufferManagerV1::interface().version);
                     state.spbm = Some(registry.bind(name, version, qh, ()));
@@ -607,6 +622,41 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwlrForeignToplevelManagerV1,
+        event: <ZwlrForeignToplevelManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } => {
+                state.foreign_toplevels.push(toplevel);
+            }
+            zwlr_foreign_toplevel_manager_v1::Event::Finished => (),
+            _ => (),
+        }
+    }
+
+    wayland_client::event_created_child!(State, ZwlrForeignToplevelManagerV1, [
+        0 => (ZwlrForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrForeignToplevelHandleV1,
+        _event: <ZwlrForeignToplevelHandleV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
     }
 }
 

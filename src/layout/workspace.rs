@@ -24,8 +24,8 @@ use super::scrolling::{
 use super::shadow::Shadow;
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
-    ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
-    RemovedTile, SizeFrac,
+    ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, MinimizeRect,
+    Options, RemovedTile, SizeFrac,
 };
 use crate::animation::Clock;
 use crate::niri_render_elements;
@@ -768,9 +768,14 @@ impl<W: LayoutElement> Workspace<W> {
         Some(removed)
     }
 
-    pub fn set_minimized(&mut self, id: &W::Id, minimized: bool) -> bool {
+    pub fn set_minimized(
+        &mut self,
+        id: &W::Id,
+        minimized: bool,
+        animation_rect: Option<&MinimizeRect>,
+    ) -> bool {
         if self.floating.has_window(id) {
-            let changed = self.floating.set_minimized(id, minimized);
+            let changed = self.floating.set_minimized(id, minimized, animation_rect);
             if changed {
                 if minimized && !self.floating.has_visible_windows() {
                     self.floating_is_active = FloatingActive::No;
@@ -781,7 +786,7 @@ impl<W: LayoutElement> Workspace<W> {
             return changed;
         }
 
-        let changed = self.scrolling.set_minimized(id, minimized);
+        let changed = self.scrolling.set_minimized(id, minimized, animation_rect);
         if changed {
             if minimized {
                 if self.scrolling.active_window().is_none() && self.floating.has_visible_windows() {
@@ -790,6 +795,99 @@ impl<W: LayoutElement> Workspace<W> {
             } else {
                 self.floating_is_active = FloatingActive::No;
             }
+        }
+
+        changed
+    }
+
+    pub fn minimize_with_snapshot(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        xray: Option<&mut Xray>,
+        xray_has_blocked_out_layers: bool,
+        xray_pos: XrayPos,
+        id: &W::Id,
+        animation_rect: Option<&MinimizeRect>,
+    ) -> bool {
+        let animation_rect = match (animation_rect, self.current_output()) {
+            (Some(rect), Some(output)) if &rect.output == output => Some(rect),
+            _ => None,
+        };
+
+        if self.floating.has_window(id) {
+            let changed = self.floating.minimize_with_snapshot(
+                renderer,
+                xray,
+                xray_has_blocked_out_layers,
+                xray_pos,
+                id,
+                animation_rect,
+            );
+            if changed {
+                if !self.floating.has_visible_windows() {
+                    self.floating_is_active = FloatingActive::No;
+                }
+            }
+            return changed;
+        }
+
+        let changed = self.scrolling.minimize_with_snapshot(
+            renderer,
+            xray,
+            xray_has_blocked_out_layers,
+            xray_pos,
+            id,
+            animation_rect,
+        );
+        if changed
+            && self.scrolling.active_window().is_none()
+            && self.floating.has_visible_windows()
+        {
+            self.floating_is_active = FloatingActive::Yes;
+        }
+
+        changed
+    }
+
+    pub fn restore_with_snapshot(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        xray: Option<&mut Xray>,
+        xray_has_blocked_out_layers: bool,
+        xray_pos: XrayPos,
+        id: &W::Id,
+        animation_rect: Option<&MinimizeRect>,
+    ) -> bool {
+        let animation_rect = match (animation_rect, self.current_output()) {
+            (Some(rect), Some(output)) if &rect.output == output => Some(rect),
+            _ => None,
+        };
+
+        if self.floating.has_window(id) {
+            let changed = self.floating.restore_with_snapshot(
+                renderer,
+                xray,
+                xray_has_blocked_out_layers,
+                xray_pos,
+                id,
+                animation_rect,
+            );
+            if changed {
+                self.floating_is_active = FloatingActive::Yes;
+            }
+            return changed;
+        }
+
+        let changed = self.scrolling.restore_with_snapshot(
+            renderer,
+            xray,
+            xray_has_blocked_out_layers,
+            xray_pos,
+            id,
+            animation_rect,
+        );
+        if changed {
+            self.floating_is_active = FloatingActive::No;
         }
 
         changed
@@ -2086,8 +2184,14 @@ impl<W: LayoutElement> Workspace<W> {
 
             if let Some(alpha) = &tile.alpha_animation {
                 let anim = &alpha.anim;
-                if visible {
+                if visible && !tile.window().is_minimized() {
                     assert_eq!(anim.to(), 1., "visible tiles can animate alpha only to 1");
+                } else if tile.window().is_minimized() && alpha.render_when_minimized {
+                    assert_eq!(
+                        anim.to(),
+                        0.,
+                        "minimized tiles can only render fade-out animations"
+                    );
                 }
 
                 assert!(

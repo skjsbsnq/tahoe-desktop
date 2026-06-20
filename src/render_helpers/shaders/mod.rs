@@ -16,6 +16,7 @@ pub struct Shaders {
     pub clipped_surface: Option<GlesTexProgram>,
     pub postprocess_and_clip: Option<GlesTexProgram>,
     pub resize: Option<ShaderProgram>,
+    pub genie: Option<ShaderProgram>,
     pub gradient_fade: Option<GlesTexProgram>,
     pub blur: Option<BlurProgram>,
     pub custom_resize: RefCell<Option<ShaderProgram>>,
@@ -28,6 +29,7 @@ pub enum ProgramType {
     Border,
     Shadow,
     Resize,
+    Genie,
     Close,
     Open,
 }
@@ -141,6 +143,12 @@ impl Shaders {
             })
             .ok();
 
+        let genie = compile_genie_program(renderer, include_str!("genie.frag"))
+            .map_err(|err| {
+                warn!("error compiling genie shader: {err:?}");
+            })
+            .ok();
+
         let gradient_fade = renderer
             .compile_custom_texture_shader(
                 include_str!("gradient_fade.frag"),
@@ -163,6 +171,7 @@ impl Shaders {
             clipped_surface,
             postprocess_and_clip,
             resize,
+            genie,
             gradient_fade,
             blur,
             custom_resize: RefCell::new(None),
@@ -214,6 +223,7 @@ impl Shaders {
                 .borrow()
                 .clone()
                 .or_else(|| self.resize.clone()),
+            ProgramType::Genie => self.genie.clone(),
             ProgramType::Close => self.custom_close.borrow().clone(),
             ProgramType::Open => self.custom_open.borrow().clone(),
         }
@@ -253,6 +263,30 @@ fn compile_resize_program(
             UniformName::new("niri_clip_to_geometry", UniformType::_1f),
         ],
         &["niri_tex_prev", "niri_tex_next"],
+    )
+}
+
+fn compile_genie_program(
+    renderer: &mut GlesRenderer,
+    src: &str,
+) -> Result<ShaderProgram, GlesError> {
+    let mut program = include_str!("genie_prelude.frag").to_string();
+    program.push_str(src);
+    program.push_str(include_str!("genie_epilogue.frag"));
+
+    ShaderProgram::compile(
+        renderer,
+        &program,
+        &[
+            UniformName::new("niri_area_rect", UniformType::_4f),
+            UniformName::new("niri_window_rect", UniformType::_4f),
+            UniformName::new("niri_target_rect", UniformType::_4f),
+            UniformName::new("niri_geo_to_tex", UniformType::Matrix3x3),
+            UniformName::new("niri_progress", UniformType::_1f),
+            UniformName::new("niri_clamped_progress", UniformType::_1f),
+            UniformName::new("niri_direction", UniformType::_1f),
+        ],
+        &["niri_tex"],
     )
 }
 

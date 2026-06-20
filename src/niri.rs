@@ -142,8 +142,8 @@ use crate::layer::MappedLayer;
 use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
-    HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
-    SnapPreviewRenderElement,
+    HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MinimizeRect,
+    MonitorRenderElement, SnapPreviewRenderElement,
 };
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
@@ -2098,6 +2098,150 @@ impl State {
                     .store_unmap_snapshot(renderer, None, false, window);
             }
         });
+    }
+
+    pub fn minimize_window_with_animation(
+        &mut self,
+        window: &Window,
+        target_rect: Option<MinimizeRect>,
+    ) -> bool {
+        let mut output = None;
+        self.niri
+            .layout
+            .with_windows(|mapped, mapped_output, _, _| {
+                if &mapped.window == window {
+                    output = mapped_output.cloned();
+                }
+            });
+
+        // The minimizing tile may have an xray background, in which case we will render xray
+        // elements, so they need to be updated.
+        self.niri.update_xray_render_elements(output.as_ref());
+
+        let target_rect_for_snapshot = target_rect.clone();
+        let changed = self.backend.with_primary_renderer(|renderer| {
+            if let Some(output) = &output {
+                let mut ctx = RenderCtx {
+                    target: RenderTarget::Output,
+                    renderer,
+                    xray: None,
+                };
+
+                self.niri.fill_xray_elements(ctx.r(), output);
+
+                // If any background layer has block_out_from, also fill the Screencast xray
+                // buffer so the minimize snapshot can render a buffer with blocked-out background.
+                let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
+                if has_blocked_out {
+                    let screencast_ctx = RenderCtx {
+                        target: RenderTarget::Screencast,
+                        ..ctx.r()
+                    };
+                    self.niri.fill_xray_elements(screencast_ctx, output);
+                }
+
+                let state = self.niri.output_state.get_mut(output).unwrap();
+                self.niri.layout.minimize_window_with_snapshot(
+                    renderer,
+                    Some(&mut state.xray),
+                    has_blocked_out,
+                    window,
+                    target_rect_for_snapshot,
+                )
+            } else {
+                self.niri.layout.minimize_window_with_snapshot(
+                    renderer,
+                    None,
+                    false,
+                    window,
+                    target_rect_for_snapshot,
+                )
+            }
+        });
+
+        let changed = changed.unwrap_or_else(|| {
+            self.niri
+                .layout
+                .minimize_window_with_target(window, target_rect)
+        });
+
+        if let Some(output) = &output {
+            self.niri.clear_xray_elements(output);
+        }
+
+        changed
+    }
+
+    pub fn restore_window_with_animation(
+        &mut self,
+        window: &Window,
+        source_rect: Option<MinimizeRect>,
+    ) -> bool {
+        if source_rect.is_none() {
+            return self.niri.layout.restore_window(window);
+        }
+
+        let mut output = None;
+        self.niri
+            .layout
+            .with_windows(|mapped, mapped_output, _, _| {
+                if &mapped.window == window {
+                    output = mapped_output.cloned();
+                }
+            });
+
+        self.niri.update_xray_render_elements(output.as_ref());
+
+        let source_rect_for_snapshot = source_rect.clone();
+        let changed = self.backend.with_primary_renderer(|renderer| {
+            if let Some(output) = &output {
+                let mut ctx = RenderCtx {
+                    target: RenderTarget::Output,
+                    renderer,
+                    xray: None,
+                };
+
+                self.niri.fill_xray_elements(ctx.r(), output);
+
+                let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
+                if has_blocked_out {
+                    let screencast_ctx = RenderCtx {
+                        target: RenderTarget::Screencast,
+                        ..ctx.r()
+                    };
+                    self.niri.fill_xray_elements(screencast_ctx, output);
+                }
+
+                let state = self.niri.output_state.get_mut(output).unwrap();
+                self.niri.layout.restore_window_with_snapshot(
+                    renderer,
+                    Some(&mut state.xray),
+                    has_blocked_out,
+                    window,
+                    source_rect_for_snapshot,
+                )
+            } else {
+                self.niri.layout.restore_window_with_snapshot(
+                    renderer,
+                    None,
+                    false,
+                    window,
+                    source_rect_for_snapshot,
+                )
+            }
+        });
+
+        let changed = changed.unwrap_or_else(|| {
+            self.niri
+                .layout
+                .restore_window_with_source(window, source_rect)
+        });
+
+        if let Some(output) = &output {
+            self.niri.clear_xray_elements(output);
+        }
+
+        changed
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]

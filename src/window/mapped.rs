@@ -47,6 +47,14 @@ use crate::utils::{
     ResizeEdge,
 };
 
+#[derive(Debug, Clone)]
+pub struct ForeignToplevelRect {
+    pub source_surface: WlSurface,
+    pub source_root_surface: WlSurface,
+    pub output: Output,
+    pub rect: Rectangle<i32, Logical>,
+}
+
 #[derive(Debug)]
 pub struct Mapped {
     pub window: Window,
@@ -99,6 +107,9 @@ pub struct Mapped {
 
     /// Whether this window is minimized.
     is_minimized: bool,
+
+    /// Last rectangle provided through wlr foreign-toplevel set_rectangle.
+    foreign_toplevel_rect: Option<ForeignToplevelRect>,
 
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
@@ -293,6 +304,7 @@ impl Mapped {
             is_active_in_column: true,
             is_floating: false,
             is_minimized: false,
+            foreign_toplevel_rect: None,
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
@@ -385,6 +397,26 @@ impl Mapped {
 
     pub fn is_minimized(&self) -> bool {
         self.is_minimized
+    }
+
+    pub fn foreign_toplevel_rect(&self) -> Option<&ForeignToplevelRect> {
+        self.foreign_toplevel_rect.as_ref()
+    }
+
+    pub fn set_foreign_toplevel_rect(&mut self, rect: Option<ForeignToplevelRect>) {
+        self.foreign_toplevel_rect = rect;
+    }
+
+    pub fn clear_foreign_toplevel_rect_for_source(&mut self, source_surface: &WlSurface) -> bool {
+        let should_clear = self.foreign_toplevel_rect.as_ref().is_some_and(|rect| {
+            rect.source_surface == *source_surface || rect.source_root_surface == *source_surface
+        });
+
+        if should_clear {
+            self.foreign_toplevel_rect = None;
+        }
+
+        should_clear
     }
 
     pub fn is_window_cast_target(&self) -> bool {

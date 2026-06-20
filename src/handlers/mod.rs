@@ -13,7 +13,7 @@ use std::time::Duration;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
 use smithay::backend::input::{InputEvent, TabletToolDescriptor};
-use smithay::desktop::{PopupKind, PopupManager};
+use smithay::desktop::{layer_map_for_output, PopupKind, PopupManager, WindowSurfaceType};
 use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle};
 use smithay::input::{keyboard, Seat, SeatHandler, SeatState};
@@ -23,7 +23,7 @@ use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_scre
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::utils::{Logical, Point, Rectangle, Serial, Size};
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_lease::{
@@ -74,7 +74,7 @@ use smithay::{
 
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::layout::workspace::WorkspaceId;
-use crate::layout::ActivateWindow;
+use crate::layout::{ActivateWindow, MinimizeRect};
 use crate::niri::{DndIcon, NewClient, State};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceHandler, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{
@@ -91,6 +91,7 @@ use crate::protocols::virtual_pointer::{
     VirtualPointerMotionEvent,
 };
 use crate::utils::{output_size, send_scale_transform};
+use crate::window::mapped::ForeignToplevelRect;
 use crate::{
     delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
     delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
@@ -533,6 +534,20 @@ impl IdleInhibitHandler for State {
 }
 delegate_idle_inhibit!(State);
 
+impl State {
+    fn clear_foreign_toplevel_rects_for_source(&mut self, source_surface: &WlSurface) {
+        self.niri.layout.with_windows_mut(|mapped, _| {
+            if mapped.clear_foreign_toplevel_rect_for_source(source_surface) {
+                debug!(
+                    window = mapped.id().get(),
+                    source = %source_surface.id(),
+                    "cleared foreign-toplevel rectangle because source surface was destroyed"
+                );
+            }
+        });
+    }
+}
+
 impl ForeignToplevelHandler for State {
     fn foreign_toplevel_manager_state(&mut self) -> &mut ForeignToplevelManagerState {
         &mut self.niri.foreign_toplevel_state
@@ -599,7 +614,11 @@ impl ForeignToplevelHandler for State {
     fn set_minimized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            if self.niri.layout.minimize_window(&window) {
+            let target_rect = mapped.foreign_toplevel_rect().map(|rect| MinimizeRect {
+                output: rect.output.clone(),
+                rect: rect.rect,
+            });
+            if self.minimize_window_with_animation(&window, target_rect) {
                 self.niri.layer_shell_on_demand_focus = None;
                 self.niri.queue_redraw_all();
             }
@@ -609,11 +628,93 @@ impl ForeignToplevelHandler for State {
     fn unset_minimized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            if self.niri.layout.restore_window(&window) {
+            let source_rect = mapped.foreign_toplevel_rect().map(|rect| MinimizeRect {
+                output: rect.output.clone(),
+                rect: rect.rect,
+            });
+            if self.restore_window_with_animation(&window, source_rect) {
                 self.niri.layer_shell_on_demand_focus = None;
                 self.niri.queue_redraw_all();
             }
         }
+    }
+
+    fn set_rectangle(
+        &mut self,
+        wl_surface: WlSurface,
+        source_surface: WlSurface,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) {
+        let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) else {
+            return;
+        };
+        let mapped_id = mapped.id();
+
+        if width <= 0 || height <= 0 {
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&wl_surface) {
+                mapped.set_foreign_toplevel_rect(None);
+            }
+            debug!(
+                window = mapped_id.get(),
+                source = %source_surface.id(),
+                "cleared foreign-toplevel rectangle because dimensions are empty"
+            );
+            return;
+        }
+
+        let source_root = self.niri.find_root_shell_surface(&source_surface);
+        let rect = Rectangle::new(Point::from((x, y)), Size::from((width, height)));
+
+        let target = self.niri.layout.outputs().find_map(|output| {
+            let layers = layer_map_for_output(output);
+            let layer = layers.layer_for_surface(&source_root, WindowSurfaceType::TOPLEVEL)?;
+
+            if !self.niri.mapped_layer_surfaces.contains_key(layer) {
+                return None;
+            }
+
+            let layer_geo = layers.layer_geometry(layer)?;
+            let rect = Rectangle::new(layer_geo.loc + rect.loc, rect.size);
+
+            Some((output.clone(), rect))
+        });
+
+        let Some((output, rect)) = target else {
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&wl_surface) {
+                mapped.set_foreign_toplevel_rect(None);
+            }
+            debug!(
+                window = mapped_id.get(),
+                source = %source_surface.id(),
+                source_root = %source_root.id(),
+                "cleared foreign-toplevel rectangle because source layer surface was not mapped"
+            );
+            return;
+        };
+
+        if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&wl_surface) {
+            mapped.set_foreign_toplevel_rect(Some(ForeignToplevelRect {
+                source_surface: source_surface.clone(),
+                source_root_surface: source_root.clone(),
+                output: output.clone(),
+                rect,
+            }));
+        }
+
+        debug!(
+            window = mapped_id.get(),
+            source = %source_surface.id(),
+            source_root = %source_root.id(),
+            output = output.name(),
+            x = rect.loc.x,
+            y = rect.loc.y,
+            width = rect.size.w,
+            height = rect.size.h,
+            "stored foreign-toplevel rectangle"
+        );
     }
 }
 delegate_foreign_toplevel!(State);

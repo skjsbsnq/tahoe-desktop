@@ -47,6 +47,7 @@ impl WlrLayerShellHandler for State {
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         let wl_surface = surface.wl_surface();
+        self.clear_foreign_toplevel_rects_for_source(wl_surface);
         self.niri.unmapped_layer_surfaces.remove(wl_surface);
 
         let output = if let Some((output, mut map, layer)) =
@@ -187,6 +188,7 @@ impl State {
         } else {
             // The surface is unmapped.
             if self.niri.mapped_layer_surfaces.remove(layer).is_some() {
+                self.clear_foreign_toplevel_rects_for_source(surface);
                 needs_output_resize = true;
 
                 // A mapped surface got unmapped via a null commit. Now it needs to do a new

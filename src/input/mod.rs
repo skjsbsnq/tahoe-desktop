@@ -838,7 +838,7 @@ impl State {
             Action::MinimizeWindow => {
                 let focus = self.niri.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    if self.niri.layout.minimize_window(&window) {
+                    if self.minimize_window_with_animation(&window, None) {
                         self.niri.layer_shell_on_demand_focus = None;
                         self.niri.queue_redraw_all();
                     }
@@ -848,7 +848,7 @@ impl State {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    if self.niri.layout.minimize_window(&window) {
+                    if self.minimize_window_with_animation(&window, None) {
                         self.niri.layer_shell_on_demand_focus = None;
                         self.niri.queue_redraw_all();
                     }
@@ -858,7 +858,7 @@ impl State {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    if self.niri.layout.restore_window(&window) {
+                    if self.restore_window_with_animation(&window, None) {
                         self.niri.layer_shell_on_demand_focus = None;
                         self.niri.queue_redraw_all();
                     }
