@@ -486,6 +486,74 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.tiles.iter().any(|tile| tile.window().id() == id)
     }
 
+    pub fn is_snapped_to_working_area(&self, id: &W::Id) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        self.tiles[idx].snap_restore_window_size.is_some()
+    }
+
+    pub fn snap_window_to_working_area(&mut self, id: &W::Id, animate: bool) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        let target = self.working_area;
+        let target_pos = Data::logical_to_size_frac_in_working_area(self.working_area, target.loc);
+
+        {
+            let tile = &mut self.tiles[idx];
+            let restore_size = tile.snap_restore_window_size.unwrap_or_else(|| {
+                tile.window()
+                    .expected_size()
+                    .unwrap_or_else(|| tile.window().size())
+            });
+            tile.snap_restore_window_size = Some(restore_size);
+
+            let mut win_size = Size::from((
+                tile.window_width_for_tile_width(target.size.w)
+                    .round()
+                    .clamp(1., 100000.) as i32,
+                tile.window_height_for_tile_height(target.size.h)
+                    .round()
+                    .clamp(1., 100000.) as i32,
+            ));
+
+            let win = tile.window_mut();
+            let min_size = win.min_size();
+            let max_size = win.max_size();
+            win_size.w = ensure_min_max_size(win_size.w, min_size.w, max_size.w);
+            win_size.h = ensure_min_max_size(win_size.h, min_size.h, max_size.h);
+            win.request_size_once(win_size, animate);
+
+            tile.floating_window_size = Some(win_size);
+            tile.floating_pos = Some(target_pos);
+        }
+
+        self.move_and_animate(idx, target.loc);
+        self.data[idx].update(&self.tiles[idx]);
+
+        true
+    }
+
+    pub fn unsnap_window_from_working_area(&mut self, id: &W::Id, animate: bool) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        let Some(restore_size) = self.tiles[idx].snap_restore_window_size.take() else {
+            return false;
+        };
+
+        let tile = &mut self.tiles[idx];
+        tile.floating_window_size = Some(restore_size);
+        tile.window_mut().request_size_once(restore_size, animate);
+        self.data[idx].update(tile);
+
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
     }

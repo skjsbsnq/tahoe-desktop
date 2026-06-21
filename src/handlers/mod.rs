@@ -600,14 +600,19 @@ impl ForeignToplevelHandler for State {
     fn set_maximized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            self.niri.layout.set_maximized(&window, true);
+            if self.niri.layout.snap_window_to_working_area(&window, true) {
+                self.niri.queue_redraw_all();
+            }
         }
     }
 
     fn unset_maximized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            self.niri.layout.set_maximized(&window, false);
+            if !self.niri.layout.snap_window_to_working_area(&window, false) {
+                self.niri.layout.set_maximized(&window, false);
+            }
+            self.niri.queue_redraw_all();
         }
     }
 

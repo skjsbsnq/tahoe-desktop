@@ -3972,6 +3972,22 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    pub fn snap_window_to_working_area(&mut self, id: &W::Id, snap: bool) -> bool {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == id {
+                return false;
+            }
+        }
+
+        for ws in self.workspaces_mut() {
+            if ws.has_window(id) {
+                return ws.snap_window_to_working_area(id, snap);
+            }
+        }
+
+        false
+    }
+
     pub fn workspace_switch_gesture_begin(&mut self, output: &Output, is_touchpad: bool) {
         let monitors = match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => monitors,

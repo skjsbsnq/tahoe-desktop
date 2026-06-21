@@ -1510,6 +1510,53 @@ impl<W: LayoutElement> Workspace<W> {
         self.set_maximized(window, !current);
     }
 
+    pub fn snap_window_to_working_area(&mut self, window: &W::Id, snap: bool) -> bool {
+        if snap {
+            if self.floating.is_snapped_to_working_area(window) {
+                if self.floating.unsnap_window_from_working_area(window, true) {
+                    self.floating.activate_window(window);
+                    self.floating_is_active = FloatingActive::Yes;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if !self.floating.has_window(window) {
+                self.toggle_window_floating(Some(window));
+            }
+
+            if self.floating.snap_window_to_working_area(window, true) {
+                self.floating.activate_window(window);
+                self.floating_is_active = FloatingActive::Yes;
+                return true;
+            }
+
+            return false;
+        }
+
+        if self.floating.has_window(window) {
+            if self.floating.unsnap_window_from_working_area(window, true) {
+                self.floating.activate_window(window);
+                self.floating_is_active = FloatingActive::Yes;
+                return true;
+            }
+
+            return false;
+        }
+
+        if self
+            .scrolling
+            .columns()
+            .any(|col| col.contains(window) && col.is_pending_maximized())
+        {
+            self.set_maximized(window, false);
+            return true;
+        }
+
+        false
+    }
+
     pub fn toggle_window_floating(&mut self, id: Option<&W::Id>) {
         let active_id = self.active_window().map(|win| win.id().clone());
         let target_is_active = id.is_none_or(|id| Some(id) == active_id.as_ref());
