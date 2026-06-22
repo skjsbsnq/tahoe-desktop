@@ -1,10 +1,13 @@
+use niri_config::animations::{LayerCloseAnim, LayerOpenAnim};
 use niri_config::layer_rule::{LayerRule, Match};
 use niri_config::utils::MergeWith as _;
 use niri_config::{BackgroundEffect, BlockOutFrom, CornerRadius, ResolvedPopupsRules, ShadowRule};
 use smithay::desktop::LayerSurface;
 use smithay::wayland::shell::wlr_layer::Layer;
 
+pub mod closing_layer;
 pub mod mapped;
+pub mod opening_layer;
 pub use mapped::MappedLayer;
 
 /// Rules fully resolved for a layer-shell surface.
@@ -33,6 +36,12 @@ pub struct ResolvedLayerRules {
 
     /// Rules for this layer surface's popups.
     pub popups: ResolvedPopupsRules,
+
+    /// Animation configuration to use when this layer surface maps.
+    pub layer_open: Option<LayerOpenAnim>,
+
+    /// Animation configuration to use when this layer surface unmaps.
+    pub layer_close: Option<LayerCloseAnim>,
 }
 
 impl ResolvedLayerRules {
@@ -83,6 +92,15 @@ impl ResolvedLayerRules {
                 .merge_with(&rule.background_effect);
 
             resolved.popups.merge_with(&rule.popups);
+
+            if let Some(animations) = &rule.animations {
+                if animations.layer_open.is_some() {
+                    resolved.layer_open = animations.layer_open;
+                }
+                if animations.layer_close.is_some() {
+                    resolved.layer_close = animations.layer_close;
+                }
+            }
         }
 
         resolved

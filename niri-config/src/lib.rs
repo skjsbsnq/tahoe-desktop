@@ -635,6 +635,11 @@ impl ConfigPath {
 
 #[cfg(test)]
 mod tests {
+    use crate::animations::{
+        Curve, EasingParams, Kind, LayerAnimationEdge, LayerAnimationOrigin, LayerCloseAnim,
+        LayerCloseAnimationStyle, LayerOpenAnim, LayerOpenAnimationStyle,
+    };
+
     use insta::{assert_debug_snapshot, assert_snapshot};
     use pretty_assertions::assert_eq;
 
@@ -650,6 +655,135 @@ mod tests {
         let config = Config::parse_mem("").unwrap();
         assert_eq!(config.input.keyboard.repeat_delay, 600);
         assert_eq!(config.input.keyboard.repeat_rate, 25);
+    }
+
+    #[test]
+    fn parse_layer_rule_animations() {
+        let config = do_parse(
+            r#"
+            layer-rule {
+                match namespace="^tahoe-control-center$"
+
+                animations {
+                    layer-open {}
+                    layer-close {}
+                }
+            }
+
+            layer-rule {
+                match namespace="^plain-layer$"
+            }
+            "#,
+        );
+
+        let animations = config.layer_rules[0].animations.as_ref().unwrap();
+        assert_eq!(
+            animations.layer_open,
+            Some(LayerOpenAnim {
+                anim: Animation {
+                    off: false,
+                    kind: Kind::Easing(EasingParams {
+                        duration_ms: 150,
+                        curve: Curve::EaseOutExpo,
+                    }),
+                },
+                style: LayerOpenAnimationStyle::Popin,
+                scale_from: 0.96,
+                opacity_from: 0.,
+                origin: LayerAnimationOrigin::Center,
+                edge: LayerAnimationEdge::Right,
+                distance: 32.,
+            })
+        );
+        assert_eq!(
+            animations.layer_close,
+            Some(LayerCloseAnim {
+                anim: Animation {
+                    off: false,
+                    kind: Kind::Easing(EasingParams {
+                        duration_ms: 150,
+                        curve: Curve::EaseOutQuad,
+                    }),
+                },
+                style: LayerCloseAnimationStyle::Popout,
+                scale_to: 0.97,
+                opacity_to: 0.,
+                origin: LayerAnimationOrigin::Center,
+                edge: LayerAnimationEdge::Right,
+                distance: 32.,
+            })
+        );
+        assert_eq!(config.layer_rules[1].animations, None);
+    }
+
+    #[test]
+    fn parse_layer_rule_animation_styles() {
+        let config = do_parse(
+            r#"
+            layer-rule {
+                match namespace="^tahoe-wifi-popup$"
+
+                animations {
+                    layer-open {
+                        style "popin"
+                        scale-from 0.93
+                        opacity-from 0
+                        duration-ms 180
+                        curve "emphasized-decel"
+                        origin "anchor"
+                    }
+
+                    layer-close {
+                        style "slide"
+                        edge "left"
+                        distance 28
+                        opacity-to 0.25
+                        duration-ms 120
+                        curve "cubic-bezier" 0.3 0 0.8 0.15
+                        origin "center"
+                    }
+                }
+            }
+            "#,
+        );
+
+        let animations = config.layer_rules[0].animations.as_ref().unwrap();
+        assert_eq!(
+            animations.layer_open,
+            Some(LayerOpenAnim {
+                anim: Animation {
+                    off: false,
+                    kind: Kind::Easing(EasingParams {
+                        duration_ms: 180,
+                        curve: Curve::CubicBezier(0.05, 0.7, 0.1, 1.),
+                    }),
+                },
+                style: LayerOpenAnimationStyle::Popin,
+                scale_from: 0.93,
+                opacity_from: 0.,
+                origin: LayerAnimationOrigin::Anchor,
+                edge: LayerAnimationEdge::Right,
+                distance: 32.,
+            })
+        );
+        assert_eq!(
+            animations.layer_close,
+            Some(LayerCloseAnim {
+                anim: Animation {
+                    off: false,
+                    kind: Kind::Easing(EasingParams {
+                        duration_ms: 120,
+                        curve: Curve::CubicBezier(0.3, 0., 0.8, 0.15),
+                    }),
+                },
+                style: LayerCloseAnimationStyle::Slide,
+                scale_to: 0.97,
+                opacity_to: 0.25,
+                origin: LayerAnimationOrigin::Center,
+                edge: LayerAnimationEdge::Left,
+                distance: 28.,
+            })
+        );
     }
 
     #[track_caller]
@@ -2386,6 +2520,7 @@ mod tests {
                             lens_depth: None,
                         },
                     },
+                    animations: None,
                 },
             ],
             binds: Binds(

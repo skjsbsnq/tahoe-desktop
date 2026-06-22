@@ -106,6 +106,7 @@ pub fn render_for_layer(
     scale: f64,
     blur_config: niri_config::Blur,
     config: &TahoeGlass,
+    layer_alpha: f32,
     xray_pos: XrayPos,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
@@ -148,6 +149,7 @@ pub fn render_for_layer(
                 location,
                 scale,
                 blur_config,
+                layer_alpha,
                 xray_pos,
                 push,
             );
@@ -167,12 +169,13 @@ fn render_region(
     surface_location: Point<f64, Logical>,
     scale: f64,
     blur_config: niri_config::Blur,
+    layer_alpha: f32,
     xray_pos: XrayPos,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) {
     let rect = region.rect.to_f64();
     let geometry = Rectangle::new(surface_location + rect.loc, rect.size);
-    let material_alpha = region.material_alpha.clamp(0., 1.);
+    let material_alpha = region.material_alpha.clamp(0., 1.) * layer_alpha.clamp(0., 1.);
 
     if region.flags.shadow && material_alpha > 0. {
         renderer.shadow.update_config(material.shadow);

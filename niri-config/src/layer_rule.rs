@@ -1,3 +1,4 @@
+use crate::animations::{LayerCloseAnim, LayerOpenAnim};
 use crate::appearance::{BackgroundEffectRule, BlockOutFrom, CornerRadius, ShadowRule};
 use crate::utils::RegexEq;
 use crate::window_rule::PopupsRule;
@@ -25,6 +26,16 @@ pub struct LayerRule {
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]
     pub popups: PopupsRule,
+    #[knuffel(child)]
+    pub animations: Option<LayerAnimationsRule>,
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct LayerAnimationsRule {
+    #[knuffel(child)]
+    pub layer_open: Option<LayerOpenAnim>,
+    #[knuffel(child)]
+    pub layer_close: Option<LayerCloseAnim>,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]

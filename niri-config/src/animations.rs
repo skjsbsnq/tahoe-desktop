@@ -194,6 +194,96 @@ impl Default for WindowCloseAnim {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerOpenAnim {
+    pub anim: Animation,
+    pub style: LayerOpenAnimationStyle,
+    pub scale_from: f64,
+    pub opacity_from: f32,
+    pub origin: LayerAnimationOrigin,
+    pub edge: LayerAnimationEdge,
+    pub distance: f64,
+}
+
+impl Default for LayerOpenAnim {
+    fn default() -> Self {
+        Self {
+            anim: Animation {
+                off: false,
+                kind: Kind::Easing(EasingParams {
+                    duration_ms: 150,
+                    curve: Curve::EaseOutExpo,
+                }),
+            },
+            style: LayerOpenAnimationStyle::Popin,
+            scale_from: 0.96,
+            opacity_from: 0.,
+            origin: LayerAnimationOrigin::Center,
+            edge: LayerAnimationEdge::Right,
+            distance: 32.,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerCloseAnim {
+    pub anim: Animation,
+    pub style: LayerCloseAnimationStyle,
+    pub scale_to: f64,
+    pub opacity_to: f32,
+    pub origin: LayerAnimationOrigin,
+    pub edge: LayerAnimationEdge,
+    pub distance: f64,
+}
+
+impl Default for LayerCloseAnim {
+    fn default() -> Self {
+        Self {
+            anim: Animation {
+                off: false,
+                kind: Kind::Easing(EasingParams {
+                    duration_ms: 150,
+                    curve: Curve::EaseOutQuad,
+                }),
+            },
+            style: LayerCloseAnimationStyle::Popout,
+            scale_to: 0.97,
+            opacity_to: 0.,
+            origin: LayerAnimationOrigin::Center,
+            edge: LayerAnimationEdge::Right,
+            distance: 32.,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerOpenAnimationStyle {
+    Fade,
+    Popin,
+    Slide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerCloseAnimationStyle {
+    Fade,
+    Popout,
+    Slide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerAnimationOrigin {
+    Center,
+    Anchor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerAnimationEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HorizontalViewMovementAnim(pub Animation);
 
 impl Default for HorizontalViewMovementAnim {
@@ -423,6 +513,146 @@ where
     }
 }
 
+impl<S> knuffel::Decode<S> for LayerOpenAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default();
+        let mut style = None;
+        let mut scale_from = None;
+        let mut opacity_from = None;
+        let mut origin = None;
+        let mut edge = None;
+        let mut distance = None;
+
+        let anim = Animation::decode_node(node, ctx, default.anim, |child, ctx| {
+            match &**child.node_name {
+                "style" => {
+                    check_duplicate_node(ctx, child, style.is_some(), "style");
+                    let value: String = parse_arg_node("style", child, ctx)?;
+                    style = Some(parse_layer_open_style(ctx, child, &value));
+                    Ok(true)
+                }
+                "scale-from" => {
+                    check_duplicate_node(ctx, child, scale_from.is_some(), "scale-from");
+                    let value: FloatOrInt<0, 10> = parse_arg_node("scale-from", child, ctx)?;
+                    scale_from = Some(value.0);
+                    Ok(true)
+                }
+                "opacity-from" => {
+                    check_duplicate_node(ctx, child, opacity_from.is_some(), "opacity-from");
+                    let value: FloatOrInt<0, 1> = parse_arg_node("opacity-from", child, ctx)?;
+                    opacity_from = Some(value.0 as f32);
+                    Ok(true)
+                }
+                "origin" => {
+                    check_duplicate_node(ctx, child, origin.is_some(), "origin");
+                    let value: String = parse_arg_node("origin", child, ctx)?;
+                    origin = Some(parse_layer_animation_origin(ctx, child, &value));
+                    Ok(true)
+                }
+                "edge" => {
+                    check_duplicate_node(ctx, child, edge.is_some(), "edge");
+                    let value: String = parse_arg_node("edge", child, ctx)?;
+                    edge = Some(parse_layer_animation_edge(ctx, child, &value));
+                    Ok(true)
+                }
+                "distance" => {
+                    check_duplicate_node(ctx, child, distance.is_some(), "distance");
+                    let value: FloatOrInt<0, 65535> = parse_arg_node("distance", child, ctx)?;
+                    distance = Some(value.0);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        })?;
+
+        Ok(Self {
+            anim,
+            style: style.unwrap_or(default.style),
+            scale_from: scale_from.unwrap_or(default.scale_from),
+            opacity_from: opacity_from.unwrap_or(default.opacity_from),
+            origin: origin.unwrap_or(default.origin),
+            edge: edge.unwrap_or(default.edge),
+            distance: distance.unwrap_or(default.distance),
+        })
+    }
+}
+
+impl<S> knuffel::Decode<S> for LayerCloseAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default();
+        let mut style = None;
+        let mut scale_to = None;
+        let mut opacity_to = None;
+        let mut origin = None;
+        let mut edge = None;
+        let mut distance = None;
+
+        let anim = Animation::decode_node(node, ctx, default.anim, |child, ctx| {
+            match &**child.node_name {
+                "style" => {
+                    check_duplicate_node(ctx, child, style.is_some(), "style");
+                    let value: String = parse_arg_node("style", child, ctx)?;
+                    style = Some(parse_layer_close_style(ctx, child, &value));
+                    Ok(true)
+                }
+                "scale-to" => {
+                    check_duplicate_node(ctx, child, scale_to.is_some(), "scale-to");
+                    let value: FloatOrInt<0, 10> = parse_arg_node("scale-to", child, ctx)?;
+                    scale_to = Some(value.0);
+                    Ok(true)
+                }
+                "opacity-to" => {
+                    check_duplicate_node(ctx, child, opacity_to.is_some(), "opacity-to");
+                    let value: FloatOrInt<0, 1> = parse_arg_node("opacity-to", child, ctx)?;
+                    opacity_to = Some(value.0 as f32);
+                    Ok(true)
+                }
+                "origin" => {
+                    check_duplicate_node(ctx, child, origin.is_some(), "origin");
+                    let value: String = parse_arg_node("origin", child, ctx)?;
+                    origin = Some(parse_layer_animation_origin(ctx, child, &value));
+                    Ok(true)
+                }
+                "edge" => {
+                    check_duplicate_node(ctx, child, edge.is_some(), "edge");
+                    let value: String = parse_arg_node("edge", child, ctx)?;
+                    edge = Some(parse_layer_animation_edge(ctx, child, &value));
+                    Ok(true)
+                }
+                "distance" => {
+                    check_duplicate_node(ctx, child, distance.is_some(), "distance");
+                    let value: FloatOrInt<0, 65535> = parse_arg_node("distance", child, ctx)?;
+                    distance = Some(value.0);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        })?;
+
+        Ok(Self {
+            anim,
+            style: style.unwrap_or(default.style),
+            scale_to: scale_to.unwrap_or(default.scale_to),
+            opacity_to: opacity_to.unwrap_or(default.opacity_to),
+            origin: origin.unwrap_or(default.origin),
+            edge: edge.unwrap_or(default.edge),
+            distance: distance.unwrap_or(default.distance),
+        })
+    }
+}
+
 impl<S> knuffel::Decode<S> for WindowResizeAnim
 where
     S: knuffel::traits::ErrorSpan,
@@ -521,6 +751,113 @@ where
         Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
             Ok(false)
         })?))
+    }
+}
+
+fn check_duplicate_node<S: knuffel::traits::ErrorSpan>(
+    ctx: &mut knuffel::decode::Context<S>,
+    node: &knuffel::ast::SpannedNode<S>,
+    duplicate: bool,
+    name: &str,
+) {
+    if duplicate {
+        ctx.emit_error(DecodeError::unexpected(
+            &node.node_name,
+            "node",
+            format!("duplicate node `{name}`, single node expected"),
+        ));
+    }
+}
+
+fn parse_layer_open_style<S: knuffel::traits::ErrorSpan>(
+    ctx: &mut knuffel::decode::Context<S>,
+    node: &knuffel::ast::SpannedNode<S>,
+    value: &str,
+) -> LayerOpenAnimationStyle {
+    match value {
+        "fade" => LayerOpenAnimationStyle::Fade,
+        "popin" => LayerOpenAnimationStyle::Popin,
+        "slide" => LayerOpenAnimationStyle::Slide,
+        unexpected => {
+            ctx.emit_error(DecodeError::unexpected(
+                node,
+                "node",
+                format!(
+                    "unexpected layer open animation style `{unexpected}`. \
+                    Supported styles are `fade`, `popin` and `slide`."
+                ),
+            ));
+            LayerOpenAnimationStyle::Fade
+        }
+    }
+}
+
+fn parse_layer_close_style<S: knuffel::traits::ErrorSpan>(
+    ctx: &mut knuffel::decode::Context<S>,
+    node: &knuffel::ast::SpannedNode<S>,
+    value: &str,
+) -> LayerCloseAnimationStyle {
+    match value {
+        "fade" => LayerCloseAnimationStyle::Fade,
+        "popout" => LayerCloseAnimationStyle::Popout,
+        "slide" => LayerCloseAnimationStyle::Slide,
+        unexpected => {
+            ctx.emit_error(DecodeError::unexpected(
+                node,
+                "node",
+                format!(
+                    "unexpected layer close animation style `{unexpected}`. \
+                    Supported styles are `fade`, `popout` and `slide`."
+                ),
+            ));
+            LayerCloseAnimationStyle::Fade
+        }
+    }
+}
+
+fn parse_layer_animation_origin<S: knuffel::traits::ErrorSpan>(
+    ctx: &mut knuffel::decode::Context<S>,
+    node: &knuffel::ast::SpannedNode<S>,
+    value: &str,
+) -> LayerAnimationOrigin {
+    match value {
+        "center" => LayerAnimationOrigin::Center,
+        "anchor" => LayerAnimationOrigin::Anchor,
+        unexpected => {
+            ctx.emit_error(DecodeError::unexpected(
+                node,
+                "node",
+                format!(
+                    "unexpected layer animation origin `{unexpected}`. \
+                    Supported origins are `center` and `anchor`."
+                ),
+            ));
+            LayerAnimationOrigin::Center
+        }
+    }
+}
+
+fn parse_layer_animation_edge<S: knuffel::traits::ErrorSpan>(
+    ctx: &mut knuffel::decode::Context<S>,
+    node: &knuffel::ast::SpannedNode<S>,
+    value: &str,
+) -> LayerAnimationEdge {
+    match value {
+        "top" => LayerAnimationEdge::Top,
+        "right" => LayerAnimationEdge::Right,
+        "bottom" => LayerAnimationEdge::Bottom,
+        "left" => LayerAnimationEdge::Left,
+        unexpected => {
+            ctx.emit_error(DecodeError::unexpected(
+                node,
+                "node",
+                format!(
+                    "unexpected layer animation edge `{unexpected}`. \
+                    Supported edges are `top`, `right`, `bottom` and `left`."
+                ),
+            ));
+            LayerAnimationEdge::Right
+        }
     }
 }
 
@@ -634,6 +971,11 @@ impl Animation {
                         "ease-out-quad" => Some(Curve::EaseOutQuad),
                         "ease-out-cubic" => Some(Curve::EaseOutCubic),
                         "ease-out-expo" => Some(Curve::EaseOutExpo),
+                        "emphasized-decel" => Some(Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+                        "emphasized-accel" => Some(Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+                        "menu-decel" => Some(Curve::CubicBezier(0.1, 1., 0., 1.)),
+                        "menu-accel" => Some(Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+                        "stall" => Some(Curve::CubicBezier(1., -0.1, 0.7, 0.85)),
                         "cubic-bezier" => {
                             let val = iter_args.next().ok_or_else(|| {
                                 DecodeError::missing(
@@ -678,8 +1020,10 @@ impl Animation {
                                 "argument",
                                 format!(
                                     "unexpected animation curve `{unexpected_curve}`. \
-                                    Niri only supports five animation curves: \
-                                    `ease-out-quad`, `ease-out-cubic`, `ease-out-expo`, `linear` and `cubic-bezier`."
+                                    Niri only supports these animation curves: \
+                                    `ease-out-quad`, `ease-out-cubic`, `ease-out-expo`, `linear`, \
+                                    `emphasized-decel`, `emphasized-accel`, `menu-decel`, \
+                                    `menu-accel`, `stall` and `cubic-bezier`."
                                 ),
                             ));
 

@@ -1,16 +1,22 @@
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::delegate_layer_shell;
 use smithay::desktop::{layer_map_for_output, LayerSurface, PopupKind, WindowSurfaceType};
+use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{Logical, Rectangle, Scale};
 use smithay::wayland::compositor::{add_pre_commit_hook, get_parent, with_states, HookId};
+use smithay::wayland::compositor::{BufferAssignment, SurfaceAttributes};
 use smithay::wayland::shell::wlr_layer::{
     self, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceCachedState, LayerSurfaceData,
     WlrLayerShellHandler, WlrLayerShellState,
 };
 use smithay::wayland::shell::xdg::PopupSurface;
 
+use crate::animation::Animation;
+use crate::layer::closing_layer::ClosingLayer;
 use crate::layer::{MappedLayer, ResolvedLayerRules};
-use crate::niri::State;
+use crate::niri::{ClosingLayerState, State};
 use crate::utils::{is_mapped, output_size, send_scale_transform};
 
 impl WlrLayerShellHandler for State {
@@ -50,17 +56,27 @@ impl WlrLayerShellHandler for State {
         self.clear_foreign_toplevel_rects_for_source(wl_surface);
         self.niri.unmapped_layer_surfaces.remove(wl_surface);
 
-        let output = if let Some((output, mut map, layer)) =
-            self.niri.layout.outputs().find_map(|o| {
-                let map = layer_map_for_output(o);
-                let layer = map
-                    .layers()
-                    .find(|&layer| layer.layer_surface() == &surface)
-                    .cloned();
-                layer.map(|layer| (o.clone(), map, layer))
-            }) {
+        let found = self.niri.layout.outputs().find_map(|o| {
+            let map = layer_map_for_output(o);
+            let layer = map
+                .layers()
+                .find(|&layer| layer.layer_surface() == &surface)
+                .cloned();
+            layer.map(|layer| (o.clone(), layer))
+        });
+
+        let output = if let Some((output, layer)) = found {
+            let mut map = layer_map_for_output(&output);
+            let geo = map.layer_geometry(&layer);
+
+            if let Some(mapped) = self.niri.mapped_layer_surfaces.remove(&layer) {
+                if let Some(geo) = geo {
+                    self.start_close_animation_for_layer(&output, &layer, geo, mapped);
+                }
+            }
+
             map.unmap_layer(&layer);
-            self.niri.mapped_layer_surfaces.remove(&layer);
+            drop(map);
             Some(output)
         } else {
             None
@@ -104,17 +120,22 @@ impl State {
         }
 
         let mut map = layer_map_for_output(&output);
+        let layer = map
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .cloned()
+            .unwrap();
+        let close_geo = map.layer_geometry(&layer);
 
         // Arrange the layers before sending the initial configure to respect any size the
         // client may have sent. For already-mapped content-only commits this usually returns
         // false, and we can avoid the heavier output_resized() path below.
         let mut needs_output_resize = map.arrange();
 
-        let layer = map
-            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
-            .unwrap();
-
         if is_mapped(surface) {
+            self.niri
+                .closing_layers
+                .retain(|closing| closing.surface != layer);
+
             let was_unmapped = self.niri.unmapped_layer_surfaces.remove(surface);
 
             // Resolve rules for newly mapped layer surfaces.
@@ -124,13 +145,13 @@ impl State {
                 let config = self.niri.config.borrow();
 
                 let rules = &config.layer_rules;
-                let rules = ResolvedLayerRules::compute(rules, layer, self.niri.is_at_startup);
+                let rules = ResolvedLayerRules::compute(rules, &layer, self.niri.is_at_startup);
 
                 let output_size = output_size(&output);
                 let scale = output.current_scale().fractional_scale();
 
-                let hook = add_mapped_layer_pre_commit_hook(layer);
-                let mapped = MappedLayer::new(
+                let hook = add_mapped_layer_pre_commit_hook(&layer);
+                let mut mapped = MappedLayer::new(
                     layer.clone(),
                     hook,
                     rules,
@@ -139,6 +160,7 @@ impl State {
                     self.niri.clock.clone(),
                     &config,
                 );
+                mapped.start_open_animation();
 
                 let prev = self
                     .niri
@@ -149,7 +171,7 @@ impl State {
                 }
             } else {
                 // The surface remains mapped.
-                if let Some(mapped) = self.niri.mapped_layer_surfaces.get_mut(layer) {
+                if let Some(mapped) = self.niri.mapped_layer_surfaces.get_mut(&layer) {
                     // Check if the layer changed.
                     if mapped.take_recompute_rules_on_commit() {
                         let config = self.niri.config.borrow();
@@ -187,9 +209,25 @@ impl State {
             }
         } else {
             // The surface is unmapped.
-            if self.niri.mapped_layer_surfaces.remove(layer).is_some() {
+            if let Some(mut mapped) = self.niri.mapped_layer_surfaces.remove(&layer) {
                 self.clear_foreign_toplevel_rects_for_source(surface);
                 needs_output_resize = true;
+
+                if mapped.take_recompute_rules_on_commit() {
+                    let config = self.niri.config.borrow();
+                    if mapped.recompute_layer_rules(&config.layer_rules, self.niri.is_at_startup) {
+                        mapped.update_config(&config);
+                    }
+                }
+
+                if let Some(geo) = close_geo.or_else(|| map.layer_geometry(&layer)) {
+                    self.start_close_animation_for_layer(&output, &layer, geo, mapped);
+                } else {
+                    warn!(
+                        namespace = layer.namespace(),
+                        "skipping layer close animation: missing geometry on unmap"
+                    );
+                }
 
                 // A mapped surface got unmapped via a null commit. Now it needs to do a new
                 // initial commit again.
@@ -231,16 +269,98 @@ impl State {
 
         true
     }
+
+    fn start_close_animation_for_layer(
+        &mut self,
+        output: &Output,
+        layer: &LayerSurface,
+        geo: Rectangle<i32, Logical>,
+        mut mapped: MappedLayer,
+    ) {
+        let Some(anim_config) = mapped.rules().layer_close else {
+            return;
+        };
+        if animation_config_is_disabled(anim_config.anim) {
+            return;
+        }
+
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let clock = self.niri.clock.clone();
+        let for_backdrop = mapped.place_within_backdrop();
+        let layer_kind = layer.layer();
+        let output = output.clone();
+        let surface = layer.clone();
+
+        let mut animation = None;
+        self.backend.with_primary_renderer(|renderer| {
+            let snapshot = mapped.take_unmap_snapshot().or_else(|| {
+                mapped.store_unmap_snapshot(renderer);
+                mapped.take_unmap_snapshot()
+            });
+
+            let Some(snapshot) = snapshot else {
+                warn!("error starting layer close animation: missing layer snapshot");
+                return;
+            };
+
+            if snapshot.contents.is_empty() || snapshot.blocked_out_contents.is_empty() {
+                warn!("error starting layer close animation: layer snapshot is empty");
+                return;
+            }
+
+            let anim = Animation::new(clock, 0., 1., 0., anim_config.anim);
+            match ClosingLayer::new(
+                renderer,
+                snapshot,
+                scale,
+                geo.size.to_f64(),
+                geo.loc.to_f64(),
+                anim,
+                anim_config,
+                layer.cached_state().anchor,
+            ) {
+                Ok(layer_animation) => animation = Some(layer_animation),
+                Err(err) => warn!("error starting layer close animation: {err:?}"),
+            }
+        });
+
+        let Some(animation) = animation else {
+            return;
+        };
+
+        self.niri.closing_layers.push(ClosingLayerState {
+            output,
+            surface,
+            layer: layer_kind,
+            for_backdrop,
+            animation,
+        });
+    }
 }
 
 fn add_mapped_layer_pre_commit_hook(layer: &LayerSurface) -> HookId {
     add_pre_commit_hook::<State, _>(layer.wl_surface(), move |state, _dh, surface| {
-        let layer_changed = with_states(surface, |states| {
-            let mut guard = states.cached_state.get::<LayerSurfaceCachedState>();
-            let pending_layer = guard.pending().layer;
-            let current_layer = guard.current().layer;
-            pending_layer != current_layer
+        let (layer_changed, got_unmapped) = with_states(surface, |states| {
+            let layer_changed = {
+                let mut guard = states.cached_state.get::<LayerSurfaceCachedState>();
+                let pending_layer = guard.pending().layer;
+                let current_layer = guard.current().layer;
+                pending_layer != current_layer
+            };
+
+            let got_unmapped = {
+                let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                matches!(
+                    guard.pending().buffer.as_ref(),
+                    Some(BufferAssignment::Removed)
+                )
+            };
+
+            (layer_changed, got_unmapped)
         });
+
+        let current_has_buffer =
+            with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
 
         if layer_changed {
             for mapped in state.niri.mapped_layer_surfaces.values_mut() {
@@ -250,5 +370,29 @@ fn add_mapped_layer_pre_commit_hook(layer: &LayerSurface) -> HookId {
                 }
             }
         }
+
+        if got_unmapped && current_has_buffer {
+            for mapped in state.niri.mapped_layer_surfaces.values_mut() {
+                if mapped.surface().wl_surface() != surface {
+                    continue;
+                }
+                if !mapped.should_animate_close() || mapped.has_non_empty_unmap_snapshot() {
+                    break;
+                }
+
+                state.backend.with_primary_renderer(|renderer| {
+                    mapped.store_unmap_snapshot(renderer);
+                });
+                break;
+            }
+        }
     })
+}
+
+fn animation_config_is_disabled(config: niri_config::Animation) -> bool {
+    config.off
+        || matches!(
+            config.kind,
+            niri_config::animations::Kind::Easing(params) if params.duration_ms == 0
+        )
 }

@@ -2,6 +2,7 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{Config, LayerRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use smithay::wayland::compositor::{remove_pre_commit_hook, HookId};
@@ -9,16 +10,22 @@ use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
 
 use super::ResolvedLayerRules;
 use crate::animation::Clock;
+use crate::layer::closing_layer::ClosingLayerRenderElement;
+use crate::layer::opening_layer::{
+    self, OpenAnimation, OpenAnimationState, OpeningLayerSolidColorRenderElement,
+    OpeningLayerWaylandRenderElement,
+};
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
+use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::tahoe_glass::TahoeGlassElement;
 use crate::render_helpers::xray::XrayPos;
-use crate::render_helpers::{background_effect, tahoe_glass, RenderCtx};
+use crate::render_helpers::{background_effect, tahoe_glass, RenderCtx, RenderTarget};
 use crate::utils::{baba_is_float_offset, round_logical_in_physical};
 
 #[derive(Debug)]
@@ -55,6 +62,12 @@ pub struct MappedLayer {
     /// Scale of the output the layer surface is on (and rounds its sizes to).
     scale: f64,
 
+    /// The animation upon opening this layer.
+    open_animation: Option<OpenAnimation>,
+
+    /// Snapshot to use if this layer is unmapped with a close animation.
+    unmap_snapshot: Option<LayerSurfaceRenderSnapshot>,
+
     /// Clock for driving animations.
     clock: Clock,
 }
@@ -66,8 +79,16 @@ niri_render_elements! {
         Shadow = ShadowRenderElement,
         BackgroundEffect = BackgroundEffectElement,
         TahoeGlass = TahoeGlassElement,
+        OpeningWayland = OpeningLayerWaylandRenderElement<R>,
+        OpeningSolidColor = OpeningLayerSolidColorRenderElement,
+        Closing = ClosingLayerRenderElement,
     }
 }
+
+pub type LayerSurfaceRenderSnapshot = RenderSnapshot<
+    LayerSurfaceRenderElement<GlesRenderer>,
+    LayerSurfaceRenderElement<GlesRenderer>,
+>;
 
 impl MappedLayer {
     pub fn new(
@@ -95,6 +116,8 @@ impl MappedLayer {
             shadow: Shadow::new(shadow_config),
             blur_config: config.blur,
             tahoe_glass_config: config.tahoe_glass.clone(),
+            open_animation: None,
+            unmap_snapshot: None,
             clock,
         }
     }
@@ -135,6 +158,22 @@ impl MappedLayer {
 
     pub fn are_animations_ongoing(&self) -> bool {
         self.rules.baba_is_float
+            || self
+                .open_animation
+                .as_ref()
+                .is_some_and(|open| !open.is_done())
+    }
+
+    pub fn should_animate_close(&self) -> bool {
+        self.rules
+            .layer_close
+            .is_some_and(|anim| !animation_config_is_disabled(anim.anim))
+    }
+
+    pub fn has_non_empty_unmap_snapshot(&self) -> bool {
+        self.unmap_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.contents.is_empty())
     }
 
     pub fn surface(&self) -> &LayerSurface {
@@ -162,6 +201,113 @@ impl MappedLayer {
 
     pub fn take_recompute_rules_on_commit(&mut self) -> bool {
         std::mem::take(&mut self.recompute_rules_on_commit)
+    }
+
+    pub fn advance_animations(&mut self) {
+        if self
+            .open_animation
+            .as_ref()
+            .is_some_and(OpenAnimation::is_done)
+        {
+            self.open_animation = None;
+        }
+    }
+
+    pub fn start_open_animation(&mut self) {
+        let Some(anim_config) = self.rules.layer_open else {
+            return;
+        };
+        if self.open_animation.is_some() {
+            return;
+        }
+
+        self.open_animation = Some(OpenAnimation::new(self.clock.clone(), anim_config));
+    }
+
+    fn open_animation_state(&self) -> Option<OpenAnimationState> {
+        let animation = self.open_animation.as_ref()?;
+        if animation.is_done() {
+            return None;
+        }
+
+        Some(animation.state())
+    }
+
+    pub fn store_unmap_snapshot(&mut self, renderer: &mut GlesRenderer) {
+        if !self.should_animate_close() {
+            self.unmap_snapshot = None;
+            return;
+        }
+
+        let _span = tracy_client::span!("MappedLayer::store_unmap_snapshot");
+
+        let mut contents = Vec::new();
+        self.render_normal(
+            RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                xray: None,
+            },
+            None,
+            Point::from((0., 0.)),
+            XrayPos::default(),
+            &mut |elem| contents.push(elem),
+        );
+        self.render_popups(
+            RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                xray: None,
+            },
+            None,
+            Point::from((0., 0.)),
+            XrayPos::default(),
+            &mut |elem| contents.push(elem),
+        );
+
+        let mut blocked_out_contents = Vec::new();
+        self.render_normal(
+            RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                xray: None,
+            },
+            None,
+            Point::from((0., 0.)),
+            XrayPos::default(),
+            &mut |elem| blocked_out_contents.push(elem),
+        );
+        self.render_popups(
+            RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                xray: None,
+            },
+            None,
+            Point::from((0., 0.)),
+            XrayPos::default(),
+            &mut |elem| blocked_out_contents.push(elem),
+        );
+
+        if contents.is_empty() && blocked_out_contents.is_empty() {
+            return;
+        }
+
+        let size = self.surface.cached_state().size.to_f64();
+        self.unmap_snapshot = Some(LayerSurfaceRenderSnapshot {
+            contents,
+            contents_with_blocked_out_bg: None,
+            blocked_out_contents,
+            block_out_from: self.rules.block_out_from,
+            size,
+            texture: Default::default(),
+            texture_with_blocked_out_bg: Default::default(),
+            blocked_out_texture: Default::default(),
+        });
+    }
+
+    pub fn take_unmap_snapshot(&mut self) -> Option<LayerSurfaceRenderSnapshot> {
+        self.unmap_snapshot.take()
     }
 
     pub fn place_within_backdrop(&self) -> bool {
@@ -201,10 +347,31 @@ impl MappedLayer {
     ) {
         let scale = Scale::from(self.scale);
         let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
+        let open_state = self.open_animation_state();
+        let open_alpha = open_state.map_or(1., |state| state.alpha);
+        let surface_alpha = alpha * open_alpha;
 
+        let open_offset = open_state.map_or(Point::from((0., 0.)), OpenAnimationState::offset);
         let bob_offset = self.bob_offset();
-        let location = location + bob_offset;
-        let xray_pos = xray_pos.offset(bob_offset);
+        let location = location + bob_offset + open_offset;
+        let xray_pos = xray_pos.offset(bob_offset + open_offset);
+        let anchor = self.surface.cached_state().anchor;
+        let open_origin = open_state.map(|state| {
+            (
+                state,
+                state.origin(location, self.block_out_buffer.size(), anchor, scale),
+                Point::from((0, 0)),
+            )
+        });
+        let mut push_opening = |elem| {
+            if let Some((state, origin, offset)) =
+                open_origin.filter(|(state, _, _)| state.should_wrap())
+            {
+                push(wrap_opening_render_element(elem, state, origin, offset));
+            } else {
+                push(elem);
+            }
+        };
 
         let surface = self.surface.wl_surface();
 
@@ -217,10 +384,10 @@ impl MappedLayer {
             let elem = SolidColorRenderElement::from_buffer(
                 &self.block_out_buffer,
                 location,
-                alpha,
+                surface_alpha,
                 Kind::Unspecified,
             );
-            push(elem.into());
+            push_opening(elem.into());
         } else {
             // Layer surfaces don't have extra geometry like windows.
             let buf_pos = location;
@@ -230,9 +397,9 @@ impl MappedLayer {
                 surface,
                 buf_pos.to_physical_precise_round(scale),
                 scale,
-                alpha,
+                surface_alpha,
                 Kind::ScanoutCandidate,
-                &mut |elem| push(elem.into()),
+                &mut |elem| push_opening(elem.into()),
             );
         }
 
@@ -246,8 +413,9 @@ impl MappedLayer {
             self.scale,
             self.blur_config,
             &self.tahoe_glass_config,
+            open_alpha,
             xray_pos,
-            &mut |elem| push(elem.into()),
+            &mut |elem| push_opening(elem.into()),
         );
 
         let geometry = Rectangle::new(location, self.block_out_buffer.size());
@@ -255,8 +423,9 @@ impl MappedLayer {
         let surface_anim_scale = Scale::from(1.);
         let radius = self.rules.geometry_corner_radius.unwrap_or_default();
         if !has_tahoe_glass {
-            self.shadow
-                .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+            self.shadow.render(ctx.renderer, location, &mut |elem| {
+                push_opening(elem.with_alpha(open_alpha).into())
+            });
 
             background_effect::render_for_tile(
                 ctx.as_gles(),
@@ -264,6 +433,7 @@ impl MappedLayer {
                 geometry,
                 self.scale,
                 false,
+                open_alpha,
                 surface,
                 surface_off,
                 surface_anim_scale,
@@ -273,7 +443,7 @@ impl MappedLayer {
                 self.rules.background_effect,
                 should_block_out,
                 xray_pos,
-                &mut |elem| push(elem.into()),
+                &mut |elem| push_opening(elem.into()),
             );
         }
     }
@@ -292,10 +462,31 @@ impl MappedLayer {
 
         let scale = Scale::from(self.scale);
         let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
+        let open_state = self.open_animation_state();
+        let open_alpha = open_state.map_or(1., |state| state.alpha);
+        let surface_alpha = alpha * open_alpha;
 
+        let open_offset = open_state.map_or(Point::from((0., 0.)), OpenAnimationState::offset);
         let bob_offset = self.bob_offset();
-        let location = location + bob_offset;
-        let xray_pos = xray_pos.offset(bob_offset);
+        let location = location + bob_offset + open_offset;
+        let xray_pos = xray_pos.offset(bob_offset + open_offset);
+        let anchor = self.surface.cached_state().anchor;
+        let open_origin = open_state.map(|state| {
+            (
+                state,
+                state.origin(location, self.block_out_buffer.size(), anchor, scale),
+                Point::from((0, 0)),
+            )
+        });
+        let mut push_opening = |elem| {
+            if let Some((state, origin, offset)) =
+                open_origin.filter(|(state, _, _)| state.should_wrap())
+            {
+                push(wrap_opening_render_element(elem, state, origin, offset));
+            } else {
+                push(elem);
+            }
+        };
 
         let surface = self.surface.wl_surface();
         for (popup, offset) in PopupManager::popups_for_surface(surface) {
@@ -304,7 +495,7 @@ impl MappedLayer {
                 // IME popups aren't affected by rules for regular popups.
                 PopupKind::InputMethod(_) => niri_config::ResolvedPopupsRules::default(),
             };
-            let alpha = alpha * popup_rules.opacity.unwrap_or(1.).clamp(0., 1.);
+            let alpha = surface_alpha * popup_rules.opacity.unwrap_or(1.).clamp(0., 1.);
 
             let surface = popup.wl_surface();
             let popup_geo = popup.geometry();
@@ -317,7 +508,7 @@ impl MappedLayer {
                 scale,
                 alpha,
                 Kind::ScanoutCandidate,
-                &mut |elem| push(elem.into()),
+                &mut |elem| push_opening(elem.into()),
             );
 
             let geometry = Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64());
@@ -335,6 +526,7 @@ impl MappedLayer {
                 geometry,
                 self.scale,
                 false,
+                open_alpha,
                 surface,
                 surface_off,
                 surface_anim_scale,
@@ -344,10 +536,40 @@ impl MappedLayer {
                 effect,
                 false,
                 xray_pos,
-                &mut |elem| push(elem.into()),
+                &mut |elem| push_opening(elem.into()),
             );
         }
     }
+}
+
+fn wrap_opening_render_element<R: NiriRenderer>(
+    elem: LayerSurfaceRenderElement<R>,
+    state: OpenAnimationState,
+    origin: Point<i32, smithay::utils::Physical>,
+    offset: Point<i32, smithay::utils::Physical>,
+) -> LayerSurfaceRenderElement<R> {
+    match elem {
+        LayerSurfaceRenderElement::Wayland(elem) => {
+            opening_layer::wrap(elem, state, origin, offset).into()
+        }
+        LayerSurfaceRenderElement::SolidColor(elem) => {
+            opening_layer::wrap(elem, state, origin, offset).into()
+        }
+        elem @ LayerSurfaceRenderElement::Shadow(_)
+        | elem @ LayerSurfaceRenderElement::BackgroundEffect(_)
+        | elem @ LayerSurfaceRenderElement::TahoeGlass(_) => elem,
+        elem @ LayerSurfaceRenderElement::OpeningWayland(_)
+        | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)
+        | elem @ LayerSurfaceRenderElement::Closing(_) => elem,
+    }
+}
+
+fn animation_config_is_disabled(config: niri_config::Animation) -> bool {
+    config.off
+        || matches!(
+            config.kind,
+            niri_config::animations::Kind::Easing(params) if params.duration_ms == 0
+        )
 }
 
 impl Drop for MappedLayer {

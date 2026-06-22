@@ -278,6 +278,7 @@ fn render_params_for_tile(
     geometry: Rectangle<f64, Logical>,
     scale: f64,
     clip_to_geometry: bool,
+    alpha: f32,
     block_out: bool,
     blur_region: Option<Arc<Vec<Rectangle<i32, Logical>>>>,
     client_blur_region_geometry: ClientBlurRegionGeometry,
@@ -338,7 +339,7 @@ fn render_params_for_tile(
 
     Some(RenderParams {
         geometry: effect_geometry,
-        alpha: 1.,
+        alpha,
         subregion,
         clip,
         scale,
@@ -476,6 +477,7 @@ pub fn render_for_tile(
     geometry: Rectangle<f64, Logical>,
     scale: f64,
     clip_to_geometry: bool,
+    alpha: f32,
     surface: &WlSurface,
     surface_off: Point<f64, Logical>,
     surface_anim_scale: Scale<f64>,
@@ -508,6 +510,7 @@ pub fn render_for_tile(
             geometry,
             scale,
             clip_to_geometry,
+            alpha,
             should_block_out,
             blur_region,
             client_blur_region_geometry,
