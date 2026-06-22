@@ -10,7 +10,7 @@ use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
 
 use super::ResolvedLayerRules;
 use crate::animation::Clock;
-use crate::layer::closing_layer::ClosingLayerRenderElement;
+use crate::layer::closing_layer::{CloseAnimationStartState, ClosingLayerRenderElement};
 use crate::layer::opening_layer::{
     self, OpenAnimation, OpenAnimationState, OpeningLayerRenderElement,
     OpeningLayerSolidColorRenderElement, OpeningLayerWaylandRenderElement,
@@ -66,7 +66,7 @@ pub struct MappedLayer {
     open_animation: Option<OpenAnimation>,
 
     /// Snapshot to use if this layer is unmapped with a close animation.
-    unmap_snapshot: Option<LayerSurfaceRenderSnapshot>,
+    unmap_snapshot: Option<LayerSurfaceUnmapSnapshot>,
 
     /// Clock for driving animations.
     clock: Clock,
@@ -92,6 +92,12 @@ pub type LayerSurfaceRenderSnapshot = RenderSnapshot<
     LayerSurfaceRenderElement<GlesRenderer>,
     LayerSurfaceRenderElement<GlesRenderer>,
 >;
+
+#[derive(Debug)]
+pub struct LayerSurfaceUnmapSnapshot {
+    pub snapshot: LayerSurfaceRenderSnapshot,
+    pub close_start: CloseAnimationStartState,
+}
 
 impl MappedLayer {
     pub fn new(
@@ -170,13 +176,13 @@ impl MappedLayer {
     pub fn should_animate_close(&self) -> bool {
         self.rules
             .layer_close
-            .is_some_and(|anim| !animation_config_is_disabled(anim.anim))
+            .is_some_and(|anim| !layer_close_animation_config_is_disabled(anim))
     }
 
     pub fn has_non_empty_unmap_snapshot(&self) -> bool {
         self.unmap_snapshot
             .as_ref()
-            .is_some_and(|snapshot| !snapshot.contents.is_empty())
+            .is_some_and(|snapshot| !snapshot.snapshot.contents.is_empty())
     }
 
     pub fn surface(&self) -> &LayerSurface {
@@ -243,9 +249,10 @@ impl MappedLayer {
         }
 
         let _span = tracy_client::span!("MappedLayer::store_unmap_snapshot");
+        let close_start = self.close_animation_start_state();
 
         let mut contents = Vec::new();
-        self.render_normal(
+        self.render_normal_with_open_state(
             RenderCtx {
                 renderer,
                 target: RenderTarget::Output,
@@ -254,9 +261,10 @@ impl MappedLayer {
             None,
             Point::from((0., 0.)),
             XrayPos::default(),
+            None,
             &mut |elem| contents.push(elem),
         );
-        self.render_popups(
+        self.render_popups_with_open_state(
             RenderCtx {
                 renderer,
                 target: RenderTarget::Output,
@@ -265,11 +273,12 @@ impl MappedLayer {
             None,
             Point::from((0., 0.)),
             XrayPos::default(),
+            None,
             &mut |elem| contents.push(elem),
         );
 
         let mut blocked_out_contents = Vec::new();
-        self.render_normal(
+        self.render_normal_with_open_state(
             RenderCtx {
                 renderer,
                 target: RenderTarget::Screencast,
@@ -278,9 +287,10 @@ impl MappedLayer {
             None,
             Point::from((0., 0.)),
             XrayPos::default(),
+            None,
             &mut |elem| blocked_out_contents.push(elem),
         );
-        self.render_popups(
+        self.render_popups_with_open_state(
             RenderCtx {
                 renderer,
                 target: RenderTarget::Screencast,
@@ -289,6 +299,7 @@ impl MappedLayer {
             None,
             Point::from((0., 0.)),
             XrayPos::default(),
+            None,
             &mut |elem| blocked_out_contents.push(elem),
         );
 
@@ -297,20 +308,35 @@ impl MappedLayer {
         }
 
         let size = self.surface.cached_state().size.to_f64();
-        self.unmap_snapshot = Some(LayerSurfaceRenderSnapshot {
-            contents,
-            contents_with_blocked_out_bg: None,
-            blocked_out_contents,
-            block_out_from: self.rules.block_out_from,
-            size,
-            texture: Default::default(),
-            texture_with_blocked_out_bg: Default::default(),
-            blocked_out_texture: Default::default(),
+        self.unmap_snapshot = Some(LayerSurfaceUnmapSnapshot {
+            snapshot: LayerSurfaceRenderSnapshot {
+                contents,
+                contents_with_blocked_out_bg: None,
+                blocked_out_contents,
+                block_out_from: self.rules.block_out_from,
+                size,
+                texture: Default::default(),
+                texture_with_blocked_out_bg: Default::default(),
+                blocked_out_texture: Default::default(),
+            },
+            close_start,
         });
     }
 
-    pub fn take_unmap_snapshot(&mut self) -> Option<LayerSurfaceRenderSnapshot> {
+    pub fn take_unmap_snapshot(&mut self) -> Option<LayerSurfaceUnmapSnapshot> {
         self.unmap_snapshot.take()
+    }
+
+    fn close_animation_start_state(&self) -> CloseAnimationStartState {
+        let Some(open_state) = self.open_animation_state() else {
+            return CloseAnimationStartState::default();
+        };
+
+        CloseAnimationStartState {
+            start_alpha: open_state.alpha,
+            start_scale: open_state.scale(),
+            start_offset: open_state.offset(),
+        }
     }
 
     pub fn place_within_backdrop(&self) -> bool {
@@ -342,15 +368,33 @@ impl MappedLayer {
 
     pub fn render_normal<R: NiriRenderer>(
         &self,
-        mut ctx: RenderCtx<R>,
+        ctx: RenderCtx<R>,
         ns: Option<usize>,
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
+        self.render_normal_with_open_state(
+            ctx,
+            ns,
+            location,
+            xray_pos,
+            self.open_animation_state(),
+            push,
+        );
+    }
+
+    fn render_normal_with_open_state<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        ns: Option<usize>,
+        location: Point<f64, Logical>,
+        xray_pos: XrayPos,
+        open_state: Option<OpenAnimationState>,
+        push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+    ) {
         let scale = Scale::from(self.scale);
         let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
-        let open_state = self.open_animation_state();
         let open_alpha = open_state.map_or(1., |state| state.alpha);
         let surface_alpha = alpha * open_alpha;
 
@@ -453,10 +497,29 @@ impl MappedLayer {
 
     pub fn render_popups<R: NiriRenderer>(
         &self,
+        ctx: RenderCtx<R>,
+        ns: Option<usize>,
+        location: Point<f64, Logical>,
+        xray_pos: XrayPos,
+        push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+    ) {
+        self.render_popups_with_open_state(
+            ctx,
+            ns,
+            location,
+            xray_pos,
+            self.open_animation_state(),
+            push,
+        );
+    }
+
+    fn render_popups_with_open_state<R: NiriRenderer>(
+        &self,
         mut ctx: RenderCtx<R>,
         ns: Option<usize>,
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
+        open_state: Option<OpenAnimationState>,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
@@ -465,7 +528,6 @@ impl MappedLayer {
 
         let scale = Scale::from(self.scale);
         let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
-        let open_state = self.open_animation_state();
         let open_alpha = open_state.map_or(1., |state| state.alpha);
         let surface_alpha = alpha * open_alpha;
 
@@ -582,6 +644,13 @@ fn animation_config_is_disabled(config: niri_config::Animation) -> bool {
             config.kind,
             niri_config::animations::Kind::Easing(params) if params.duration_ms == 0
         )
+}
+
+fn layer_close_animation_config_is_disabled(
+    config: niri_config::animations::LayerCloseAnim,
+) -> bool {
+    animation_config_is_disabled(config.transform_anim)
+        && animation_config_is_disabled(config.opacity_anim)
 }
 
 impl Drop for MappedLayer {

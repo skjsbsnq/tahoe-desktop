@@ -677,42 +677,8 @@ mod tests {
         );
 
         let animations = config.layer_rules[0].animations.as_ref().unwrap();
-        assert_eq!(
-            animations.layer_open,
-            Some(LayerOpenAnim {
-                anim: Animation {
-                    off: false,
-                    kind: Kind::Easing(EasingParams {
-                        duration_ms: 150,
-                        curve: Curve::EaseOutExpo,
-                    }),
-                },
-                style: LayerOpenAnimationStyle::Popin,
-                scale_from: 0.96,
-                opacity_from: 0.,
-                origin: LayerAnimationOrigin::Center,
-                edge: LayerAnimationEdge::Right,
-                distance: 32.,
-            })
-        );
-        assert_eq!(
-            animations.layer_close,
-            Some(LayerCloseAnim {
-                anim: Animation {
-                    off: false,
-                    kind: Kind::Easing(EasingParams {
-                        duration_ms: 150,
-                        curve: Curve::EaseOutQuad,
-                    }),
-                },
-                style: LayerCloseAnimationStyle::Popout,
-                scale_to: 0.97,
-                opacity_to: 0.,
-                origin: LayerAnimationOrigin::Center,
-                edge: LayerAnimationEdge::Right,
-                distance: 32.,
-            })
-        );
+        assert_eq!(animations.layer_open, Some(LayerOpenAnim::default()));
+        assert_eq!(animations.layer_close, Some(LayerCloseAnim::default()));
         assert_eq!(config.layer_rules[1].animations, None);
     }
 
@@ -751,13 +717,10 @@ mod tests {
         assert_eq!(
             animations.layer_open,
             Some(LayerOpenAnim {
-                anim: Animation {
-                    off: false,
-                    kind: Kind::Easing(EasingParams {
-                        duration_ms: 180,
-                        curve: Curve::CubicBezier(0.05, 0.7, 0.1, 1.),
-                    }),
-                },
+                anim: easing(180, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+                transform_anim: easing(180, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+                opacity_anim: easing(180, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+                opacity_delay_ms: 0,
                 style: LayerOpenAnimationStyle::Popin,
                 scale_from: 0.93,
                 opacity_from: 0.,
@@ -769,13 +732,10 @@ mod tests {
         assert_eq!(
             animations.layer_close,
             Some(LayerCloseAnim {
-                anim: Animation {
-                    off: false,
-                    kind: Kind::Easing(EasingParams {
-                        duration_ms: 120,
-                        curve: Curve::CubicBezier(0.3, 0., 0.8, 0.15),
-                    }),
-                },
+                anim: easing(120, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+                transform_anim: easing(120, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+                opacity_anim: easing(120, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+                opacity_delay_ms: 0,
                 style: LayerCloseAnimationStyle::Slide,
                 scale_to: 0.97,
                 opacity_to: 0.25,
@@ -784,6 +744,186 @@ mod tests {
                 distance: 28.,
             })
         );
+    }
+
+    #[test]
+    fn parse_layer_rule_animation_channels() {
+        let config = do_parse(
+            r#"
+            layer-rule {
+                match namespace="^tahoe-control-center$"
+
+                animations {
+                    layer-open {
+                        style "popin"
+                        duration-ms 180
+                        curve "ease-out-cubic"
+                        transform-duration-ms 240
+                        transform-curve "emphasized-decel"
+                        opacity-duration-ms 90
+                        opacity-curve "linear"
+                        opacity-delay-ms 25
+                    }
+
+                    layer-close {
+                        style "popout"
+                        duration-ms 150
+                        curve "ease-out-quad"
+                        transform-duration-ms 120
+                        transform-curve "emphasized-accel"
+                        opacity-duration-ms 80
+                        opacity-curve "menu-accel"
+                        opacity-delay-ms 10
+                    }
+                }
+            }
+            "#,
+        );
+
+        let animations = config.layer_rules[0].animations.as_ref().unwrap();
+        assert_eq!(
+            animations.layer_open,
+            Some(LayerOpenAnim {
+                anim: easing(180, Curve::EaseOutCubic),
+                transform_anim: easing(240, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+                opacity_anim: easing(90, Curve::Linear),
+                opacity_delay_ms: 25,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            animations.layer_close,
+            Some(LayerCloseAnim {
+                anim: easing(150, Curve::EaseOutQuad),
+                transform_anim: easing(120, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+                opacity_anim: easing(80, Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+                opacity_delay_ms: 10,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_layer_rule_animation_edge_reveal_style() {
+        let config = do_parse(
+            r#"
+            layer-rule {
+                match namespace="^tahoe-control-center$"
+
+                animations {
+                    layer-open {
+                        style "edge-reveal"
+                        edge "top"
+                        distance 18
+                        opacity-from 0.82
+                        transform-duration-ms 180
+                        transform-curve "emphasized-decel"
+                        opacity-duration-ms 90
+                        opacity-curve "standard-decel"
+                    }
+
+                    layer-close {
+                        style "edge-reveal"
+                        edge "bottom"
+                        distance 14
+                        opacity-to 0.55
+                        transform-duration-ms 120
+                        transform-curve "emphasized-accel"
+                        opacity-duration-ms 80
+                        opacity-curve "menu-accel"
+                    }
+                }
+            }
+            "#,
+        );
+
+        let animations = config.layer_rules[0].animations.as_ref().unwrap();
+        assert_eq!(
+            animations.layer_open,
+            Some(LayerOpenAnim {
+                anim: LayerOpenAnim::default().anim,
+                transform_anim: easing(180, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+                opacity_anim: easing(90, Curve::CubicBezier(0., 0., 0., 1.)),
+                opacity_delay_ms: 0,
+                style: LayerOpenAnimationStyle::EdgeReveal,
+                scale_from: 0.96,
+                opacity_from: 0.82,
+                origin: LayerAnimationOrigin::Center,
+                edge: LayerAnimationEdge::Top,
+                distance: 18.,
+            })
+        );
+        assert_eq!(
+            animations.layer_close,
+            Some(LayerCloseAnim {
+                anim: LayerCloseAnim::default().anim,
+                transform_anim: easing(120, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+                opacity_anim: easing(80, Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+                opacity_delay_ms: 0,
+                style: LayerCloseAnimationStyle::EdgeReveal,
+                scale_to: 0.97,
+                opacity_to: 0.55,
+                origin: LayerAnimationOrigin::Center,
+                edge: LayerAnimationEdge::Bottom,
+                distance: 14.,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_layer_rule_animation_named_curves() {
+        let named_curves = [
+            ("linear", Curve::Linear),
+            ("ease-out-quad", Curve::EaseOutQuad),
+            ("ease-out-cubic", Curve::EaseOutCubic),
+            ("ease-out-expo", Curve::EaseOutExpo),
+            ("emphasized-decel", Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+            ("emphasized-accel", Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+            ("standard-decel", Curve::CubicBezier(0., 0., 0., 1.)),
+            (
+                "expressive-effects",
+                Curve::CubicBezier(0.34, 0.8, 0.34, 1.),
+            ),
+            ("menu-decel-safe", Curve::CubicBezier(0.12, 0.95, 0.16, 1.)),
+            ("menu-decel", Curve::CubicBezier(0.1, 1., 0., 1.)),
+            ("menu-accel", Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+            ("stall", Curve::CubicBezier(1., -0.1, 0.7, 0.85)),
+        ];
+
+        for (name, curve) in named_curves {
+            let config = do_parse(&format!(
+                r#"
+                layer-rule {{
+                    match namespace="^named-curve-layer$"
+
+                    animations {{
+                        layer-open {{
+                            duration-ms 123
+                            curve "{name}"
+                        }}
+                    }}
+                }}
+                "#
+            ));
+
+            let layer_open = config.layer_rules[0]
+                .animations
+                .as_ref()
+                .unwrap()
+                .layer_open
+                .unwrap();
+
+            assert_eq!(layer_open.anim, easing(123, curve), "{name}");
+            assert_eq!(layer_open.transform_anim, easing(123, curve), "{name}");
+            assert_eq!(layer_open.opacity_anim, easing(123, curve), "{name}");
+        }
+    }
+
+    fn easing(duration_ms: u32, curve: Curve) -> Animation {
+        Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams { duration_ms, curve }),
+        }
     }
 
     #[track_caller]

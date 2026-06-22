@@ -280,7 +280,7 @@ impl State {
         let Some(anim_config) = mapped.rules().layer_close else {
             return;
         };
-        if animation_config_is_disabled(anim_config.anim) {
+        if layer_close_animation_config_is_disabled(anim_config) {
             return;
         }
 
@@ -298,25 +298,30 @@ impl State {
                 mapped.take_unmap_snapshot()
             });
 
-            let Some(snapshot) = snapshot else {
+            let Some(unmap_snapshot) = snapshot else {
                 warn!("error starting layer close animation: missing layer snapshot");
                 return;
             };
+            let snapshot = unmap_snapshot.snapshot;
 
             if snapshot.contents.is_empty() || snapshot.blocked_out_contents.is_empty() {
                 warn!("error starting layer close animation: layer snapshot is empty");
                 return;
             }
 
-            let anim = Animation::new(clock, 0., 1., 0., anim_config.anim);
+            let transform_anim =
+                Animation::new(clock.clone(), 0., 1., 0., anim_config.transform_anim);
+            let opacity_anim = Animation::new(clock, 0., 1., 0., anim_config.opacity_anim);
             match ClosingLayer::new(
                 renderer,
                 snapshot,
                 scale,
                 geo.size.to_f64(),
                 geo.loc.to_f64(),
-                anim,
+                transform_anim,
+                opacity_anim,
                 anim_config,
+                unmap_snapshot.close_start,
                 layer.cached_state().anchor,
             ) {
                 Ok(layer_animation) => animation = Some(layer_animation),
@@ -395,4 +400,11 @@ fn animation_config_is_disabled(config: niri_config::Animation) -> bool {
             config.kind,
             niri_config::animations::Kind::Easing(params) if params.duration_ms == 0
         )
+}
+
+fn layer_close_animation_config_is_disabled(
+    config: niri_config::animations::LayerCloseAnim,
+) -> bool {
+    animation_config_is_disabled(config.transform_anim)
+        && animation_config_is_disabled(config.opacity_anim)
 }

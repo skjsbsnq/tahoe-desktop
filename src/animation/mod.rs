@@ -238,6 +238,14 @@ impl Animation {
         self.clock.now() >= self.start_time + self.duration
     }
 
+    pub fn is_done_with_delay(&self, delay: Duration) -> bool {
+        if self.clock.should_complete_instantly() {
+            return true;
+        }
+
+        self.clock.now() >= self.start_time + delay + self.duration
+    }
+
     pub fn is_clamped_done(&self) -> bool {
         if self.clock.should_complete_instantly() {
             return true;
@@ -308,6 +316,24 @@ impl Animation {
         self.value()
     }
 
+    pub fn clamped_value_with_delay(&self, delay: Duration) -> f64 {
+        if self.clock.should_complete_instantly() {
+            return self.to;
+        }
+
+        let now = self.clock.now();
+        let delayed_start = self.start_time + delay;
+        if now <= delayed_start {
+            return self.from;
+        }
+
+        if now >= delayed_start + self.clamped_duration {
+            return self.to;
+        }
+
+        self.value_at(now - delay)
+    }
+
     pub fn to(&self) -> f64 {
         self.to
     }
@@ -360,6 +386,41 @@ impl From<niri_config::animations::Curve> for Curve {
             niri_config::animations::Curve::EaseOutExpo => Curve::EaseOutExpo,
             niri_config::animations::Curve::CubicBezier(x1, y1, x2, y2) => {
                 Curve::CubicBezier(CubicBezier::new(x1, y1, x2, y2))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tahoe_safe_cubic_beziers_sample_without_nan_or_backtracking() {
+        let curves = [
+            ("emphasized-decel", CubicBezier::new(0.05, 0.7, 0.1, 1.)),
+            ("emphasized-accel", CubicBezier::new(0.3, 0., 0.8, 0.15)),
+            ("standard-decel", CubicBezier::new(0., 0., 0., 1.)),
+            ("expressive-effects", CubicBezier::new(0.34, 0.8, 0.34, 1.)),
+            ("menu-decel-safe", CubicBezier::new(0.12, 0.95, 0.16, 1.)),
+            ("menu-accel", CubicBezier::new(0.52, 0.03, 0.72, 0.08)),
+        ];
+
+        for (name, bezier) in curves {
+            let curve = Curve::CubicBezier(bezier);
+            let mut previous = curve.y(0.);
+
+            for step in 1..=100 {
+                let x = f64::from(step) / 100.;
+                let y = curve.y(x);
+
+                assert!(y.is_finite(), "{name} returned non-finite y at x={x}");
+                assert!(
+                    y + 0.001 >= previous,
+                    "{name} moved backwards at x={x}: {y} < {previous}"
+                );
+
+                previous = y;
             }
         }
     }

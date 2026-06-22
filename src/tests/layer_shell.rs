@@ -8,6 +8,7 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
     Anchor, KeyboardInteractivity,
 };
+use smithay::utils::Point;
 use std::time::Duration;
 use wayland_client::protocol::wl_surface::WlSurface;
 
@@ -176,6 +177,33 @@ fn layer_rule_animations_select_style_by_namespace() {
                 }
             }
         }
+
+        layer-rule {
+            match namespace="^edge-reveal-layer$"
+
+            animations {
+                layer-open {
+                    style "edge-reveal"
+                    edge "top"
+                    distance 18
+                    opacity-from 0.82
+                    transform-duration-ms 180
+                    transform-curve "emphasized-decel"
+                    opacity-duration-ms 90
+                    opacity-curve "standard-decel"
+                }
+                layer-close {
+                    style "edge-reveal"
+                    edge "bottom"
+                    distance 14
+                    opacity-to 0.55
+                    transform-duration-ms 120
+                    transform-curve "emphasized-accel"
+                    opacity-duration-ms 80
+                    opacity-curve "menu-accel"
+                }
+            }
+        }
         "#,
     )
     .unwrap();
@@ -190,6 +218,8 @@ fn layer_rule_animations_select_style_by_namespace() {
         layer_open,
         Some(LayerOpenAnim {
             anim: easing_anim(120, Curve::CubicBezier(0.1, 1., 0., 1.)),
+            transform_anim: easing_anim(120, Curve::CubicBezier(0.1, 1., 0., 1.)),
+            opacity_anim: easing_anim(120, Curve::CubicBezier(0.1, 1., 0., 1.)),
             style: LayerOpenAnimationStyle::Fade,
             opacity_from: 0.2,
             ..Default::default()
@@ -199,6 +229,8 @@ fn layer_rule_animations_select_style_by_namespace() {
         layer_close,
         Some(LayerCloseAnim {
             anim: easing_anim(80, Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+            transform_anim: easing_anim(80, Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+            opacity_anim: easing_anim(80, Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
             style: LayerCloseAnimationStyle::Fade,
             opacity_to: 0.3,
             ..Default::default()
@@ -211,6 +243,8 @@ fn layer_rule_animations_select_style_by_namespace() {
         layer_open,
         Some(LayerOpenAnim {
             anim: easing_anim(140, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+            transform_anim: easing_anim(140, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+            opacity_anim: easing_anim(140, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
             style: LayerOpenAnimationStyle::Slide,
             edge: LayerAnimationEdge::Top,
             distance: 24.,
@@ -221,6 +255,8 @@ fn layer_rule_animations_select_style_by_namespace() {
         layer_close,
         Some(LayerCloseAnim {
             anim: easing_anim(90, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+            transform_anim: easing_anim(90, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+            opacity_anim: easing_anim(90, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
             style: LayerCloseAnimationStyle::Slide,
             edge: LayerAnimationEdge::Bottom,
             distance: 18.,
@@ -234,6 +270,8 @@ fn layer_rule_animations_select_style_by_namespace() {
         layer_open,
         Some(LayerOpenAnim {
             anim: easing_anim(160, Curve::CubicBezier(1., -0.1, 0.7, 0.85)),
+            transform_anim: easing_anim(160, Curve::CubicBezier(1., -0.1, 0.7, 0.85)),
+            opacity_anim: easing_anim(160, Curve::CubicBezier(1., -0.1, 0.7, 0.85)),
             style: LayerOpenAnimationStyle::Popin,
             scale_from: 0.93,
             origin: LayerAnimationOrigin::Anchor,
@@ -244,9 +282,100 @@ fn layer_rule_animations_select_style_by_namespace() {
         layer_close,
         Some(LayerCloseAnim {
             anim: easing_anim(100, Curve::Linear),
+            transform_anim: easing_anim(100, Curve::Linear),
+            opacity_anim: easing_anim(100, Curve::Linear),
             style: LayerCloseAnimationStyle::Popout,
             scale_to: 0.95,
             origin: LayerAnimationOrigin::Anchor,
+            ..Default::default()
+        })
+    );
+
+    map_layer(&mut f, id, "edge-reveal-layer");
+    let (layer_open, layer_close, _) = resolved_layer_animation_rules(&mut f, "edge-reveal-layer");
+    assert_eq!(
+        layer_open,
+        Some(LayerOpenAnim {
+            anim: LayerOpenAnim::default().anim,
+            transform_anim: easing_anim(180, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+            opacity_anim: easing_anim(90, Curve::CubicBezier(0., 0., 0., 1.)),
+            style: LayerOpenAnimationStyle::EdgeReveal,
+            opacity_from: 0.82,
+            edge: LayerAnimationEdge::Top,
+            distance: 18.,
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        layer_close,
+        Some(LayerCloseAnim {
+            anim: LayerCloseAnim::default().anim,
+            transform_anim: easing_anim(120, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+            opacity_anim: easing_anim(80, Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+            style: LayerCloseAnimationStyle::EdgeReveal,
+            opacity_to: 0.55,
+            edge: LayerAnimationEdge::Bottom,
+            distance: 14.,
+            ..Default::default()
+        })
+    );
+}
+
+#[test]
+fn layer_rule_animations_resolve_split_channels() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^split-layer$"
+
+            animations {
+                layer-open {
+                    duration-ms 180
+                    curve "ease-out-cubic"
+                    transform-duration-ms 240
+                    transform-curve "emphasized-decel"
+                    opacity-duration-ms 90
+                    opacity-curve "linear"
+                    opacity-delay-ms 25
+                }
+                layer-close {
+                    duration-ms 150
+                    curve "ease-out-quad"
+                    transform-duration-ms 120
+                    transform-curve "emphasized-accel"
+                    opacity-duration-ms 80
+                    opacity-curve "menu-accel"
+                    opacity-delay-ms 10
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    map_layer(&mut f, id, "split-layer");
+    let (layer_open, layer_close, _) = resolved_layer_animation_rules(&mut f, "split-layer");
+    assert_eq!(
+        layer_open,
+        Some(LayerOpenAnim {
+            anim: easing_anim(180, Curve::EaseOutCubic),
+            transform_anim: easing_anim(240, Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+            opacity_anim: easing_anim(90, Curve::Linear),
+            opacity_delay_ms: 25,
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        layer_close,
+        Some(LayerCloseAnim {
+            anim: easing_anim(150, Curve::EaseOutQuad),
+            transform_anim: easing_anim(120, Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+            opacity_anim: easing_anim(80, Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+            opacity_delay_ms: 10,
             ..Default::default()
         })
     );
@@ -298,6 +427,45 @@ fn layer_close_animation_uses_snapshot_and_cleans_up() {
 }
 
 #[test]
+fn layer_close_animation_opacity_delay_extends_lifetime() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-close {
+                    style "fade"
+                    opacity-to 0
+                    transform-duration-ms 0
+                    transform-curve "linear"
+                    opacity-duration-ms 100
+                    opacity-curve "linear"
+                    opacity-delay-ms 50
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_layer(&mut f, id, "animated-layer");
+    unmap_layer(&mut f, id, &surface);
+    assert_eq!(f.niri().closing_layers.len(), 1);
+
+    advance_layer_animations(&mut f, Duration::from_millis(120));
+    assert_eq!(f.niri().closing_layers.len(), 1);
+
+    advance_layer_animations(&mut f, Duration::from_millis(40));
+    assert!(f.niri().closing_layers.is_empty());
+}
+
+#[test]
 fn layer_close_animation_is_cancelled_on_reopen() {
     let config = Config::parse_mem(
         r#"
@@ -331,6 +499,199 @@ fn layer_close_animation_is_cancelled_on_reopen() {
         .mapped_layer_surfaces
         .values()
         .any(|mapped| mapped.surface().namespace() == "animated-layer"));
+}
+
+#[test]
+fn layer_close_animation_interrupted_open_starts_from_current_visual_state() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-open {
+                    style "popin"
+                    opacity-from 0.2
+                    scale-from 0.8
+                    duration-ms 1000
+                    curve "linear"
+                }
+                layer-close {
+                    style "popout"
+                    opacity-to 0.1
+                    scale-to 0.6
+                    duration-ms 500
+                    curve "linear"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_layer(&mut f, id, "animated-layer");
+    advance_layer_animations(&mut f, Duration::from_millis(250));
+
+    unmap_layer(&mut f, id, &surface);
+    assert_eq!(f.niri().closing_layers.len(), 1);
+
+    let start = f.niri().closing_layers[0].animation.start_state_for_tests();
+    assert!((start.start_alpha - 0.4).abs() < 0.001);
+    assert!((start.start_scale - 0.85).abs() < 0.001);
+    assert_eq!(start.start_offset, Point::from((0., 0.)));
+}
+
+#[test]
+fn layer_close_animation_interrupted_open_uses_opacity_delay() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-open {
+                    style "popin"
+                    opacity-from 0.2
+                    scale-from 0.8
+                    transform-duration-ms 1000
+                    transform-curve "linear"
+                    opacity-duration-ms 1000
+                    opacity-curve "linear"
+                    opacity-delay-ms 200
+                }
+                layer-close {
+                    style "popout"
+                    opacity-to 0.1
+                    scale-to 0.6
+                    duration-ms 500
+                    curve "linear"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_layer(&mut f, id, "animated-layer");
+    advance_layer_animations(&mut f, Duration::from_millis(250));
+
+    unmap_layer(&mut f, id, &surface);
+    assert_eq!(f.niri().closing_layers.len(), 1);
+
+    let start = f.niri().closing_layers[0].animation.start_state_for_tests();
+    assert!((start.start_alpha - 0.24).abs() < 0.001);
+    assert!((start.start_scale - 0.85).abs() < 0.001);
+    assert_eq!(start.start_offset, Point::from((0., 0.)));
+}
+
+#[test]
+fn layer_close_animation_interrupted_slide_open_starts_from_current_offset() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-open {
+                    style "slide"
+                    edge "top"
+                    distance 40
+                    opacity-from 0.5
+                    duration-ms 1000
+                    curve "linear"
+                }
+                layer-close {
+                    style "slide"
+                    edge "bottom"
+                    distance 20
+                    opacity-to 0.25
+                    duration-ms 500
+                    curve "linear"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_layer(&mut f, id, "animated-layer");
+    advance_layer_animations(&mut f, Duration::from_millis(250));
+
+    unmap_layer(&mut f, id, &surface);
+    assert_eq!(f.niri().closing_layers.len(), 1);
+
+    let start = f.niri().closing_layers[0].animation.start_state_for_tests();
+    assert!((start.start_alpha - 0.625).abs() < 0.001);
+    assert!((start.start_scale - 1.).abs() < 0.001);
+    assert!((start.start_offset.x - 0.).abs() < 0.001);
+    assert!((start.start_offset.y - -30.).abs() < 0.05);
+}
+
+#[test]
+fn layer_close_animation_interrupted_edge_reveal_open_starts_from_current_offset() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-open {
+                    style "edge-reveal"
+                    edge "top"
+                    distance 20
+                    opacity-from 0.8
+                    transform-duration-ms 1000
+                    transform-curve "linear"
+                    opacity-duration-ms 500
+                    opacity-curve "linear"
+                }
+                layer-close {
+                    style "edge-reveal"
+                    edge "bottom"
+                    distance 12
+                    opacity-to 0.55
+                    transform-duration-ms 500
+                    transform-curve "linear"
+                    opacity-duration-ms 400
+                    opacity-curve "linear"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_layer(&mut f, id, "animated-layer");
+    advance_layer_animations(&mut f, Duration::from_millis(250));
+
+    unmap_layer(&mut f, id, &surface);
+    assert_eq!(f.niri().closing_layers.len(), 1);
+
+    let start = f.niri().closing_layers[0].animation.start_state_for_tests();
+    assert!((start.start_alpha - 0.9).abs() < 0.001);
+    assert!((start.start_scale - 1.).abs() < 0.001);
+    assert!((start.start_offset.x - 0.).abs() < 0.001);
+    assert!((start.start_offset.y - -15.).abs() < 0.05);
 }
 
 #[test]
@@ -637,15 +998,21 @@ fn easing_anim(duration_ms: u32, curve: Curve) -> Animation {
 }
 
 fn layer_open_anim(duration_ms: u32, curve: Curve) -> LayerOpenAnim {
+    let anim = easing_anim(duration_ms, curve);
     LayerOpenAnim {
-        anim: easing_anim(duration_ms, curve),
+        anim,
+        transform_anim: anim,
+        opacity_anim: anim,
         ..Default::default()
     }
 }
 
 fn layer_close_anim(duration_ms: u32, curve: Curve) -> LayerCloseAnim {
+    let anim = easing_anim(duration_ms, curve);
     LayerCloseAnim {
-        anim: easing_anim(duration_ms, curve),
+        anim,
+        transform_anim: anim,
+        opacity_anim: anim,
         ..Default::default()
     }
 }

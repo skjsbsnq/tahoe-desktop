@@ -5,6 +5,7 @@ use smithay::backend::renderer::element::utils::{
 use smithay::backend::renderer::element::Element;
 use smithay::utils::{Logical, Physical, Point, Scale, Size};
 use smithay::wayland::shell::wlr_layer::Anchor;
+use std::time::Duration;
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::solid_color::SolidColorRenderElement;
@@ -17,7 +18,9 @@ pub type OpeningLayerRenderElement<E> = RelocateRenderElement<RescaleRenderEleme
 
 #[derive(Debug)]
 pub struct OpenAnimation {
-    anim: Animation,
+    transform_anim: Animation,
+    opacity_anim: Animation,
+    opacity_delay: Duration,
     config: niri_config::animations::LayerOpenAnim,
 }
 
@@ -33,30 +36,43 @@ pub struct OpenAnimationState {
 impl OpenAnimation {
     pub fn new(clock: Clock, config: niri_config::animations::LayerOpenAnim) -> Self {
         Self {
-            anim: Animation::new(clock, 0., 1., 0., config.anim),
+            transform_anim: Animation::new(clock.clone(), 0., 1., 0., config.transform_anim),
+            opacity_anim: Animation::new(clock, 0., 1., 0., config.opacity_anim),
+            opacity_delay: Duration::from_millis(u64::from(config.opacity_delay_ms)),
             config,
         }
     }
 
     pub fn is_done(&self) -> bool {
-        self.anim.is_done()
+        self.transform_anim.is_done() && self.opacity_anim.is_done_with_delay(self.opacity_delay)
     }
 
     pub fn state(&self) -> OpenAnimationState {
-        let progress = self.anim.clamped_value().clamp(0., 1.);
+        let transform_progress = self.transform_anim.clamped_value().clamp(0., 1.);
+        let opacity_progress = self
+            .opacity_anim
+            .clamped_value_with_delay(self.opacity_delay)
+            .clamp(0., 1.);
         let config = self.config;
 
-        let alpha = config.opacity_from + (1. - config.opacity_from) * progress as f32;
+        let alpha = config.opacity_from + (1. - config.opacity_from) * opacity_progress as f32;
         let scale = match config.style {
             niri_config::animations::LayerOpenAnimationStyle::Popin => {
-                config.scale_from + (1. - config.scale_from) * progress
+                config.scale_from + (1. - config.scale_from) * transform_progress
             }
             niri_config::animations::LayerOpenAnimationStyle::Fade
-            | niri_config::animations::LayerOpenAnimationStyle::Slide => 1.,
+            | niri_config::animations::LayerOpenAnimationStyle::Slide
+            | niri_config::animations::LayerOpenAnimationStyle::EdgeReveal => 1.,
         };
         let offset = match config.style {
+            // slide moves the whole surface by the configured distance. edge-reveal
+            // deliberately uses the same offset primitive for now, but is kept as a
+            // distinct style for shorter edge-attached motion and future clipping.
             niri_config::animations::LayerOpenAnimationStyle::Slide => {
-                config.distance * (1. - progress)
+                config.distance * (1. - transform_progress)
+            }
+            niri_config::animations::LayerOpenAnimationStyle::EdgeReveal => {
+                config.distance * (1. - transform_progress)
             }
             niri_config::animations::LayerOpenAnimationStyle::Fade
             | niri_config::animations::LayerOpenAnimationStyle::Popin => 0.,
@@ -109,6 +125,10 @@ impl OpenAnimationState {
             niri_config::animations::LayerAnimationEdge::Bottom => Point::new(0., self.offset),
             niri_config::animations::LayerAnimationEdge::Left => Point::new(-self.offset, 0.),
         }
+    }
+
+    pub fn scale(self) -> f64 {
+        self.scale
     }
 
     pub fn wrap<E: Element>(

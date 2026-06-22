@@ -119,6 +119,12 @@ pub struct EasingParams {
     pub curve: Curve,
 }
 
+#[derive(Default, Clone, Copy, PartialEq)]
+struct OptionalEasingParams {
+    duration_ms: Option<u32>,
+    curve: Option<Curve>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Curve {
     Linear,
@@ -196,6 +202,9 @@ impl Default for WindowCloseAnim {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerOpenAnim {
     pub anim: Animation,
+    pub transform_anim: Animation,
+    pub opacity_anim: Animation,
+    pub opacity_delay_ms: u32,
     pub style: LayerOpenAnimationStyle,
     pub scale_from: f64,
     pub opacity_from: f32,
@@ -206,14 +215,19 @@ pub struct LayerOpenAnim {
 
 impl Default for LayerOpenAnim {
     fn default() -> Self {
+        let anim = Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 150,
+                curve: Curve::EaseOutExpo,
+            }),
+        };
+
         Self {
-            anim: Animation {
-                off: false,
-                kind: Kind::Easing(EasingParams {
-                    duration_ms: 150,
-                    curve: Curve::EaseOutExpo,
-                }),
-            },
+            anim,
+            transform_anim: anim,
+            opacity_anim: anim,
+            opacity_delay_ms: 0,
             style: LayerOpenAnimationStyle::Popin,
             scale_from: 0.96,
             opacity_from: 0.,
@@ -227,6 +241,9 @@ impl Default for LayerOpenAnim {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerCloseAnim {
     pub anim: Animation,
+    pub transform_anim: Animation,
+    pub opacity_anim: Animation,
+    pub opacity_delay_ms: u32,
     pub style: LayerCloseAnimationStyle,
     pub scale_to: f64,
     pub opacity_to: f32,
@@ -237,14 +254,19 @@ pub struct LayerCloseAnim {
 
 impl Default for LayerCloseAnim {
     fn default() -> Self {
+        let anim = Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 150,
+                curve: Curve::EaseOutQuad,
+            }),
+        };
+
         Self {
-            anim: Animation {
-                off: false,
-                kind: Kind::Easing(EasingParams {
-                    duration_ms: 150,
-                    curve: Curve::EaseOutQuad,
-                }),
-            },
+            anim,
+            transform_anim: anim,
+            opacity_anim: anim,
+            opacity_delay_ms: 0,
             style: LayerCloseAnimationStyle::Popout,
             scale_to: 0.97,
             opacity_to: 0.,
@@ -260,6 +282,7 @@ pub enum LayerOpenAnimationStyle {
     Fade,
     Popin,
     Slide,
+    EdgeReveal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +290,7 @@ pub enum LayerCloseAnimationStyle {
     Fade,
     Popout,
     Slide,
+    EdgeReveal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +552,9 @@ where
         let mut origin = None;
         let mut edge = None;
         let mut distance = None;
+        let mut transform_params = OptionalEasingParams::default();
+        let mut opacity_params = OptionalEasingParams::default();
+        let mut opacity_delay_ms = None;
 
         let anim = Animation::decode_node(node, ctx, default.anim, |child, ctx| {
             match &**child.node_name {
@@ -567,12 +594,69 @@ where
                     distance = Some(value.0);
                     Ok(true)
                 }
+                "transform-duration-ms" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        transform_params.duration_ms.is_some(),
+                        "transform-duration-ms",
+                    );
+                    transform_params.duration_ms =
+                        Some(parse_arg_node("transform-duration-ms", child, ctx)?);
+                    Ok(true)
+                }
+                "transform-curve" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        transform_params.curve.is_some(),
+                        "transform-curve",
+                    );
+                    transform_params.curve = parse_animation_curve_node(child, ctx)?;
+                    Ok(true)
+                }
+                "opacity-duration-ms" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        opacity_params.duration_ms.is_some(),
+                        "opacity-duration-ms",
+                    );
+                    opacity_params.duration_ms =
+                        Some(parse_arg_node("opacity-duration-ms", child, ctx)?);
+                    Ok(true)
+                }
+                "opacity-curve" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        opacity_params.curve.is_some(),
+                        "opacity-curve",
+                    );
+                    opacity_params.curve = parse_animation_curve_node(child, ctx)?;
+                    Ok(true)
+                }
+                "opacity-delay-ms" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        opacity_delay_ms.is_some(),
+                        "opacity-delay-ms",
+                    );
+                    opacity_delay_ms = Some(parse_arg_node("opacity-delay-ms", child, ctx)?);
+                    Ok(true)
+                }
                 _ => Ok(false),
             }
         })?;
+        let transform_anim = animation_from_optional_easing_params(anim, transform_params);
+        let opacity_anim = animation_from_optional_easing_params(anim, opacity_params);
 
         Ok(Self {
             anim,
+            transform_anim,
+            opacity_anim,
+            opacity_delay_ms: opacity_delay_ms.unwrap_or(default.opacity_delay_ms),
             style: style.unwrap_or(default.style),
             scale_from: scale_from.unwrap_or(default.scale_from),
             opacity_from: opacity_from.unwrap_or(default.opacity_from),
@@ -598,6 +682,9 @@ where
         let mut origin = None;
         let mut edge = None;
         let mut distance = None;
+        let mut transform_params = OptionalEasingParams::default();
+        let mut opacity_params = OptionalEasingParams::default();
+        let mut opacity_delay_ms = None;
 
         let anim = Animation::decode_node(node, ctx, default.anim, |child, ctx| {
             match &**child.node_name {
@@ -637,12 +724,69 @@ where
                     distance = Some(value.0);
                     Ok(true)
                 }
+                "transform-duration-ms" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        transform_params.duration_ms.is_some(),
+                        "transform-duration-ms",
+                    );
+                    transform_params.duration_ms =
+                        Some(parse_arg_node("transform-duration-ms", child, ctx)?);
+                    Ok(true)
+                }
+                "transform-curve" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        transform_params.curve.is_some(),
+                        "transform-curve",
+                    );
+                    transform_params.curve = parse_animation_curve_node(child, ctx)?;
+                    Ok(true)
+                }
+                "opacity-duration-ms" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        opacity_params.duration_ms.is_some(),
+                        "opacity-duration-ms",
+                    );
+                    opacity_params.duration_ms =
+                        Some(parse_arg_node("opacity-duration-ms", child, ctx)?);
+                    Ok(true)
+                }
+                "opacity-curve" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        opacity_params.curve.is_some(),
+                        "opacity-curve",
+                    );
+                    opacity_params.curve = parse_animation_curve_node(child, ctx)?;
+                    Ok(true)
+                }
+                "opacity-delay-ms" => {
+                    check_duplicate_node(
+                        ctx,
+                        child,
+                        opacity_delay_ms.is_some(),
+                        "opacity-delay-ms",
+                    );
+                    opacity_delay_ms = Some(parse_arg_node("opacity-delay-ms", child, ctx)?);
+                    Ok(true)
+                }
                 _ => Ok(false),
             }
         })?;
+        let transform_anim = animation_from_optional_easing_params(anim, transform_params);
+        let opacity_anim = animation_from_optional_easing_params(anim, opacity_params);
 
         Ok(Self {
             anim,
+            transform_anim,
+            opacity_anim,
+            opacity_delay_ms: opacity_delay_ms.unwrap_or(default.opacity_delay_ms),
             style: style.unwrap_or(default.style),
             scale_to: scale_to.unwrap_or(default.scale_to),
             opacity_to: opacity_to.unwrap_or(default.opacity_to),
@@ -778,13 +922,14 @@ fn parse_layer_open_style<S: knuffel::traits::ErrorSpan>(
         "fade" => LayerOpenAnimationStyle::Fade,
         "popin" => LayerOpenAnimationStyle::Popin,
         "slide" => LayerOpenAnimationStyle::Slide,
+        "edge-reveal" => LayerOpenAnimationStyle::EdgeReveal,
         unexpected => {
             ctx.emit_error(DecodeError::unexpected(
                 node,
                 "node",
                 format!(
                     "unexpected layer open animation style `{unexpected}`. \
-                    Supported styles are `fade`, `popin` and `slide`."
+                    Supported styles are `fade`, `popin`, `slide` and `edge-reveal`."
                 ),
             ));
             LayerOpenAnimationStyle::Fade
@@ -801,13 +946,14 @@ fn parse_layer_close_style<S: knuffel::traits::ErrorSpan>(
         "fade" => LayerCloseAnimationStyle::Fade,
         "popout" => LayerCloseAnimationStyle::Popout,
         "slide" => LayerCloseAnimationStyle::Slide,
+        "edge-reveal" => LayerCloseAnimationStyle::EdgeReveal,
         unexpected => {
             ctx.emit_error(DecodeError::unexpected(
                 node,
                 "node",
                 format!(
                     "unexpected layer close animation style `{unexpected}`. \
-                    Supported styles are `fade`, `popout` and `slide`."
+                    Supported styles are `fade`, `popout`, `slide` and `edge-reveal`."
                 ),
             ));
             LayerCloseAnimationStyle::Fade
@@ -861,6 +1007,135 @@ fn parse_layer_animation_edge<S: knuffel::traits::ErrorSpan>(
     }
 }
 
+fn animation_from_optional_easing_params(
+    default: Animation,
+    params: OptionalEasingParams,
+) -> Animation {
+    if params == OptionalEasingParams::default() {
+        return default;
+    }
+
+    let default_easing = if let Kind::Easing(easing) = default.kind {
+        easing
+    } else {
+        EasingParams {
+            duration_ms: 250,
+            curve: Curve::EaseOutCubic,
+        }
+    };
+
+    Animation {
+        off: default.off,
+        kind: Kind::Easing(EasingParams {
+            duration_ms: params.duration_ms.unwrap_or(default_easing.duration_ms),
+            curve: params.curve.unwrap_or(default_easing.curve),
+        }),
+    }
+}
+
+fn parse_animation_curve_node<S: knuffel::traits::ErrorSpan>(
+    child: &knuffel::ast::SpannedNode<S>,
+    ctx: &mut knuffel::decode::Context<S>,
+) -> Result<Option<Curve>, DecodeError<S>> {
+    let mut iter_args = child.arguments.iter();
+    let val = iter_args
+        .next()
+        .ok_or_else(|| DecodeError::missing(child, "additional argument `curve` is required"))?;
+    let animation_curve_string: String = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+
+    let animation_curve = match animation_curve_string.as_str() {
+        "linear" => Some(Curve::Linear),
+        "ease-out-quad" => Some(Curve::EaseOutQuad),
+        "ease-out-cubic" => Some(Curve::EaseOutCubic),
+        "ease-out-expo" => Some(Curve::EaseOutExpo),
+        "emphasized-decel" => Some(Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
+        "emphasized-accel" => Some(Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
+        "standard-decel" => Some(Curve::CubicBezier(0., 0., 0., 1.)),
+        "expressive-effects" => Some(Curve::CubicBezier(0.34, 0.8, 0.34, 1.)),
+        "menu-decel-safe" => Some(Curve::CubicBezier(0.12, 0.95, 0.16, 1.)),
+        // Imported from end-4 for compatibility. Its x control points are not monotonic
+        // (x2 < x1), so prefer menu-decel-safe for compositor surface animation.
+        "menu-decel" => Some(Curve::CubicBezier(0.1, 1., 0., 1.)),
+        "menu-accel" => Some(Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
+        "stall" => Some(Curve::CubicBezier(1., -0.1, 0.7, 0.85)),
+        "cubic-bezier" => {
+            let val = iter_args.next().ok_or_else(|| {
+                DecodeError::missing(
+                    child,
+                    "missing x1 coordinate for cubic Bézier curve control point",
+                )
+            })?;
+            // The X axis represents time frame so it cannot be negative or larger than 1.
+            let x1: FloatOrInt<0, 1> = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+            let val = iter_args.next().ok_or_else(|| {
+                DecodeError::missing(
+                    child,
+                    "missing y1 coordinate for cubic Bézier curve control point",
+                )
+            })?;
+            let y1: FloatOrInt<{ i32::MIN }, { i32::MAX }> =
+                knuffel::traits::DecodeScalar::decode(val, ctx)?;
+            let val = iter_args.next().ok_or_else(|| {
+                DecodeError::missing(
+                    child,
+                    "missing x2 coordinate for cubic Bézier curve control point",
+                )
+            })?;
+            let x2: FloatOrInt<0, 1> = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+            let val = iter_args.next().ok_or_else(|| {
+                DecodeError::missing(
+                    child,
+                    "missing y2 coordinate for cubic Bézier curve control point",
+                )
+            })?;
+            let y2: FloatOrInt<{ i32::MIN }, { i32::MAX }> =
+                knuffel::traits::DecodeScalar::decode(val, ctx)?;
+
+            Some(Curve::CubicBezier(x1.0, y1.0, x2.0, y2.0))
+        }
+        unexpected_curve => {
+            ctx.emit_error(DecodeError::unexpected(
+                &val.literal,
+                "argument",
+                format!(
+                    "unexpected animation curve `{unexpected_curve}`. \
+                    Niri only supports these animation curves: \
+                    `ease-out-quad`, `ease-out-cubic`, `ease-out-expo`, `linear`, \
+                    `emphasized-decel`, `emphasized-accel`, `standard-decel`, \
+                    `expressive-effects`, `menu-decel-safe`, `menu-decel`, \
+                    `menu-accel`, `stall` and `cubic-bezier`."
+                ),
+            ));
+
+            None
+        }
+    };
+
+    if let Some(val) = iter_args.next() {
+        ctx.emit_error(DecodeError::unexpected(
+            &val.literal,
+            "argument",
+            "unexpected argument",
+        ));
+    }
+    for name in child.properties.keys() {
+        ctx.emit_error(DecodeError::unexpected(
+            name,
+            "property",
+            format!("unexpected property `{}`", name.escape_default()),
+        ));
+    }
+    for child in child.children() {
+        ctx.emit_error(DecodeError::unexpected(
+            child,
+            "node",
+            format!("unexpected node `{}`", child.node_name.escape_default()),
+        ));
+    }
+
+    Ok(animation_curve)
+}
+
 impl Animation {
     pub fn new_off() -> Self {
         Self {
@@ -881,12 +1156,6 @@ impl Animation {
             &mut knuffel::decode::Context<S>,
         ) -> Result<bool, DecodeError<S>>,
     ) -> Result<Self, DecodeError<S>> {
-        #[derive(Default, PartialEq)]
-        struct OptionalEasingParams {
-            duration_ms: Option<u32>,
-            curve: Option<Curve>,
-        }
-
         expect_only_children(node, ctx);
 
         let mut off = false;
@@ -959,101 +1228,7 @@ impl Animation {
                         ));
                     }
 
-                    let mut iter_args = child.arguments.iter();
-                    let val = iter_args.next().ok_or_else(|| {
-                        DecodeError::missing(child, "additional argument `curve` is required")
-                    })?;
-                    let animation_curve_string: String =
-                        knuffel::traits::DecodeScalar::decode(val, ctx)?;
-
-                    let animation_curve = match animation_curve_string.as_str() {
-                        "linear" => Some(Curve::Linear),
-                        "ease-out-quad" => Some(Curve::EaseOutQuad),
-                        "ease-out-cubic" => Some(Curve::EaseOutCubic),
-                        "ease-out-expo" => Some(Curve::EaseOutExpo),
-                        "emphasized-decel" => Some(Curve::CubicBezier(0.05, 0.7, 0.1, 1.)),
-                        "emphasized-accel" => Some(Curve::CubicBezier(0.3, 0., 0.8, 0.15)),
-                        "menu-decel" => Some(Curve::CubicBezier(0.1, 1., 0., 1.)),
-                        "menu-accel" => Some(Curve::CubicBezier(0.52, 0.03, 0.72, 0.08)),
-                        "stall" => Some(Curve::CubicBezier(1., -0.1, 0.7, 0.85)),
-                        "cubic-bezier" => {
-                            let val = iter_args.next().ok_or_else(|| {
-                                DecodeError::missing(
-                                    child,
-                                    "missing x1 coordinate for cubic Bézier curve control point",
-                                )
-                            })?;
-                            // the X axis represents time frame so it cannot be negative
-                            // or larger than 1
-                            let x1: FloatOrInt<0, 1> =
-                                knuffel::traits::DecodeScalar::decode(val, ctx)?;
-                            let val = iter_args.next().ok_or_else(|| {
-                                DecodeError::missing(
-                                    child,
-                                    "missing y1 coordinate for cubic Bézier curve control point",
-                                )
-                            })?;
-                            let y1: FloatOrInt<{ i32::MIN }, { i32::MAX }> =
-                                knuffel::traits::DecodeScalar::decode(val, ctx)?;
-                            let val = iter_args.next().ok_or_else(|| {
-                                DecodeError::missing(
-                                    child,
-                                    "missing x2 coordinate for cubic Bézier curve control point",
-                                )
-                            })?;
-                            let x2: FloatOrInt<0, 1> =
-                                knuffel::traits::DecodeScalar::decode(val, ctx)?;
-                            let val = iter_args.next().ok_or_else(|| {
-                                DecodeError::missing(
-                                    child,
-                                    "missing y2 coordinate for cubic Bézier curve control point",
-                                )
-                            })?;
-                            let y2: FloatOrInt<{ i32::MIN }, { i32::MAX }> =
-                                knuffel::traits::DecodeScalar::decode(val, ctx)?;
-
-                            Some(Curve::CubicBezier(x1.0, y1.0, x2.0, y2.0))
-                        }
-                        unexpected_curve => {
-                            ctx.emit_error(DecodeError::unexpected(
-                                &val.literal,
-                                "argument",
-                                format!(
-                                    "unexpected animation curve `{unexpected_curve}`. \
-                                    Niri only supports these animation curves: \
-                                    `ease-out-quad`, `ease-out-cubic`, `ease-out-expo`, `linear`, \
-                                    `emphasized-decel`, `emphasized-accel`, `menu-decel`, \
-                                    `menu-accel`, `stall` and `cubic-bezier`."
-                                ),
-                            ));
-
-                            None
-                        }
-                    };
-
-                    if let Some(val) = iter_args.next() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            &val.literal,
-                            "argument",
-                            "unexpected argument",
-                        ));
-                    }
-                    for name in child.properties.keys() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            name,
-                            "property",
-                            format!("unexpected property `{}`", name.escape_default()),
-                        ));
-                    }
-                    for child in child.children() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            child,
-                            "node",
-                            format!("unexpected node `{}`", child.node_name.escape_default()),
-                        ));
-                    }
-
-                    easing_params.curve = animation_curve;
+                    easing_params.curve = parse_animation_curve_node(child, ctx)?;
                 }
                 name_str => {
                     if !process_children(child, ctx)? {
