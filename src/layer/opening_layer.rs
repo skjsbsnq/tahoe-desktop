@@ -13,6 +13,7 @@ pub type OpeningLayerWaylandRenderElement<R> =
     RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>;
 pub type OpeningLayerSolidColorRenderElement =
     RelocateRenderElement<RescaleRenderElement<SolidColorRenderElement>>;
+pub type OpeningLayerRenderElement<E> = RelocateRenderElement<RescaleRenderElement<E>>;
 
 #[derive(Debug)]
 pub struct OpenAnimation {

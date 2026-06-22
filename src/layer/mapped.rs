@@ -12,8 +12,8 @@ use super::ResolvedLayerRules;
 use crate::animation::Clock;
 use crate::layer::closing_layer::ClosingLayerRenderElement;
 use crate::layer::opening_layer::{
-    self, OpenAnimation, OpenAnimationState, OpeningLayerSolidColorRenderElement,
-    OpeningLayerWaylandRenderElement,
+    self, OpenAnimation, OpenAnimationState, OpeningLayerRenderElement,
+    OpeningLayerSolidColorRenderElement, OpeningLayerWaylandRenderElement,
 };
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
@@ -81,6 +81,9 @@ niri_render_elements! {
         TahoeGlass = TahoeGlassElement,
         OpeningWayland = OpeningLayerWaylandRenderElement<R>,
         OpeningSolidColor = OpeningLayerSolidColorRenderElement,
+        OpeningShadow = OpeningLayerRenderElement<ShadowRenderElement>,
+        OpeningBackgroundEffect = OpeningLayerRenderElement<BackgroundEffectElement>,
+        OpeningTahoeGlass = OpeningLayerRenderElement<TahoeGlassElement>,
         Closing = ClosingLayerRenderElement,
     }
 }
@@ -555,11 +558,20 @@ fn wrap_opening_render_element<R: NiriRenderer>(
         LayerSurfaceRenderElement::SolidColor(elem) => {
             opening_layer::wrap(elem, state, origin, offset).into()
         }
-        elem @ LayerSurfaceRenderElement::Shadow(_)
-        | elem @ LayerSurfaceRenderElement::BackgroundEffect(_)
-        | elem @ LayerSurfaceRenderElement::TahoeGlass(_) => elem,
+        LayerSurfaceRenderElement::Shadow(elem) => {
+            opening_layer::wrap(elem, state, origin, offset).into()
+        }
+        LayerSurfaceRenderElement::BackgroundEffect(elem) => {
+            opening_layer::wrap(elem, state, origin, offset).into()
+        }
+        LayerSurfaceRenderElement::TahoeGlass(elem) => {
+            opening_layer::wrap(elem, state, origin, offset).into()
+        }
         elem @ LayerSurfaceRenderElement::OpeningWayland(_)
         | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)
+        | elem @ LayerSurfaceRenderElement::OpeningShadow(_)
+        | elem @ LayerSurfaceRenderElement::OpeningBackgroundEffect(_)
+        | elem @ LayerSurfaceRenderElement::OpeningTahoeGlass(_)
         | elem @ LayerSurfaceRenderElement::Closing(_) => elem,
     }
 }
