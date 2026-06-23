@@ -194,15 +194,21 @@ impl MappedLayer {
     }
 
     pub fn has_tahoe_glass_regions(&self) -> bool {
-        if self
-            .close_tahoe_glass_regions
-            .as_ref()
-            .is_some_and(|regions| !regions.is_empty())
+        self.has_renderable_tahoe_glass_regions()
+    }
+
+    fn has_renderable_tahoe_glass_regions(&self) -> bool {
+        if !self
+            .tahoe_glass_config
+            .namespace_allowed(self.surface.namespace())
         {
-            return true;
+            return false;
         }
 
-        tahoe_glass::surface_has_regions(self.surface.wl_surface())
+        self.close_tahoe_glass_regions
+            .as_ref()
+            .is_some_and(|regions| !regions.is_empty())
+            || tahoe_glass::surface_has_regions(self.surface.wl_surface())
     }
 
     pub fn surface(&self) -> &LayerSurface {
@@ -273,6 +279,7 @@ impl MappedLayer {
         let tahoe_glass_regions = with_states(self.surface.wl_surface(), get_committed_regions);
         self.close_tahoe_glass_regions =
             (!tahoe_glass_regions.is_empty()).then_some(tahoe_glass_regions);
+        let render_tahoe_glass_in_snapshot = !self.has_renderable_tahoe_glass_regions();
 
         let mut contents = Vec::new();
         self.render_normal_with_open_state(
@@ -285,6 +292,7 @@ impl MappedLayer {
             Point::from((0., 0.)),
             XrayPos::default(),
             None,
+            render_tahoe_glass_in_snapshot,
             &mut |elem| contents.push(elem),
         );
         self.render_popups_with_open_state(
@@ -311,6 +319,7 @@ impl MappedLayer {
             Point::from((0., 0.)),
             XrayPos::default(),
             None,
+            render_tahoe_glass_in_snapshot,
             &mut |elem| blocked_out_contents.push(elem),
         );
         self.render_popups_with_open_state(
@@ -403,6 +412,7 @@ impl MappedLayer {
             location,
             xray_pos,
             self.open_animation_state(),
+            true,
             push,
         );
     }
@@ -414,6 +424,7 @@ impl MappedLayer {
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
         open_state: Option<OpenAnimationState>,
+        render_tahoe_glass: bool,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
@@ -474,19 +485,25 @@ impl MappedLayer {
         }
 
         let location = location.to_physical_precise_round(scale).to_logical(scale);
-        let has_tahoe_glass = tahoe_glass::render_for_layer(
-            ctx.as_gles(),
-            ns,
-            surface,
-            self.surface.namespace(),
-            location,
-            self.scale,
-            self.blur_config,
-            &self.tahoe_glass_config,
-            open_alpha,
-            xray_pos,
-            &mut |elem| push_opening(elem.into()),
-        );
+        let has_tahoe_glass = if render_tahoe_glass {
+            tahoe_glass::render_for_layer(
+                ctx.as_gles(),
+                ns,
+                surface,
+                self.surface.namespace(),
+                location,
+                self.scale,
+                self.blur_config,
+                &self.tahoe_glass_config,
+                open_alpha,
+                xray_pos,
+                &mut |elem| push_opening(elem.into()),
+            )
+        } else {
+            // The close animation renders frozen TahoeGlass regions live; do not
+            // bake a second glass/fallback effect into the snapshot texture.
+            true
+        };
 
         let geometry = Rectangle::new(location, self.block_out_buffer.size());
         let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.
