@@ -287,7 +287,7 @@ impl State {
         let scale = Scale::from(output.current_scale().fractional_scale());
         let clock = self.niri.clock.clone();
         let for_backdrop = mapped.place_within_backdrop();
-        let has_live_tahoe_glass = mapped.has_tahoe_glass_regions();
+        let render_close_effects_live = mapped.should_render_close_effects_live();
         let layer_kind = layer.layer();
         let output = output.clone();
         let surface = layer.clone();
@@ -340,7 +340,7 @@ impl State {
             layer: layer_kind,
             for_backdrop,
             animation,
-            live_tahoe_glass: has_live_tahoe_glass.then_some(mapped),
+            live_close_effects: render_close_effects_live.then_some(mapped),
         });
     }
 }

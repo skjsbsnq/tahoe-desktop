@@ -197,6 +197,11 @@ impl MappedLayer {
         self.has_renderable_tahoe_glass_regions()
     }
 
+    pub fn should_render_close_effects_live(&self) -> bool {
+        self.tahoe_glass_config
+            .namespace_allowed(self.surface.namespace())
+    }
+
     fn has_renderable_tahoe_glass_regions(&self) -> bool {
         if !self
             .tahoe_glass_config
@@ -279,7 +284,7 @@ impl MappedLayer {
         let tahoe_glass_regions = with_states(self.surface.wl_surface(), get_committed_regions);
         self.close_tahoe_glass_regions =
             (!tahoe_glass_regions.is_empty()).then_some(tahoe_glass_regions);
-        let render_tahoe_glass_in_snapshot = !self.has_renderable_tahoe_glass_regions();
+        let render_close_effects_in_snapshot = !self.should_render_close_effects_live();
 
         let mut contents = Vec::new();
         self.render_normal_with_open_state(
@@ -292,7 +297,7 @@ impl MappedLayer {
             Point::from((0., 0.)),
             XrayPos::default(),
             None,
-            render_tahoe_glass_in_snapshot,
+            render_close_effects_in_snapshot,
             &mut |elem| contents.push(elem),
         );
         self.render_popups_with_open_state(
@@ -319,7 +324,7 @@ impl MappedLayer {
             Point::from((0., 0.)),
             XrayPos::default(),
             None,
-            render_tahoe_glass_in_snapshot,
+            render_close_effects_in_snapshot,
             &mut |elem| blocked_out_contents.push(elem),
         );
         self.render_popups_with_open_state(
@@ -424,7 +429,7 @@ impl MappedLayer {
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
         open_state: Option<OpenAnimationState>,
-        render_tahoe_glass: bool,
+        render_close_effects: bool,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
@@ -485,7 +490,7 @@ impl MappedLayer {
         }
 
         let location = location.to_physical_precise_round(scale).to_logical(scale);
-        let has_tahoe_glass = if render_tahoe_glass {
+        let has_tahoe_glass = if render_close_effects {
             tahoe_glass::render_for_layer(
                 ctx.as_gles(),
                 ns,
@@ -500,8 +505,9 @@ impl MappedLayer {
                 &mut |elem| push_opening(elem.into()),
             )
         } else {
-            // The close animation renders frozen TahoeGlass regions live; do not
-            // bake a second glass/fallback effect into the snapshot texture.
+            // The close animation renders Tahoe glass or its fallback effect
+            // live. Baking framebuffer effects into an offscreen snapshot would
+            // sample that transparent snapshot instead of the desktop below.
             true
         };
 
@@ -553,7 +559,7 @@ impl MappedLayer {
         );
     }
 
-    pub fn render_tahoe_glass_for_close<R: NiriRenderer>(
+    pub fn render_close_effects<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
         ns: Option<usize>,
@@ -587,7 +593,7 @@ impl MappedLayer {
             .close_tahoe_glass_regions
             .clone()
             .unwrap_or_else(|| with_states(surface, get_committed_regions));
-        tahoe_glass::render_frozen_regions_for_layer(
+        let rendered_tahoe_glass = tahoe_glass::render_frozen_regions_for_layer(
             ctx.as_gles(),
             ns,
             surface,
@@ -601,6 +607,60 @@ impl MappedLayer {
             regions,
             &mut |elem| {
                 let elem = LayerSurfaceRenderElement::TahoeGlass(elem);
+                if let Some(origin) = origin {
+                    push(wrap_render_element_with_transform(
+                        elem,
+                        close_state.scale,
+                        origin,
+                        Point::from((0, 0)),
+                    ));
+                } else {
+                    push(elem);
+                }
+            },
+        );
+
+        if rendered_tahoe_glass {
+            return;
+        }
+
+        let geometry = Rectangle::new(location, self.block_out_buffer.size());
+        let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.
+        let surface_anim_scale = Scale::from(1.);
+        let radius = self.rules.geometry_corner_radius.unwrap_or_default();
+
+        self.shadow.render(ctx.renderer, location, &mut |elem| {
+            let elem = LayerSurfaceRenderElement::Shadow(elem.with_alpha(close_state.alpha));
+            if let Some(origin) = origin {
+                push(wrap_render_element_with_transform(
+                    elem,
+                    close_state.scale,
+                    origin,
+                    Point::from((0, 0)),
+                ));
+            } else {
+                push(elem);
+            }
+        });
+
+        background_effect::render_for_tile(
+            ctx.as_gles(),
+            ns,
+            geometry,
+            self.scale,
+            false,
+            close_state.alpha,
+            surface,
+            surface_off,
+            surface_anim_scale,
+            background_effect::ClientBlurRegionGeometry::BoundingBox,
+            self.blur_config,
+            radius,
+            self.rules.background_effect,
+            false,
+            xray_pos,
+            &mut |elem| {
+                let elem = LayerSurfaceRenderElement::BackgroundEffect(elem);
                 if let Some(origin) = origin {
                     push(wrap_render_element_with_transform(
                         elem,

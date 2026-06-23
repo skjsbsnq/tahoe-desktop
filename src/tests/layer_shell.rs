@@ -414,6 +414,7 @@ fn layer_close_animation_uses_snapshot_and_cleans_up() {
         .values()
         .all(|mapped| mapped.surface().namespace() != "animated-layer"));
     assert_eq!(f.niri().closing_layers.len(), 1);
+    assert!(f.niri().closing_layers[0].live_close_effects.is_none());
     assert!(f.niri().closing_layers[0]
         .animation
         .are_animations_ongoing());
@@ -424,6 +425,54 @@ fn layer_close_animation_uses_snapshot_and_cleans_up() {
     let plain_surface = map_layer(&mut f, id, "plain-layer");
     unmap_layer(&mut f, id, &plain_surface);
     assert!(f.niri().closing_layers.is_empty());
+}
+
+#[test]
+fn tahoe_layer_close_keeps_fallback_blur_live() {
+    let config = Config::parse_mem(
+        r##"
+        layer-rule {
+            match namespace="^tahoe-control-center$"
+
+            geometry-corner-radius 28
+
+            background-effect {
+                xray false
+                blur true
+                noise 0.006
+                saturation 1.16
+                tint-color "#ffffff"
+                tint-amount 0.04
+                edge-highlight 0.34
+                refraction 0.04
+            }
+
+            animations {
+                layer-close {
+                    style "edge-reveal"
+                    edge "top"
+                    distance 24
+                    opacity-to 1
+                    transform-duration-ms 33
+                    transform-curve "linear"
+                    opacity-duration-ms 0
+                }
+            }
+        }
+        "##,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_layer(&mut f, id, "tahoe-control-center");
+    unmap_layer(&mut f, id, &surface);
+
+    assert_eq!(f.niri().closing_layers.len(), 1);
+    assert!(f.niri().closing_layers[0].live_close_effects.is_some());
 }
 
 #[test]
