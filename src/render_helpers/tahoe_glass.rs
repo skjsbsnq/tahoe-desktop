@@ -96,6 +96,10 @@ pub fn damage_surface_regions(
     }
 }
 
+pub fn surface_has_regions(surface: &WlSurface) -> bool {
+    with_states(surface, |states| !get_committed_regions(states).is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_for_layer(
     mut ctx: RenderCtx<GlesRenderer>,

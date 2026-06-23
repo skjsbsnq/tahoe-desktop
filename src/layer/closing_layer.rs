@@ -25,6 +25,20 @@ pub struct CloseAnimationStartState {
     pub start_offset: Point<f64, Logical>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CloseAnimationRenderState {
+    pub alpha: f32,
+    pub scale: f64,
+    pub offset: Point<f64, Logical>,
+    pub origin: niri_config::animations::LayerAnimationOrigin,
+}
+
+impl CloseAnimationRenderState {
+    pub fn should_wrap(self) -> bool {
+        (self.scale - 1.).abs() > f64::EPSILON
+    }
+}
+
 impl Default for CloseAnimationStartState {
     fn default() -> Self {
         Self {
@@ -165,51 +179,19 @@ impl ClosingLayer {
             (&self.buffer, self.buffer_offset)
         };
 
-        let transform_progress = self.transform_anim.clamped_value().clamp(0., 1.);
-        let opacity_progress = self
-            .opacity_anim
-            .clamped_value_with_delay(self.opacity_delay)
-            .clamp(0., 1.);
-        let config = self.config;
-        let target_alpha = config.opacity_to;
-        let alpha = self.start_alpha + (target_alpha - self.start_alpha) * opacity_progress as f32;
-        let target_scale = match config.style {
-            niri_config::animations::LayerCloseAnimationStyle::Popout => config.scale_to,
-            niri_config::animations::LayerCloseAnimationStyle::Fade
-            | niri_config::animations::LayerCloseAnimationStyle::Slide
-            | niri_config::animations::LayerCloseAnimationStyle::EdgeReveal => 1.,
-        };
-        let scale_factor =
-            self.start_scale + (target_scale - self.start_scale) * transform_progress;
-        let target_offset = match config.style {
-            // slide is a full-surface translation. edge-reveal currently reuses the
-            // same offset primitive with shorter configured distances, preserving a
-            // separate style hook for later clipped reveal rendering.
-            niri_config::animations::LayerCloseAnimationStyle::Slide => {
-                edge_offset(config.edge, config.distance)
-            }
-            niri_config::animations::LayerCloseAnimationStyle::EdgeReveal => {
-                edge_offset(config.edge, config.distance)
-            }
-            niri_config::animations::LayerCloseAnimationStyle::Fade
-            | niri_config::animations::LayerCloseAnimationStyle::Popout => Point::from((0., 0.)),
-        };
-        let animation_offset = Point::new(
-            self.start_offset.x + (target_offset.x - self.start_offset.x) * transform_progress,
-            self.start_offset.y + (target_offset.y - self.start_offset.y) * transform_progress,
-        );
+        let state = self.render_state();
 
         let elem = TextureRenderElement::from_texture_buffer(
             buffer.clone(),
             Point::from((0., 0.)),
-            alpha.clamp(0., 1.),
+            state.alpha.clamp(0., 1.),
             None,
             None,
             Kind::Unspecified,
         );
         let elem = PrimaryGpuTextureRenderElement(elem);
 
-        let origin = match config.origin {
+        let origin = match state.origin {
             niri_config::animations::LayerAnimationOrigin::Center => {
                 self.geo_size.to_point().downscale(2.)
             }
@@ -229,10 +211,10 @@ impl ClosingLayer {
         let elem = RescaleRenderElement::from_element(
             elem,
             (origin - offset).to_physical_precise_round(scale),
-            scale_factor.max(0.),
+            state.scale.max(0.),
         );
 
-        let mut location = self.pos + offset + animation_offset;
+        let mut location = self.pos + offset + state.offset;
         location.x -= view_rect.loc.x;
         let elem = RelocateRenderElement::from_element(
             elem,
@@ -241,6 +223,52 @@ impl ClosingLayer {
         );
 
         elem.into()
+    }
+
+    pub fn render_state(&self) -> CloseAnimationRenderState {
+        let transform_progress = self.transform_anim.clamped_value().clamp(0., 1.);
+        let opacity_progress = self
+            .opacity_anim
+            .clamped_value_with_delay(self.opacity_delay)
+            .clamp(0., 1.);
+        let config = self.config;
+        let target_alpha = config.opacity_to;
+        let alpha = self.start_alpha + (target_alpha - self.start_alpha) * opacity_progress as f32;
+        let target_scale = match config.style {
+            niri_config::animations::LayerCloseAnimationStyle::Popout => config.scale_to,
+            niri_config::animations::LayerCloseAnimationStyle::Fade
+            | niri_config::animations::LayerCloseAnimationStyle::Slide
+            | niri_config::animations::LayerCloseAnimationStyle::EdgeReveal => 1.,
+        };
+        let scale = self.start_scale + (target_scale - self.start_scale) * transform_progress;
+        let target_offset = match config.style {
+            // slide is a full-surface translation. edge-reveal currently reuses the
+            // same offset primitive with shorter configured distances, preserving a
+            // separate style hook for later clipped reveal rendering.
+            niri_config::animations::LayerCloseAnimationStyle::Slide => {
+                edge_offset(config.edge, config.distance)
+            }
+            niri_config::animations::LayerCloseAnimationStyle::EdgeReveal => {
+                edge_offset(config.edge, config.distance)
+            }
+            niri_config::animations::LayerCloseAnimationStyle::Fade
+            | niri_config::animations::LayerCloseAnimationStyle::Popout => Point::from((0., 0.)),
+        };
+        let offset = Point::new(
+            self.start_offset.x + (target_offset.x - self.start_offset.x) * transform_progress,
+            self.start_offset.y + (target_offset.y - self.start_offset.y) * transform_progress,
+        );
+
+        CloseAnimationRenderState {
+            alpha,
+            scale,
+            offset,
+            origin: config.origin,
+        }
+    }
+
+    pub fn position(&self) -> Point<f64, Logical> {
+        self.pos
     }
 }
 

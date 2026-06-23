@@ -432,6 +432,7 @@ pub struct ClosingLayerState {
     pub layer: Layer,
     pub for_backdrop: bool,
     pub animation: ClosingLayer,
+    pub live_tahoe_glass: Option<MappedLayer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4766,6 +4767,19 @@ impl Niri {
 
             let elem = closing.animation.render(view_rect, scale, ctx.target);
             push(elem.into());
+
+            if let Some(mapped) = &closing.live_tahoe_glass {
+                let loc = closing.animation.position();
+                let xray_pos = xray_pos.offset(loc);
+                mapped.render_tahoe_glass_for_close(
+                    ctx.r(),
+                    ns,
+                    loc,
+                    xray_pos,
+                    closing.animation.render_state(),
+                    push,
+                );
+            }
         }
     }
 

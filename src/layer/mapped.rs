@@ -10,7 +10,9 @@ use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
 
 use super::ResolvedLayerRules;
 use crate::animation::Clock;
-use crate::layer::closing_layer::{CloseAnimationStartState, ClosingLayerRenderElement};
+use crate::layer::closing_layer::{
+    CloseAnimationRenderState, CloseAnimationStartState, ClosingLayerRenderElement,
+};
 use crate::layer::opening_layer::{
     self, OpenAnimation, OpenAnimationState, OpeningLayerRenderElement,
     OpeningLayerSolidColorRenderElement, OpeningLayerWaylandRenderElement,
@@ -183,6 +185,10 @@ impl MappedLayer {
         self.unmap_snapshot
             .as_ref()
             .is_some_and(|snapshot| !snapshot.snapshot.contents.is_empty())
+    }
+
+    pub fn has_tahoe_glass_regions(&self) -> bool {
+        tahoe_glass::surface_has_regions(self.surface.wl_surface())
     }
 
     pub fn surface(&self) -> &LayerSurface {
@@ -513,6 +519,63 @@ impl MappedLayer {
         );
     }
 
+    pub fn render_tahoe_glass_for_close<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        ns: Option<usize>,
+        location: Point<f64, Logical>,
+        xray_pos: XrayPos,
+        close_state: CloseAnimationRenderState,
+        push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+    ) {
+        if ctx.target.should_block_out(self.rules.block_out_from) {
+            return;
+        }
+
+        let scale = Scale::from(self.scale);
+        let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
+        let surface_alpha = alpha * close_state.alpha;
+        let location = location + close_state.offset;
+        let xray_pos = xray_pos.offset(close_state.offset);
+        let anchor = self.surface.cached_state().anchor;
+        let origin = close_state.should_wrap().then(|| {
+            close_animation_origin(
+                close_state.origin,
+                location,
+                self.block_out_buffer.size(),
+                anchor,
+                scale,
+            )
+        });
+
+        let surface = self.surface.wl_surface();
+        tahoe_glass::render_for_layer(
+            ctx.as_gles(),
+            ns,
+            surface,
+            self.surface.namespace(),
+            location,
+            self.scale,
+            self.blur_config,
+            &self.tahoe_glass_config,
+            surface_alpha,
+            xray_pos,
+            &mut |elem| {
+                let elem = LayerSurfaceRenderElement::TahoeGlass(elem);
+                if let Some(origin) = origin {
+                    push(wrap_render_element_with_transform(
+                        elem,
+                        close_state.scale,
+                        origin,
+                        Point::from((0, 0)),
+                    ));
+                } else {
+                    push(elem);
+                }
+            },
+        );
+    }
+
     fn render_popups_with_open_state<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -607,6 +670,43 @@ impl MappedLayer {
     }
 }
 
+fn close_animation_origin(
+    origin: niri_config::animations::LayerAnimationOrigin,
+    location: Point<f64, Logical>,
+    size: Size<f64, Logical>,
+    anchor: smithay::wayland::shell::wlr_layer::Anchor,
+    output_scale: Scale<f64>,
+) -> Point<i32, smithay::utils::Physical> {
+    let center = location + size.to_point().downscale(2.);
+    let origin = match origin {
+        niri_config::animations::LayerAnimationOrigin::Center => center,
+        niri_config::animations::LayerAnimationOrigin::Anchor => Point::new(
+            anchor_axis_origin(
+                location.x,
+                size.w,
+                anchor.contains(smithay::wayland::shell::wlr_layer::Anchor::LEFT),
+                anchor.contains(smithay::wayland::shell::wlr_layer::Anchor::RIGHT),
+            ),
+            anchor_axis_origin(
+                location.y,
+                size.h,
+                anchor.contains(smithay::wayland::shell::wlr_layer::Anchor::TOP),
+                anchor.contains(smithay::wayland::shell::wlr_layer::Anchor::BOTTOM),
+            ),
+        ),
+    };
+
+    origin.to_physical_precise_round(output_scale)
+}
+
+fn anchor_axis_origin(loc: f64, size: f64, anchored_min: bool, anchored_max: bool) -> f64 {
+    match (anchored_min, anchored_max) {
+        (true, false) => loc,
+        (false, true) => loc + size,
+        _ => loc + size / 2.,
+    }
+}
+
 fn wrap_opening_render_element<R: NiriRenderer>(
     elem: LayerSurfaceRenderElement<R>,
     state: OpenAnimationState,
@@ -628,6 +728,37 @@ fn wrap_opening_render_element<R: NiriRenderer>(
         }
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
             opening_layer::wrap(elem, state, origin, offset).into()
+        }
+        elem @ LayerSurfaceRenderElement::OpeningWayland(_)
+        | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)
+        | elem @ LayerSurfaceRenderElement::OpeningShadow(_)
+        | elem @ LayerSurfaceRenderElement::OpeningBackgroundEffect(_)
+        | elem @ LayerSurfaceRenderElement::OpeningTahoeGlass(_)
+        | elem @ LayerSurfaceRenderElement::Closing(_) => elem,
+    }
+}
+
+fn wrap_render_element_with_transform<R: NiriRenderer>(
+    elem: LayerSurfaceRenderElement<R>,
+    scale: f64,
+    origin: Point<i32, smithay::utils::Physical>,
+    offset: Point<i32, smithay::utils::Physical>,
+) -> LayerSurfaceRenderElement<R> {
+    match elem {
+        LayerSurfaceRenderElement::Wayland(elem) => {
+            opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
+        }
+        LayerSurfaceRenderElement::SolidColor(elem) => {
+            opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
+        }
+        LayerSurfaceRenderElement::Shadow(elem) => {
+            opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
+        }
+        LayerSurfaceRenderElement::BackgroundEffect(elem) => {
+            opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
+        }
+        LayerSurfaceRenderElement::TahoeGlass(elem) => {
+            opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
         }
         elem @ LayerSurfaceRenderElement::OpeningWayland(_)
         | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)

@@ -150,7 +150,16 @@ pub fn wrap<E: Element>(
     origin: Point<i32, Physical>,
     offset: Point<i32, Physical>,
 ) -> RelocateRenderElement<RescaleRenderElement<E>> {
-    let elem = state.wrap(element, origin);
+    wrap_with_transform(element, origin, state.scale(), offset)
+}
+
+pub fn wrap_with_transform<E: Element>(
+    element: E,
+    origin: Point<i32, Physical>,
+    scale: f64,
+    offset: Point<i32, Physical>,
+) -> RelocateRenderElement<RescaleRenderElement<E>> {
+    let elem = RescaleRenderElement::from_element(element, origin, scale);
     RelocateRenderElement::from_element(elem, offset, Relocate::Relative)
 }
 
