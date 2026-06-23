@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use niri_config::{TahoeGlass, TahoeGlassMaterial};
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -114,12 +114,74 @@ pub fn render_for_layer(
     xray_pos: XrayPos,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
+    let regions = with_states(surface, get_committed_regions);
+    render_regions_for_layer(
+        ctx.r(),
+        ns,
+        surface,
+        namespace,
+        location,
+        scale,
+        blur_config,
+        config,
+        layer_alpha,
+        xray_pos,
+        regions,
+        push,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_frozen_regions_for_layer(
+    ctx: RenderCtx<GlesRenderer>,
+    ns: Option<usize>,
+    surface: &WlSurface,
+    namespace: &str,
+    location: Point<f64, Logical>,
+    scale: f64,
+    blur_config: niri_config::Blur,
+    config: &TahoeGlass,
+    layer_alpha: f32,
+    xray_pos: XrayPos,
+    regions: Arc<Vec<TahoeGlassRegion>>,
+    push: &mut dyn FnMut(TahoeGlassElement),
+) -> bool {
+    render_regions_for_layer(
+        ctx,
+        ns,
+        surface,
+        namespace,
+        location,
+        scale,
+        blur_config,
+        config,
+        layer_alpha,
+        xray_pos,
+        regions,
+        push,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_regions_for_layer(
+    mut ctx: RenderCtx<GlesRenderer>,
+    ns: Option<usize>,
+    surface: &WlSurface,
+    namespace: &str,
+    location: Point<f64, Logical>,
+    scale: f64,
+    blur_config: niri_config::Blur,
+    config: &TahoeGlass,
+    layer_alpha: f32,
+    xray_pos: XrayPos,
+    regions: Arc<Vec<TahoeGlassRegion>>,
+    push: &mut dyn FnMut(TahoeGlassElement),
+) -> bool {
     if !config.namespace_allowed(namespace) {
         return false;
     }
 
     with_states(surface, |states| {
-        let regions = get_committed_regions(states);
         if regions.is_empty() {
             return false;
         }

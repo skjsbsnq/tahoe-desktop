@@ -5,8 +5,9 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
-use smithay::wayland::compositor::{remove_pre_commit_hook, HookId};
+use smithay::wayland::compositor::{remove_pre_commit_hook, with_states, HookId};
 use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
+use std::sync::Arc;
 
 use super::ResolvedLayerRules;
 use crate::animation::Clock;
@@ -19,6 +20,7 @@ use crate::layer::opening_layer::{
 };
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
+use crate::protocols::tahoe_glass::{get_committed_regions, TahoeGlassRegion};
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -69,6 +71,9 @@ pub struct MappedLayer {
 
     /// Snapshot to use if this layer is unmapped with a close animation.
     unmap_snapshot: Option<LayerSurfaceUnmapSnapshot>,
+
+    /// TahoeGlass regions captured before the unmap commit clears surface geometry.
+    close_tahoe_glass_regions: Option<Arc<Vec<TahoeGlassRegion>>>,
 
     /// Clock for driving animations.
     clock: Clock,
@@ -129,6 +134,7 @@ impl MappedLayer {
             tahoe_glass_config: config.tahoe_glass.clone(),
             open_animation: None,
             unmap_snapshot: None,
+            close_tahoe_glass_regions: None,
             clock,
         }
     }
@@ -188,6 +194,14 @@ impl MappedLayer {
     }
 
     pub fn has_tahoe_glass_regions(&self) -> bool {
+        if self
+            .close_tahoe_glass_regions
+            .as_ref()
+            .is_some_and(|regions| !regions.is_empty())
+        {
+            return true;
+        }
+
         tahoe_glass::surface_has_regions(self.surface.wl_surface())
     }
 
@@ -256,6 +270,9 @@ impl MappedLayer {
 
         let _span = tracy_client::span!("MappedLayer::store_unmap_snapshot");
         let close_start = self.close_animation_start_state();
+        let tahoe_glass_regions = with_states(self.surface.wl_surface(), get_committed_regions);
+        self.close_tahoe_glass_regions =
+            (!tahoe_glass_regions.is_empty()).then_some(tahoe_glass_regions);
 
         let mut contents = Vec::new();
         self.render_normal_with_open_state(
@@ -549,7 +566,11 @@ impl MappedLayer {
         });
 
         let surface = self.surface.wl_surface();
-        tahoe_glass::render_for_layer(
+        let regions = self
+            .close_tahoe_glass_regions
+            .clone()
+            .unwrap_or_else(|| with_states(surface, get_committed_regions));
+        tahoe_glass::render_frozen_regions_for_layer(
             ctx.as_gles(),
             ns,
             surface,
@@ -560,6 +581,7 @@ impl MappedLayer {
             &self.tahoe_glass_config,
             surface_alpha,
             xray_pos,
+            regions,
             &mut |elem| {
                 let elem = LayerSurfaceRenderElement::TahoeGlass(elem);
                 if let Some(origin) = origin {
