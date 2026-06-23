@@ -323,7 +323,7 @@ impl Animation {
 
         let now = self.clock.now();
         let delayed_start = self.start_time + delay;
-        if now <= delayed_start {
+        if now < delayed_start {
             return self.from;
         }
 
@@ -423,5 +423,29 @@ mod tests {
                 previous = y;
             }
         }
+    }
+
+    #[test]
+    fn zero_duration_delayed_clamped_value_reaches_target_at_start() {
+        let clock = Clock::with_time(Duration::ZERO);
+        let animation = Animation::ease(clock.clone(), 0., 1., 0., 0, Curve::Linear);
+
+        assert_eq!(animation.clamped_value_with_delay(Duration::ZERO), 1.);
+    }
+
+    #[test]
+    fn zero_duration_delayed_clamped_value_waits_for_delay() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let animation = Animation::ease(clock.clone(), 0., 1., 0., 0, Curve::Linear);
+
+        assert_eq!(
+            animation.clamped_value_with_delay(Duration::from_millis(1)),
+            0.
+        );
+        clock.set_unadjusted(Duration::from_millis(1));
+        assert_eq!(
+            animation.clamped_value_with_delay(Duration::from_millis(1)),
+            1.
+        );
     }
 }
