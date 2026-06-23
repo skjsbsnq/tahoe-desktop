@@ -1,6 +1,7 @@
 use niri_config::utils::MergeWith as _;
 use niri_config::{Config, LayerRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
@@ -86,6 +87,11 @@ niri_render_elements! {
         Shadow = ShadowRenderElement,
         BackgroundEffect = BackgroundEffectElement,
         TahoeGlass = TahoeGlassElement,
+        CroppedWayland = CropRenderElement<WaylandSurfaceRenderElement<R>>,
+        CroppedSolidColor = CropRenderElement<SolidColorRenderElement>,
+        CroppedShadow = CropRenderElement<ShadowRenderElement>,
+        CroppedBackgroundEffect = CropRenderElement<BackgroundEffectElement>,
+        CroppedTahoeGlass = CropRenderElement<TahoeGlassElement>,
         OpeningWayland = OpeningLayerWaylandRenderElement<R>,
         OpeningSolidColor = OpeningLayerSolidColorRenderElement,
         OpeningShadow = OpeningLayerRenderElement<ShadowRenderElement>,
@@ -372,7 +378,7 @@ impl MappedLayer {
         CloseAnimationStartState {
             start_alpha: open_state.alpha,
             start_scale: open_state.scale(),
-            start_offset: open_state.offset(),
+            start_offset: open_state.offset_for_size(self.block_out_buffer.size()),
         }
     }
 
@@ -437,26 +443,26 @@ impl MappedLayer {
         let open_alpha = open_state.map_or(1., |state| state.alpha);
         let surface_alpha = alpha * open_alpha;
 
-        let open_offset = open_state.map_or(Point::from((0., 0.)), OpenAnimationState::offset);
+        let open_size = self.block_out_buffer.size();
+        let open_offset = open_state.map_or(Point::from((0., 0.)), |state| {
+            state.offset_for_size(open_size)
+        });
         let bob_offset = self.bob_offset();
-        let location = location + bob_offset + open_offset;
+        let base_location = location + bob_offset;
+        let crop_rect = open_state
+            .and_then(|state| state.edge_reveal_crop_rect(base_location, open_size, scale));
+        let location = base_location + open_offset;
         let xray_pos = xray_pos.offset(bob_offset + open_offset);
         let anchor = self.surface.cached_state().anchor;
         let open_origin = open_state.map(|state| {
             (
                 state,
-                state.origin(location, self.block_out_buffer.size(), anchor, scale),
+                state.origin(location, open_size, anchor, scale),
                 Point::from((0, 0)),
             )
         });
         let mut push_opening = |elem| {
-            if let Some((state, origin, offset)) =
-                open_origin.filter(|(state, _, _)| state.should_wrap())
-            {
-                push(wrap_opening_render_element(elem, state, origin, offset));
-            } else {
-                push(elem);
-            }
+            push_opening_element(elem, open_origin, scale, crop_rect, push);
         };
 
         let surface = self.surface.wl_surface();
@@ -575,8 +581,11 @@ impl MappedLayer {
         let scale = Scale::from(self.scale);
         let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
         let surface_alpha = alpha * close_state.alpha;
+        let base_location = location;
         let location = location + close_state.offset;
         let xray_pos = xray_pos.offset(close_state.offset);
+        let crop_rect =
+            close_state.edge_reveal_crop_rect(base_location, self.block_out_buffer.size(), scale);
         let anchor = self.surface.cached_state().anchor;
         let origin = close_state.should_wrap().then(|| {
             close_animation_origin(
@@ -608,14 +617,19 @@ impl MappedLayer {
             &mut |elem| {
                 let elem = LayerSurfaceRenderElement::TahoeGlass(elem);
                 if let Some(origin) = origin {
-                    push(wrap_render_element_with_transform(
-                        elem,
-                        close_state.scale,
-                        origin,
-                        Point::from((0, 0)),
-                    ));
+                    push_close_effect_element(
+                        wrap_render_element_with_transform(
+                            elem,
+                            close_state.scale,
+                            origin,
+                            Point::from((0, 0)),
+                        ),
+                        scale,
+                        crop_rect,
+                        push,
+                    );
                 } else {
-                    push(elem);
+                    push_close_effect_element(elem, scale, crop_rect, push);
                 }
             },
         );
@@ -632,14 +646,19 @@ impl MappedLayer {
         self.shadow.render(ctx.renderer, location, &mut |elem| {
             let elem = LayerSurfaceRenderElement::Shadow(elem.with_alpha(close_state.alpha));
             if let Some(origin) = origin {
-                push(wrap_render_element_with_transform(
-                    elem,
-                    close_state.scale,
-                    origin,
-                    Point::from((0, 0)),
-                ));
+                push_close_effect_element(
+                    wrap_render_element_with_transform(
+                        elem,
+                        close_state.scale,
+                        origin,
+                        Point::from((0, 0)),
+                    ),
+                    scale,
+                    crop_rect,
+                    push,
+                );
             } else {
-                push(elem);
+                push_close_effect_element(elem, scale, crop_rect, push);
             }
         });
 
@@ -662,14 +681,19 @@ impl MappedLayer {
             &mut |elem| {
                 let elem = LayerSurfaceRenderElement::BackgroundEffect(elem);
                 if let Some(origin) = origin {
-                    push(wrap_render_element_with_transform(
-                        elem,
-                        close_state.scale,
-                        origin,
-                        Point::from((0, 0)),
-                    ));
+                    push_close_effect_element(
+                        wrap_render_element_with_transform(
+                            elem,
+                            close_state.scale,
+                            origin,
+                            Point::from((0, 0)),
+                        ),
+                        scale,
+                        crop_rect,
+                        push,
+                    );
                 } else {
-                    push(elem);
+                    push_close_effect_element(elem, scale, crop_rect, push);
                 }
             },
         );
@@ -693,7 +717,10 @@ impl MappedLayer {
         let open_alpha = open_state.map_or(1., |state| state.alpha);
         let surface_alpha = alpha * open_alpha;
 
-        let open_offset = open_state.map_or(Point::from((0., 0.)), OpenAnimationState::offset);
+        let open_size = self.block_out_buffer.size();
+        let open_offset = open_state.map_or(Point::from((0., 0.)), |state| {
+            state.offset_for_size(open_size)
+        });
         let bob_offset = self.bob_offset();
         let location = location + bob_offset + open_offset;
         let xray_pos = xray_pos.offset(bob_offset + open_offset);
@@ -828,6 +855,11 @@ fn wrap_opening_render_element<R: NiriRenderer>(
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
             opening_layer::wrap(elem, state, origin, offset).into()
         }
+        elem @ LayerSurfaceRenderElement::CroppedWayland(_)
+        | elem @ LayerSurfaceRenderElement::CroppedSolidColor(_)
+        | elem @ LayerSurfaceRenderElement::CroppedShadow(_)
+        | elem @ LayerSurfaceRenderElement::CroppedBackgroundEffect(_)
+        | elem @ LayerSurfaceRenderElement::CroppedTahoeGlass(_) => elem,
         elem @ LayerSurfaceRenderElement::OpeningWayland(_)
         | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)
         | elem @ LayerSurfaceRenderElement::OpeningShadow(_)
@@ -859,12 +891,99 @@ fn wrap_render_element_with_transform<R: NiriRenderer>(
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
             opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
         }
+        elem @ LayerSurfaceRenderElement::CroppedWayland(_)
+        | elem @ LayerSurfaceRenderElement::CroppedSolidColor(_)
+        | elem @ LayerSurfaceRenderElement::CroppedShadow(_)
+        | elem @ LayerSurfaceRenderElement::CroppedBackgroundEffect(_)
+        | elem @ LayerSurfaceRenderElement::CroppedTahoeGlass(_) => elem,
         elem @ LayerSurfaceRenderElement::OpeningWayland(_)
         | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)
         | elem @ LayerSurfaceRenderElement::OpeningShadow(_)
         | elem @ LayerSurfaceRenderElement::OpeningBackgroundEffect(_)
         | elem @ LayerSurfaceRenderElement::OpeningTahoeGlass(_)
         | elem @ LayerSurfaceRenderElement::Closing(_) => elem,
+    }
+}
+
+fn push_opening_element<R: NiriRenderer>(
+    elem: LayerSurfaceRenderElement<R>,
+    open_origin: Option<(
+        OpenAnimationState,
+        Point<i32, smithay::utils::Physical>,
+        Point<i32, smithay::utils::Physical>,
+    )>,
+    scale: Scale<f64>,
+    crop_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
+    push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+) {
+    if let Some((state, origin, offset)) = open_origin.filter(|(state, _, _)| state.should_wrap()) {
+        push(wrap_opening_render_element(elem, state, origin, offset));
+        return;
+    }
+
+    let Some(crop_rect) = crop_rect else {
+        push(elem);
+        return;
+    };
+
+    match elem {
+        LayerSurfaceRenderElement::Wayland(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::SolidColor(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::Shadow(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::BackgroundEffect(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::TahoeGlass(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        elem => push(elem),
+    }
+}
+
+fn push_close_effect_element<R: NiriRenderer>(
+    elem: LayerSurfaceRenderElement<R>,
+    scale: Scale<f64>,
+    crop_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
+    push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+) {
+    let Some(crop_rect) = crop_rect else {
+        push(elem);
+        return;
+    };
+
+    match elem {
+        LayerSurfaceRenderElement::Shadow(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::BackgroundEffect(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::TahoeGlass(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        elem => push(elem),
     }
 }
 

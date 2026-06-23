@@ -3,7 +3,7 @@ use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::Element;
-use smithay::utils::{Logical, Physical, Point, Scale, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 use smithay::wayland::shell::wlr_layer::Anchor;
 use std::time::Duration;
 
@@ -31,6 +31,8 @@ pub struct OpenAnimationState {
     origin: niri_config::animations::LayerAnimationOrigin,
     edge: niri_config::animations::LayerAnimationEdge,
     offset: f64,
+    remaining: f64,
+    style: niri_config::animations::LayerOpenAnimationStyle,
 }
 
 impl OpenAnimation {
@@ -65,9 +67,6 @@ impl OpenAnimation {
             | niri_config::animations::LayerOpenAnimationStyle::EdgeReveal => 1.,
         };
         let offset = match config.style {
-            // slide moves the whole surface by the configured distance. edge-reveal
-            // deliberately uses the same offset primitive for now, but is kept as a
-            // distinct style for shorter edge-attached motion and future clipping.
             niri_config::animations::LayerOpenAnimationStyle::Slide => {
                 config.distance * (1. - transform_progress)
             }
@@ -84,6 +83,8 @@ impl OpenAnimation {
             origin: config.origin,
             edge: config.edge,
             offset,
+            remaining: 1. - transform_progress,
+            style: config.style,
         }
     }
 }
@@ -119,11 +120,36 @@ impl OpenAnimationState {
     }
 
     pub fn offset(self) -> Point<f64, Logical> {
+        self.edge_offset(self.offset)
+    }
+
+    pub fn offset_for_size(self, size: Size<f64, Logical>) -> Point<f64, Logical> {
+        if self.style != niri_config::animations::LayerOpenAnimationStyle::EdgeReveal {
+            return self.offset();
+        }
+
+        self.edge_offset(edge_reveal_distance(self.edge, size) * self.remaining)
+    }
+
+    pub fn edge_reveal_crop_rect(
+        self,
+        location: Point<f64, Logical>,
+        size: Size<f64, Logical>,
+        scale: Scale<f64>,
+    ) -> Option<Rectangle<i32, Physical>> {
+        if self.style != niri_config::animations::LayerOpenAnimationStyle::EdgeReveal {
+            return None;
+        }
+
+        Some(Rectangle::new(location, size).to_physical_precise_round(scale))
+    }
+
+    fn edge_offset(self, offset: f64) -> Point<f64, Logical> {
         match self.edge {
-            niri_config::animations::LayerAnimationEdge::Top => Point::new(0., -self.offset),
-            niri_config::animations::LayerAnimationEdge::Right => Point::new(self.offset, 0.),
-            niri_config::animations::LayerAnimationEdge::Bottom => Point::new(0., self.offset),
-            niri_config::animations::LayerAnimationEdge::Left => Point::new(-self.offset, 0.),
+            niri_config::animations::LayerAnimationEdge::Top => Point::new(0., -offset),
+            niri_config::animations::LayerAnimationEdge::Right => Point::new(offset, 0.),
+            niri_config::animations::LayerAnimationEdge::Bottom => Point::new(0., offset),
+            niri_config::animations::LayerAnimationEdge::Left => Point::new(-offset, 0.),
         }
     }
 
@@ -161,6 +187,18 @@ pub fn wrap_with_transform<E: Element>(
 ) -> RelocateRenderElement<RescaleRenderElement<E>> {
     let elem = RescaleRenderElement::from_element(element, origin, scale);
     RelocateRenderElement::from_element(elem, offset, Relocate::Relative)
+}
+
+fn edge_reveal_distance(
+    edge: niri_config::animations::LayerAnimationEdge,
+    size: Size<f64, Logical>,
+) -> f64 {
+    match edge {
+        niri_config::animations::LayerAnimationEdge::Top
+        | niri_config::animations::LayerAnimationEdge::Bottom => size.h,
+        niri_config::animations::LayerAnimationEdge::Left
+        | niri_config::animations::LayerAnimationEdge::Right => size.w,
+    }
 }
 
 fn anchor_axis_origin(loc: f64, size: f64, anchored_min: bool, anchored_max: bool) -> f64 {

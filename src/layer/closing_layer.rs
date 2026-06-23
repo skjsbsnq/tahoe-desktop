@@ -2,12 +2,12 @@ use anyhow::Context as _;
 use niri_config::BlockOutFrom;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
-    Relocate, RelocateRenderElement, RescaleRenderElement,
+    CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::element::{Kind, RenderElement};
+use smithay::backend::renderer::element::{Element, Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::Texture;
-use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shell::wlr_layer::Anchor;
 use std::time::Duration;
 
@@ -31,11 +31,25 @@ pub struct CloseAnimationRenderState {
     pub scale: f64,
     pub offset: Point<f64, Logical>,
     pub origin: niri_config::animations::LayerAnimationOrigin,
+    pub style: niri_config::animations::LayerCloseAnimationStyle,
 }
 
 impl CloseAnimationRenderState {
     pub fn should_wrap(self) -> bool {
         (self.scale - 1.).abs() > f64::EPSILON
+    }
+
+    pub fn edge_reveal_crop_rect(
+        self,
+        location: Point<f64, Logical>,
+        size: Size<f64, Logical>,
+        scale: Scale<f64>,
+    ) -> Option<Rectangle<i32, Physical>> {
+        if self.style != niri_config::animations::LayerCloseAnimationStyle::EdgeReveal {
+            return None;
+        }
+
+        Some(Rectangle::new(location, size).to_physical_precise_round(scale))
     }
 }
 
@@ -71,6 +85,9 @@ pub struct ClosingLayer {
 niri_render_elements! {
     ClosingLayerRenderElement => {
         Texture = RelocateRenderElement<RescaleRenderElement<PrimaryGpuTextureRenderElement>>,
+        CroppedTexture = CropRenderElement<RelocateRenderElement<
+            RescaleRenderElement<PrimaryGpuTextureRenderElement>
+        >>,
     }
 }
 
@@ -222,6 +239,19 @@ impl ClosingLayer {
             Relocate::Relative,
         );
 
+        let mut crop_location = self.pos;
+        crop_location.x -= view_rect.loc.x;
+        if let Some(crop_rect) = state.edge_reveal_crop_rect(crop_location, self.geo_size, scale) {
+            let intersects = elem
+                .geometry(scale)
+                .intersection(crop_rect)
+                .is_some_and(|rect| !rect.is_empty());
+            if intersects {
+                let elem = CropRenderElement::from_element(elem, scale, crop_rect).unwrap();
+                return elem.into();
+            }
+        }
+
         elem.into()
     }
 
@@ -248,9 +278,10 @@ impl ClosingLayer {
             niri_config::animations::LayerCloseAnimationStyle::Slide => {
                 edge_offset(config.edge, config.distance)
             }
-            niri_config::animations::LayerCloseAnimationStyle::EdgeReveal => {
-                edge_offset(config.edge, config.distance)
-            }
+            niri_config::animations::LayerCloseAnimationStyle::EdgeReveal => edge_offset(
+                config.edge,
+                edge_reveal_distance(config.edge, self.geo_size),
+            ),
             niri_config::animations::LayerCloseAnimationStyle::Fade
             | niri_config::animations::LayerCloseAnimationStyle::Popout => Point::from((0., 0.)),
         };
@@ -264,11 +295,24 @@ impl ClosingLayer {
             scale,
             offset,
             origin: config.origin,
+            style: config.style,
         }
     }
 
     pub fn position(&self) -> Point<f64, Logical> {
         self.pos
+    }
+}
+
+fn edge_reveal_distance(
+    edge: niri_config::animations::LayerAnimationEdge,
+    size: Size<f64, Logical>,
+) -> f64 {
+    match edge {
+        niri_config::animations::LayerAnimationEdge::Top
+        | niri_config::animations::LayerAnimationEdge::Bottom => size.h,
+        niri_config::animations::LayerAnimationEdge::Left
+        | niri_config::animations::LayerAnimationEdge::Right => size.w,
     }
 }
 

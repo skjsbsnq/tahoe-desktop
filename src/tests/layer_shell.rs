@@ -740,7 +740,52 @@ fn layer_close_animation_interrupted_edge_reveal_open_starts_from_current_offset
     assert!((start.start_alpha - 0.9).abs() < 0.001);
     assert!((start.start_scale - 1.).abs() < 0.001);
     assert!((start.start_offset.x - 0.).abs() < 0.001);
-    assert!((start.start_offset.y - -15.).abs() < 0.05);
+    assert!((start.start_offset.y - -75.).abs() < 2.);
+}
+
+#[test]
+fn layer_close_edge_reveal_moves_full_surface_extent() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-close {
+                    style "edge-reveal"
+                    edge "top"
+                    distance 12
+                    transform-duration-ms 1000
+                    transform-curve "linear"
+                    opacity-duration-ms 0
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_layer(&mut f, id, "animated-layer");
+    unmap_layer(&mut f, id, &surface);
+    assert_eq!(f.niri().closing_layers.len(), 1);
+
+    advance_layer_animations(&mut f, Duration::from_millis(500));
+
+    let state = f.niri().closing_layers[0].animation.render_state();
+    assert!((state.offset.x - 0.).abs() < 0.001);
+    // The layer surface is 100 px tall in map_layer(). Edge-reveal close
+    // should fully retract that surface, not stop at the short configured
+    // gesture distance.
+    assert!(
+        (state.offset.y - -50.).abs() < 5.,
+        "offset.y was {}",
+        state.offset.y
+    );
 }
 
 #[test]
