@@ -3746,11 +3746,7 @@ impl<W: LayoutElement> Layout<W> {
         minimized: bool,
         animation_rect: Option<MinimizeRect>,
     ) -> bool {
-        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
-            if move_.tile.window().id() == id {
-                return false;
-            }
-        }
+        self.finish_interactive_move_if_window(id);
 
         if let Some(rect) = &animation_rect {
             trace!(
@@ -3782,11 +3778,7 @@ impl<W: LayoutElement> Layout<W> {
         id: &W::Id,
         target_rect: Option<MinimizeRect>,
     ) -> bool {
-        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
-            if move_.tile.window().id() == id {
-                return false;
-            }
-        }
+        self.finish_interactive_move_if_window(id);
 
         if let Some(rect) = &target_rect {
             trace!(
@@ -3916,6 +3908,20 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         false
+    }
+
+    fn finish_interactive_move_if_window(&mut self, id: &W::Id) {
+        let should_finish = self
+            .interactive_move
+            .as_ref()
+            .is_some_and(|state| match state {
+                InteractiveMoveState::Starting { window_id, .. } => window_id == id,
+                InteractiveMoveState::Moving(move_) => move_.tile.window().id() == id,
+            });
+
+        if should_finish {
+            self.interactive_move_end(id);
+        }
     }
 
     pub fn minimize_window(&mut self, id: &W::Id) -> bool {

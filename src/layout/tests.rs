@@ -1818,6 +1818,35 @@ fn repeated_minimize_restore_with_rect_keeps_ipc_layout() {
 }
 
 #[test]
+fn minimize_finishes_interactive_move() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    let output = layout.outputs().next().unwrap().clone();
+    assert!(layout.interactive_move_begin(2, &output, Point::default()));
+    assert!(layout.interactive_move_update(
+        &2,
+        Point::from((128., 0.)),
+        output,
+        Point::from((128., 0.)),
+    ));
+
+    assert!(layout.minimize_window(&2));
+    layout.verify_invariants();
+
+    let minimized = window_ipc_state(&layout, 2);
+    assert!(minimized.0);
+    assert_eq!(layout.focus().map(|win| *win.id()), Some(1));
+}
+
+#[test]
 fn minimize_restore_floating_window_keeps_position_and_size() {
     let mut params = TestWindowParams::new(1);
     params.is_floating = true;
