@@ -378,6 +378,39 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let color = result.map_err(|_| String::from("error getting picked color"))?;
             Response::PickedColor(color)
         }
+        Request::WindowThumbnail {
+            id,
+            path,
+            max_width,
+            max_height,
+        } => {
+            if !Path::new(&path).is_absolute() {
+                return Err(format!("path must be absolute: {path}"));
+            }
+            if max_width == 0 || max_height == 0 {
+                return Err(String::from(
+                    "max-width and max-height must be greater than zero",
+                ));
+            }
+            if max_width > 4096 || max_height > 4096 {
+                return Err(String::from(
+                    "max-width and max-height must be at most 4096",
+                ));
+            }
+
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let result = state
+                    .window_thumbnail(id, path, max_width, max_height)
+                    .map_err(|err| err.to_string());
+                let _ = tx.send_blocking(result);
+            });
+            let result = rx
+                .recv()
+                .await
+                .map_err(|_| String::from("error rendering window thumbnail"))?;
+            Response::WindowThumbnail(result?)
+        }
         Request::Action(action) => {
             validate_action(&action)?;
 

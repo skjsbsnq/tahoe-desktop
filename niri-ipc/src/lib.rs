@@ -85,6 +85,17 @@ pub enum Request {
     PickWindow,
     /// Request picking a color from the screen.
     PickColor,
+    /// Render a private thumbnail of a window into a PNG file.
+    WindowThumbnail {
+        /// Id of the window to render.
+        id: u64,
+        /// Absolute path where the PNG thumbnail should be written.
+        path: String,
+        /// Maximum thumbnail width in physical pixels.
+        max_width: u32,
+        /// Maximum thumbnail height in physical pixels.
+        max_height: u32,
+    },
     /// Perform an action.
     Action(Action),
     /// Change output configuration temporarily.
@@ -159,6 +170,8 @@ pub enum Response {
     PickedWindow(Option<Window>),
     /// Information about the picked color.
     PickedColor(Option<PickedColor>),
+    /// Information about a written private window thumbnail.
+    WindowThumbnail(WindowThumbnail),
     /// Output configuration change result.
     OutputConfigChanged(OutputConfigChanged),
     /// Information about the overview.
@@ -181,6 +194,18 @@ pub struct Overview {
 pub struct PickedColor {
     /// Color values as red, green, blue, each ranging from 0.0 to 1.0.
     pub rgb: [f64; 3],
+}
+
+/// Private window thumbnail written for shell previews.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowThumbnail {
+    /// Absolute path where the PNG thumbnail was written.
+    pub path: String,
+    /// Written PNG width in physical pixels.
+    pub width: u32,
+    /// Written PNG height in physical pixels.
+    pub height: u32,
 }
 
 /// Actions that niri can perform.

@@ -2043,6 +2043,28 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    pub fn window_thumbnail(
+        &mut self,
+        id: u64,
+        path: String,
+        max_width: u32,
+        max_height: u32,
+    ) -> anyhow::Result<niri_ipc::WindowThumbnail> {
+        let mut windows = self.niri.layout.windows();
+        let window = windows.find(|(_, mapped)| mapped.id().get() == id);
+        let Some((Some(monitor), mapped)) = window else {
+            bail!("window not found or not on an output: {id}");
+        };
+
+        let output = monitor.output();
+        self.backend
+            .with_primary_renderer(|renderer| {
+                self.niri
+                    .window_thumbnail(renderer, output, mapped, path, max_width, max_height)
+            })
+            .context("primary renderer unavailable")?
+    }
+
     pub fn confirm_screenshot(&mut self, write_to_disk: bool) {
         let ScreenshotUi::Open { path, .. } = &mut self.niri.screenshot_ui else {
             return;
@@ -5870,6 +5892,106 @@ impl Niri {
 
         self.save_screenshot(geo.size, pixels, write_to_disk, path)
             .context("error saving screenshot")
+    }
+
+    pub fn window_thumbnail(
+        &self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+        mapped: &Mapped,
+        path: String,
+        max_width: u32,
+        max_height: u32,
+    ) -> anyhow::Result<niri_ipc::WindowThumbnail> {
+        let _span = tracy_client::span!("Niri::window_thumbnail");
+
+        ensure!(max_width > 0 && max_height > 0);
+
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let alpha =
+            if mapped.sizing_mode().is_fullscreen() || mapped.is_ignoring_opacity_window_rule() {
+                1.
+            } else {
+                mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
+            };
+
+        let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
+        let ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::ScreenCapture,
+            xray: None,
+        };
+        mapped.render(
+            ctx,
+            mapped.window.geometry().loc.to_f64(),
+            scale,
+            alpha,
+            XrayPos::default(),
+            &mut |elem| elements.push(elem.into()),
+        );
+
+        let geo = encompassing_geo(scale, elements.iter());
+        ensure!(
+            geo.size.w > 0 && geo.size.h > 0,
+            "window has no renderable thumbnail contents"
+        );
+
+        let fit = f64::min(
+            max_width as f64 / f64::from(geo.size.w),
+            max_height as f64 / f64::from(geo.size.h),
+        )
+        .min(1.0);
+        ensure!(fit.is_finite() && fit > 0.0);
+
+        let size = Size::from((
+            f64::max(1.0, f64::from(geo.size.w) * fit).round() as i32,
+            f64::max(1.0, f64::from(geo.size.h) * fit).round() as i32,
+        ));
+        let origin = Point::from((0, 0));
+        let elements = elements.iter().rev().map(|elem| {
+            let elem =
+                RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative);
+            RescaleRenderElement::from_element(elem, origin, fit)
+        });
+        let pixels = render_to_vec(
+            renderer,
+            size,
+            scale,
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements,
+        )?;
+
+        self.save_window_thumbnail(PathBuf::from(&path), size, pixels)?;
+        Ok(niri_ipc::WindowThumbnail {
+            path,
+            width: size.w as u32,
+            height: size.h as u32,
+        })
+    }
+
+    fn save_window_thumbnail(
+        &self,
+        path: PathBuf,
+        size: Size<i32, Physical>,
+        pixels: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        ensure!(path.is_absolute(), "thumbnail path must be absolute");
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("error creating thumbnail directory {parent:?}"))?;
+            }
+        }
+
+        let file = std::fs::File::create(&path)
+            .with_context(|| format!("error creating thumbnail file {path:?}"))?;
+        let writer = std::io::BufWriter::new(file);
+        write_png_rgba8(writer, size.w as u32, size.h as u32, &pixels)
+            .with_context(|| format!("error encoding thumbnail PNG {path:?}"))?;
+
+        Ok(())
     }
 
     pub fn save_screenshot(

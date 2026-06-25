@@ -9,6 +9,7 @@ use niri_ipc::socket::Socket;
 use niri_ipc::{
     Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
     OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
+    WindowThumbnail,
 };
 use serde_json::json;
 
@@ -28,6 +29,9 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             ensure_absolute_path(path).context("error making the path absolute")?;
         }
     }
+    if let Msg::WindowThumbnail { path, .. } = &mut msg {
+        ensure_absolute_path(path).context("error making the path absolute")?;
+    }
 
     let request = match &msg {
         Msg::Version => Request::Version,
@@ -36,6 +40,17 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         Msg::FocusedOutput => Request::FocusedOutput,
         Msg::PickWindow => Request::PickWindow,
         Msg::PickColor => Request::PickColor,
+        Msg::WindowThumbnail {
+            id,
+            path,
+            max_width,
+            max_height,
+        } => Request::WindowThumbnail {
+            id: *id,
+            path: path.clone(),
+            max_width: *max_width,
+            max_height: *max_height,
+        },
         Msg::Action { action } => Request::Action(action.clone()),
         Msg::Output { output, action } => Request::Output {
             output: output.clone(),
@@ -316,6 +331,25 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             } else {
                 println!("No color was picked.");
             }
+        }
+        Msg::WindowThumbnail { .. } => {
+            let Response::WindowThumbnail(response) = response else {
+                bail!("unexpected response: expected WindowThumbnail, got {response:?}");
+            };
+
+            if json {
+                let response =
+                    serde_json::to_string(&response).context("error formatting response")?;
+                println!("{response}");
+                return Ok(());
+            }
+
+            let WindowThumbnail {
+                path,
+                width,
+                height,
+            } = response;
+            println!("Window thumbnail saved to {path} ({width}x{height}).");
         }
         Msg::Action { .. } => {
             let Response::Handled = response else {

@@ -79,6 +79,21 @@ pub enum Msg {
     PickWindow,
     /// Pick a color from the screen with the mouse.
     PickColor,
+    /// Render a private PNG thumbnail of a window.
+    WindowThumbnail {
+        /// Id of the window to render.
+        #[arg(long)]
+        id: u64,
+        /// Absolute path where the PNG thumbnail should be written.
+        #[arg(long)]
+        path: String,
+        /// Maximum thumbnail width in physical pixels.
+        #[arg(long, default_value_t = 320)]
+        max_width: u32,
+        /// Maximum thumbnail height in physical pixels.
+        #[arg(long, default_value_t = 220)]
+        max_height: u32,
+    },
     /// Perform an action.
     Action {
         #[command(subcommand)]
