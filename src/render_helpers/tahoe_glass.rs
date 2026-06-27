@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use niri_config::{TahoeGlass, TahoeGlassMaterial};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 
 use crate::layout::shadow::Shadow;
@@ -283,6 +283,9 @@ fn render_region(
         effect.lens_depth = boost(effect.lens_depth);
     }
 
+    let sample_padding = glass_sample_padding(region, effect, blur_config);
+    let sample_geometry = expand_rect(geometry, sample_padding);
+
     renderer.background_effect.update_config(blur_config);
     renderer
         .background_effect
@@ -293,14 +296,43 @@ fn render_region(
     }
 
     let params = RenderParams {
-        geometry,
+        geometry: sample_geometry,
         alpha: material_alpha,
         subregion: None,
         clip: region.flags.clip.then_some((geometry, region.radius)),
         scale,
     };
-    let xray_pos = xray_pos.offset(rect.loc);
+    let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
     renderer
         .background_effect
         .render(ctx.r(), ns, params, xray_pos, &mut |elem| push(elem.into()));
+}
+
+fn glass_sample_padding(
+    region: &TahoeGlassRegion,
+    effect: niri_config::BackgroundEffect,
+    blur_config: niri_config::Blur,
+) -> f64 {
+    let mut padding: f64 = 2.0;
+
+    if region.flags.blur && !blur_config.off {
+        let passes = f64::from(blur_config.passes.clamp(1, 31));
+        padding = padding.max(blur_config.offset * passes);
+    }
+
+    let refraction = effect.refraction.unwrap_or(0.).abs();
+    let lens_depth = effect.lens_depth.unwrap_or(0.).abs();
+    if refraction > 0.0 || lens_depth > 0.0 {
+        let short_edge = f64::from(region.rect.size.w.min(region.rect.size.h).max(1));
+        padding = padding.max((refraction + lens_depth) * short_edge * 2.0 + 4.0);
+    }
+
+    padding.clamp(2.0, 64.0)
+}
+
+fn expand_rect(rect: Rectangle<f64, Logical>, padding: f64) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        Point::new(rect.loc.x - padding, rect.loc.y - padding),
+        Size::new(rect.size.w + padding * 2.0, rect.size.h + padding * 2.0),
+    )
 }
