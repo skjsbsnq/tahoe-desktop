@@ -83,30 +83,107 @@ impl Default for TahoeGlass {
         let mut materials = BTreeMap::new();
         materials.insert(
             "panel".to_owned(),
-            material_profile(0.005, 1.10, 1.10, 0.105, 0.14, 0.004, 0.06, 0., 0.),
+            material_profile(
+                0.005,
+                1.08,
+                1.07,
+                Color::new_unpremul(237. / 255., 242. / 255., 248. / 255., 1.),
+                0.145,
+                0.10,
+                0.003,
+                0.12,
+                0.,
+                0.,
+            ),
         );
         materials.insert(
             "pill".to_owned(),
-            material_profile(0.005, 1.12, 1.05, 0.052, 0.32, 0.013, 0.07, 0., 0.010),
+            material_profile(
+                0.005,
+                1.09,
+                1.04,
+                Color::new_unpremul(242. / 255., 246. / 255., 251. / 255., 1.),
+                0.115,
+                0.24,
+                0.009,
+                0.10,
+                0.,
+                0.006,
+            ),
         );
         materials.insert(
             "launcher".to_owned(),
-            material_profile(0.005, 1.08, 1.08, 0.085, 0.15, 0.004, 0.055, 0., 0.003),
+            material_profile(
+                0.005,
+                1.07,
+                1.06,
+                Color::new_unpremul(237. / 255., 242. / 255., 248. / 255., 1.),
+                0.165,
+                0.11,
+                0.003,
+                0.12,
+                0.,
+                0.001,
+            ),
         );
         materials.insert(
             "dock".to_owned(),
-            material_profile(0.005, 1.10, 1.06, 0.060, 0.18, 0.007, 0.07, 0., 0.006),
+            material_profile(
+                0.005,
+                1.08,
+                1.06,
+                Color::new_unpremul(237. / 255., 242. / 255., 248. / 255., 1.),
+                0.145,
+                0.13,
+                0.005,
+                0.12,
+                0.,
+                0.003,
+            ),
         );
         materials.insert(
             "menu".to_owned(),
-            material_profile(0.004, 1.08, 1.11, 0.110, 0.26, 0.004, 0.10, 0., 0.),
+            material_profile(
+                0.004,
+                1.07,
+                1.08,
+                Color::new_unpremul(241. / 255., 244. / 255., 249. / 255., 1.),
+                0.145,
+                0.18,
+                0.003,
+                0.13,
+                0.,
+                0.,
+            ),
         );
         materials.insert(
             "toast".to_owned(),
-            material_profile(0.005, 1.09, 1.10, 0.100, 0.24, 0.005, 0.09, 0., 0.),
+            material_profile(
+                0.005,
+                1.08,
+                1.08,
+                Color::new_unpremul(241. / 255., 244. / 255., 249. / 255., 1.),
+                0.130,
+                0.18,
+                0.004,
+                0.12,
+                0.,
+                0.,
+            ),
         );
 
-        let mut backdrop = material_profile(0.003, 1.04, 1.03, 0.070, 0.05, 0.002, 0., 0., 0.);
+        let mut backdrop = material_profile(
+            0.003,
+            1.04,
+            1.03,
+            Color::new_unpremul(1., 1., 1., 1.),
+            0.070,
+            0.05,
+            0.002,
+            0.,
+            0.,
+            0.,
+        );
         backdrop.shadow.on = false;
         materials.insert("backdrop".to_owned(), backdrop);
 
@@ -121,6 +198,7 @@ fn material_profile(
     noise: f64,
     saturation: f64,
     contrast: f64,
+    tint_color: Color,
     tint_amount: f64,
     edge_highlight: f64,
     refraction: f64,
@@ -132,6 +210,7 @@ fn material_profile(
     material.background_effect.noise = Some(noise);
     material.background_effect.saturation = Some(saturation);
     material.background_effect.contrast = Some(contrast);
+    material.background_effect.tint_color = Some(tint_color);
     material.background_effect.tint_amount = Some(tint_amount);
     material.background_effect.edge_highlight = Some(edge_highlight);
     material.background_effect.refraction = Some(refraction);
@@ -230,7 +309,7 @@ mod tests {
         );
         assert_eq!(
             config.material("launcher").background_effect.refraction,
-            Some(0.004)
+            Some(0.003)
         );
         assert_eq!(
             config.material("menu").background_effect.chromatic,
