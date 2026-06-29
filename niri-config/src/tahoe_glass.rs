@@ -81,18 +81,33 @@ impl Default for TahoeGlass {
         let allow_namespaces = vec!["^tahoe-".parse().unwrap()];
 
         let mut materials = BTreeMap::new();
-        let panel = TahoeGlassMaterial::default();
-        materials.insert("clear".to_owned(), panel);
-        materials.insert("panel".to_owned(), panel);
-        materials.insert("pill".to_owned(), panel);
-        materials.insert("dock".to_owned(), panel);
-        materials.insert("menu".to_owned(), panel);
-        materials.insert("toast".to_owned(), panel);
-        materials.insert("tinted".to_owned(), panel);
+        materials.insert(
+            "panel".to_owned(),
+            material_profile(0.005, 1.10, 1.10, 0.105, 0.14, 0.004, 0.06, 0., 0.),
+        );
+        materials.insert(
+            "pill".to_owned(),
+            material_profile(0.005, 1.12, 1.05, 0.052, 0.32, 0.013, 0.07, 0., 0.010),
+        );
+        materials.insert(
+            "launcher".to_owned(),
+            material_profile(0.005, 1.08, 1.08, 0.085, 0.15, 0.004, 0.055, 0., 0.003),
+        );
+        materials.insert(
+            "dock".to_owned(),
+            material_profile(0.005, 1.10, 1.06, 0.060, 0.18, 0.007, 0.07, 0., 0.006),
+        );
+        materials.insert(
+            "menu".to_owned(),
+            material_profile(0.004, 1.08, 1.11, 0.110, 0.26, 0.004, 0.10, 0., 0.),
+        );
+        materials.insert(
+            "toast".to_owned(),
+            material_profile(0.005, 1.09, 1.10, 0.100, 0.24, 0.005, 0.09, 0., 0.),
+        );
 
-        let mut backdrop = panel;
+        let mut backdrop = material_profile(0.003, 1.04, 1.03, 0.070, 0.05, 0.002, 0., 0., 0.);
         backdrop.shadow.on = false;
-        backdrop.background_effect.tint_amount = Some(0.02);
         materials.insert("backdrop".to_owned(), backdrop);
 
         Self {
@@ -100,6 +115,30 @@ impl Default for TahoeGlass {
             materials,
         }
     }
+}
+
+fn material_profile(
+    noise: f64,
+    saturation: f64,
+    contrast: f64,
+    tint_amount: f64,
+    edge_highlight: f64,
+    refraction: f64,
+    inner_shadow: f64,
+    chromatic: f64,
+    lens_depth: f64,
+) -> TahoeGlassMaterial {
+    let mut material = TahoeGlassMaterial::default();
+    material.background_effect.noise = Some(noise);
+    material.background_effect.saturation = Some(saturation);
+    material.background_effect.contrast = Some(contrast);
+    material.background_effect.tint_amount = Some(tint_amount);
+    material.background_effect.edge_highlight = Some(edge_highlight);
+    material.background_effect.refraction = Some(refraction);
+    material.background_effect.inner_shadow = Some(inner_shadow);
+    material.background_effect.chromatic = Some(chromatic);
+    material.background_effect.lens_depth = Some(lens_depth);
+    material
 }
 
 impl Default for TahoeGlassMaterial {
@@ -177,6 +216,28 @@ impl MergeWith<TahoeGlassMaterialRule> for TahoeGlassMaterial {
 #[cfg(test)]
 mod tests {
     use crate::Config;
+
+    use super::TahoeGlass;
+
+    #[test]
+    fn default_materials_match_shell_vocabulary() {
+        let config = TahoeGlass::default();
+        let names: Vec<_> = config.materials.keys().map(String::as_str).collect();
+
+        assert_eq!(
+            names,
+            vec!["backdrop", "dock", "launcher", "menu", "panel", "pill", "toast"]
+        );
+        assert_eq!(
+            config.material("launcher").background_effect.refraction,
+            Some(0.004)
+        );
+        assert_eq!(
+            config.material("menu").background_effect.chromatic,
+            Some(0.)
+        );
+        assert!(!config.material("backdrop").shadow.on);
+    }
 
     #[test]
     fn parse_tahoe_glass_material() {

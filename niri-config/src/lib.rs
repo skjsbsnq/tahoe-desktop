@@ -1965,13 +1965,13 @@ mod tests {
                                 true,
                             ),
                             noise: Some(
-                                0.006,
+                                0.003,
                             ),
                             saturation: Some(
-                                1.16,
+                                1.04,
                             ),
                             contrast: Some(
-                                1.0,
+                                1.03,
                             ),
                             tint_color: Some(
                                 Color {
@@ -1982,13 +1982,13 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.02,
+                                0.07,
                             ),
                             edge_highlight: Some(
-                                0.0,
+                                0.05,
                             ),
                             refraction: Some(
-                                0.0,
+                                0.002,
                             ),
                             inner_shadow: Some(
                                 0.0,
@@ -2022,7 +2022,7 @@ mod tests {
                             inactive_color: None,
                         },
                     },
-                    "clear": TahoeGlassMaterial {
+                    "dock": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
                             xray: Some(
                                 false,
@@ -2031,13 +2031,13 @@ mod tests {
                                 true,
                             ),
                             noise: Some(
-                                0.006,
+                                0.005,
                             ),
                             saturation: Some(
-                                1.16,
+                                1.1,
                             ),
                             contrast: Some(
-                                1.0,
+                                1.06,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2048,22 +2048,22 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.04,
+                                0.06,
                             ),
                             edge_highlight: Some(
-                                0.0,
+                                0.18,
                             ),
                             refraction: Some(
-                                0.0,
+                                0.007,
                             ),
                             inner_shadow: Some(
-                                0.0,
+                                0.07,
                             ),
                             chromatic: Some(
                                 0.0,
                             ),
                             lens_depth: Some(
-                                0.0,
+                                0.006,
                             ),
                         },
                         shadow: Shadow {
@@ -2088,7 +2088,7 @@ mod tests {
                             inactive_color: None,
                         },
                     },
-                    "dock": TahoeGlassMaterial {
+                    "launcher": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
                             xray: Some(
                                 false,
@@ -2097,13 +2097,13 @@ mod tests {
                                 true,
                             ),
                             noise: Some(
-                                0.006,
+                                0.005,
                             ),
                             saturation: Some(
-                                1.16,
+                                1.08,
                             ),
                             contrast: Some(
-                                1.0,
+                                1.08,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2114,22 +2114,22 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.04,
+                                0.085,
                             ),
                             edge_highlight: Some(
-                                0.0,
+                                0.15,
                             ),
                             refraction: Some(
-                                0.0,
+                                0.004,
                             ),
                             inner_shadow: Some(
-                                0.0,
+                                0.055,
                             ),
                             chromatic: Some(
                                 0.0,
                             ),
                             lens_depth: Some(
-                                0.0,
+                                0.003,
                             ),
                         },
                         shadow: Shadow {
@@ -2163,13 +2163,13 @@ mod tests {
                                 true,
                             ),
                             noise: Some(
-                                0.006,
+                                0.004,
                             ),
                             saturation: Some(
-                                1.16,
+                                1.08,
                             ),
                             contrast: Some(
-                                1.0,
+                                1.11,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2180,16 +2180,16 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.04,
+                                0.11,
                             ),
                             edge_highlight: Some(
-                                0.0,
+                                0.26,
                             ),
                             refraction: Some(
-                                0.0,
+                                0.004,
                             ),
                             inner_shadow: Some(
-                                0.0,
+                                0.1,
                             ),
                             chromatic: Some(
                                 0.0,
@@ -2229,13 +2229,13 @@ mod tests {
                                 true,
                             ),
                             noise: Some(
-                                0.006,
+                                0.005,
                             ),
                             saturation: Some(
-                                1.16,
+                                1.1,
                             ),
                             contrast: Some(
-                                1.0,
+                                1.1,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2246,16 +2246,16 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.04,
+                                0.105,
                             ),
                             edge_highlight: Some(
-                                0.0,
+                                0.14,
                             ),
                             refraction: Some(
-                                0.0,
+                                0.004,
                             ),
                             inner_shadow: Some(
-                                0.0,
+                                0.06,
                             ),
                             chromatic: Some(
                                 0.0,
@@ -2295,13 +2295,13 @@ mod tests {
                                 true,
                             ),
                             noise: Some(
-                                0.006,
+                                0.005,
                             ),
                             saturation: Some(
-                                1.16,
+                                1.12,
                             ),
                             contrast: Some(
-                                1.0,
+                                1.05,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2312,88 +2312,22 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.04,
+                                0.052,
                             ),
                             edge_highlight: Some(
-                                0.0,
+                                0.32,
                             ),
                             refraction: Some(
-                                0.0,
+                                0.013,
                             ),
                             inner_shadow: Some(
-                                0.0,
+                                0.07,
                             ),
                             chromatic: Some(
                                 0.0,
                             ),
                             lens_depth: Some(
-                                0.0,
-                            ),
-                        },
-                        shadow: Shadow {
-                            on: true,
-                            offset: ShadowOffset {
-                                x: FloatOrInt(
-                                    0.0,
-                                ),
-                                y: FloatOrInt(
-                                    8.0,
-                                ),
-                            },
-                            softness: 28.0,
-                            spread: 2.0,
-                            draw_behind_window: false,
-                            color: Color {
-                                r: 0.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 0.27,
-                            },
-                            inactive_color: None,
-                        },
-                    },
-                    "tinted": TahoeGlassMaterial {
-                        background_effect: BackgroundEffect {
-                            xray: Some(
-                                false,
-                            ),
-                            blur: Some(
-                                true,
-                            ),
-                            noise: Some(
-                                0.006,
-                            ),
-                            saturation: Some(
-                                1.16,
-                            ),
-                            contrast: Some(
-                                1.0,
-                            ),
-                            tint_color: Some(
-                                Color {
-                                    r: 1.0,
-                                    g: 1.0,
-                                    b: 1.0,
-                                    a: 1.0,
-                                },
-                            ),
-                            tint_amount: Some(
-                                0.04,
-                            ),
-                            edge_highlight: Some(
-                                0.0,
-                            ),
-                            refraction: Some(
-                                0.0,
-                            ),
-                            inner_shadow: Some(
-                                0.0,
-                            ),
-                            chromatic: Some(
-                                0.0,
-                            ),
-                            lens_depth: Some(
-                                0.0,
+                                0.01,
                             ),
                         },
                         shadow: Shadow {
@@ -2427,13 +2361,13 @@ mod tests {
                                 true,
                             ),
                             noise: Some(
-                                0.006,
+                                0.005,
                             ),
                             saturation: Some(
-                                1.16,
+                                1.09,
                             ),
                             contrast: Some(
-                                1.0,
+                                1.1,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2444,16 +2378,16 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.04,
+                                0.1,
                             ),
                             edge_highlight: Some(
-                                0.0,
+                                0.24,
                             ),
                             refraction: Some(
-                                0.0,
+                                0.005,
                             ),
                             inner_shadow: Some(
-                                0.0,
+                                0.09,
                             ),
                             chromatic: Some(
                                 0.0,
