@@ -43,6 +43,7 @@ pub struct Options {
 pub struct GlassOptions {
     pub tint_color: [f32; 4],
     pub tint_amount: f32,
+    pub contrast: f32,
     pub edge_highlight: f32,
     pub refraction: f32,
     pub inner_shadow: f32,
@@ -55,6 +56,7 @@ impl Default for GlassOptions {
         Self {
             tint_color: [1., 1., 1., 1.],
             tint_amount: 0.,
+            contrast: 1.,
             edge_highlight: 0.,
             refraction: 0.,
             inner_shadow: 0.,
@@ -74,6 +76,7 @@ impl GlassOptions {
         Self {
             tint_color,
             tint_amount: effect.tint_amount.unwrap_or(0.) as f32,
+            contrast: effect.contrast.unwrap_or(1.) as f32,
             edge_highlight: effect.edge_highlight.unwrap_or(0.) as f32,
             refraction: effect.refraction.unwrap_or(0.) as f32,
             inner_shadow: effect.inner_shadow.unwrap_or(0.) as f32,
@@ -84,6 +87,7 @@ impl GlassOptions {
 
     fn is_visible(&self) -> bool {
         self.tint_amount > 0.
+            || self.contrast != 1.
             || self.edge_highlight > 0.
             || self.refraction > 0.
             || self.inner_shadow > 0.

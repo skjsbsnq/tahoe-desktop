@@ -40,6 +40,8 @@ pub struct TahoeGlassMaterialRule {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub contrast: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child)]
     pub tint_color: Option<Color>,
     #[knuffel(child, unwrap(argument))]
@@ -80,11 +82,13 @@ impl Default for TahoeGlass {
 
         let mut materials = BTreeMap::new();
         let panel = TahoeGlassMaterial::default();
+        materials.insert("clear".to_owned(), panel);
         materials.insert("panel".to_owned(), panel);
         materials.insert("pill".to_owned(), panel);
         materials.insert("dock".to_owned(), panel);
         materials.insert("menu".to_owned(), panel);
         materials.insert("toast".to_owned(), panel);
+        materials.insert("tinted".to_owned(), panel);
 
         let mut backdrop = panel;
         backdrop.shadow.on = false;
@@ -106,6 +110,7 @@ impl Default for TahoeGlassMaterial {
                 blur: Some(true),
                 noise: Some(0.006),
                 saturation: Some(1.16),
+                contrast: Some(1.0),
                 tint_color: Some(Color::new_unpremul(1., 1., 1., 1.)),
                 tint_amount: Some(0.04),
                 edge_highlight: Some(0.),
@@ -156,6 +161,7 @@ impl MergeWith<TahoeGlassMaterialRule> for TahoeGlassMaterial {
             blur: part.blur,
             noise: part.noise,
             saturation: part.saturation,
+            contrast: part.contrast,
             tint_color: part.tint_color,
             tint_amount: part.tint_amount,
             edge_highlight: part.edge_highlight,
@@ -183,6 +189,7 @@ mod tests {
                     blur true
                     noise 0.006
                     saturation 1.16
+                    contrast 1.08
                     tint-color "#ffffff"
                     tint-amount 0.04
                     edge-highlight 0.01
@@ -208,6 +215,7 @@ mod tests {
         assert_eq!(material.background_effect.xray, Some(false));
         assert_eq!(material.background_effect.blur, Some(true));
         assert_eq!(material.background_effect.noise, Some(0.006));
+        assert_eq!(material.background_effect.contrast, Some(1.08));
         assert_eq!(material.background_effect.edge_highlight, Some(0.01));
         assert_eq!(material.background_effect.refraction, Some(0.002));
         assert_eq!(material.background_effect.inner_shadow, Some(0.12));

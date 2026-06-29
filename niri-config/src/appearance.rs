@@ -1065,6 +1065,8 @@ pub struct BackgroundEffectRule {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub contrast: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child)]
     pub tint_color: Option<Color>,
     #[knuffel(child, unwrap(argument))]
@@ -1101,6 +1103,7 @@ pub struct BackgroundEffect {
 
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
+    pub contrast: Option<f64>,
     pub tint_color: Option<Color>,
     pub tint_amount: Option<f64>,
     pub edge_highlight: Option<f64>,
@@ -1120,6 +1123,10 @@ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
 
         if let Some(x) = part.saturation {
             self.saturation = Some(x.0);
+        }
+
+        if let Some(x) = part.contrast {
+            self.contrast = Some(x.0);
         }
 
         if let Some(x) = part.tint_amount {
@@ -1163,6 +1170,7 @@ mod tests {
                 background-effect {
                     tint-color "#f8fbff"
                     tint-amount 0.12
+                    contrast 1.08
                     edge-highlight 0.34
                     refraction 0.014
                     inner-shadow 0.12
@@ -1177,6 +1185,7 @@ mod tests {
         let rule = &config.window_rules[0].background_effect;
         assert_eq!(rule.tint_color, Some("#f8fbff".parse().unwrap()));
         assert_eq!(rule.tint_amount.map(|x| x.0), Some(0.12));
+        assert_eq!(rule.contrast.map(|x| x.0), Some(1.08));
         assert_eq!(rule.edge_highlight.map(|x| x.0), Some(0.34));
         assert_eq!(rule.refraction.map(|x| x.0), Some(0.014));
         assert_eq!(rule.inner_shadow.map(|x| x.0), Some(0.12));
@@ -1187,6 +1196,7 @@ mod tests {
         resolved.merge_with(rule);
         assert_eq!(resolved.tint_color, Some("#f8fbff".parse().unwrap()));
         assert_eq!(resolved.tint_amount, Some(0.12));
+        assert_eq!(resolved.contrast, Some(1.08));
         assert_eq!(resolved.edge_highlight, Some(0.34));
         assert_eq!(resolved.refraction, Some(0.014));
         assert_eq!(resolved.inner_shadow, Some(0.12));

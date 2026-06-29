@@ -5348,6 +5348,7 @@ impl<W: LayoutElement> Layout<W> {
             let glass = GlassOptions {
                 tint_color: [1., 1., 1., 1.],
                 tint_amount: 0.10 * alpha,
+                contrast: 1.,
                 edge_highlight: 0.20 * alpha,
                 refraction: 0.006 * alpha,
                 inner_shadow: 0.10 * alpha,

@@ -1970,6 +1970,9 @@ mod tests {
                             saturation: Some(
                                 1.16,
                             ),
+                            contrast: Some(
+                                1.0,
+                            ),
                             tint_color: Some(
                                 Color {
                                     r: 1.0,
@@ -2019,6 +2022,72 @@ mod tests {
                             inactive_color: None,
                         },
                     },
+                    "clear": TahoeGlassMaterial {
+                        background_effect: BackgroundEffect {
+                            xray: Some(
+                                false,
+                            ),
+                            blur: Some(
+                                true,
+                            ),
+                            noise: Some(
+                                0.006,
+                            ),
+                            saturation: Some(
+                                1.16,
+                            ),
+                            contrast: Some(
+                                1.0,
+                            ),
+                            tint_color: Some(
+                                Color {
+                                    r: 1.0,
+                                    g: 1.0,
+                                    b: 1.0,
+                                    a: 1.0,
+                                },
+                            ),
+                            tint_amount: Some(
+                                0.04,
+                            ),
+                            edge_highlight: Some(
+                                0.0,
+                            ),
+                            refraction: Some(
+                                0.0,
+                            ),
+                            inner_shadow: Some(
+                                0.0,
+                            ),
+                            chromatic: Some(
+                                0.0,
+                            ),
+                            lens_depth: Some(
+                                0.0,
+                            ),
+                        },
+                        shadow: Shadow {
+                            on: true,
+                            offset: ShadowOffset {
+                                x: FloatOrInt(
+                                    0.0,
+                                ),
+                                y: FloatOrInt(
+                                    8.0,
+                                ),
+                            },
+                            softness: 28.0,
+                            spread: 2.0,
+                            draw_behind_window: false,
+                            color: Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.27,
+                            },
+                            inactive_color: None,
+                        },
+                    },
                     "dock": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
                             xray: Some(
@@ -2032,6 +2101,9 @@ mod tests {
                             ),
                             saturation: Some(
                                 1.16,
+                            ),
+                            contrast: Some(
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2096,6 +2168,9 @@ mod tests {
                             saturation: Some(
                                 1.16,
                             ),
+                            contrast: Some(
+                                1.0,
+                            ),
                             tint_color: Some(
                                 Color {
                                     r: 1.0,
@@ -2158,6 +2233,9 @@ mod tests {
                             ),
                             saturation: Some(
                                 1.16,
+                            ),
+                            contrast: Some(
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2222,6 +2300,75 @@ mod tests {
                             saturation: Some(
                                 1.16,
                             ),
+                            contrast: Some(
+                                1.0,
+                            ),
+                            tint_color: Some(
+                                Color {
+                                    r: 1.0,
+                                    g: 1.0,
+                                    b: 1.0,
+                                    a: 1.0,
+                                },
+                            ),
+                            tint_amount: Some(
+                                0.04,
+                            ),
+                            edge_highlight: Some(
+                                0.0,
+                            ),
+                            refraction: Some(
+                                0.0,
+                            ),
+                            inner_shadow: Some(
+                                0.0,
+                            ),
+                            chromatic: Some(
+                                0.0,
+                            ),
+                            lens_depth: Some(
+                                0.0,
+                            ),
+                        },
+                        shadow: Shadow {
+                            on: true,
+                            offset: ShadowOffset {
+                                x: FloatOrInt(
+                                    0.0,
+                                ),
+                                y: FloatOrInt(
+                                    8.0,
+                                ),
+                            },
+                            softness: 28.0,
+                            spread: 2.0,
+                            draw_behind_window: false,
+                            color: Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.27,
+                            },
+                            inactive_color: None,
+                        },
+                    },
+                    "tinted": TahoeGlassMaterial {
+                        background_effect: BackgroundEffect {
+                            xray: Some(
+                                false,
+                            ),
+                            blur: Some(
+                                true,
+                            ),
+                            noise: Some(
+                                0.006,
+                            ),
+                            saturation: Some(
+                                1.16,
+                            ),
+                            contrast: Some(
+                                1.0,
+                            ),
                             tint_color: Some(
                                 Color {
                                     r: 1.0,
@@ -2284,6 +2431,9 @@ mod tests {
                             ),
                             saturation: Some(
                                 1.16,
+                            ),
+                            contrast: Some(
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2570,6 +2720,7 @@ mod tests {
                         blur: None,
                         noise: None,
                         saturation: None,
+                        contrast: None,
                         tint_color: None,
                         tint_amount: None,
                         edge_highlight: None,
@@ -2586,6 +2737,7 @@ mod tests {
                             blur: None,
                             noise: None,
                             saturation: None,
+                            contrast: None,
                             tint_color: None,
                             tint_amount: None,
                             edge_highlight: None,
@@ -2635,6 +2787,7 @@ mod tests {
                         blur: None,
                         noise: None,
                         saturation: None,
+                        contrast: None,
                         tint_color: None,
                         tint_amount: None,
                         edge_highlight: None,
@@ -2651,6 +2804,7 @@ mod tests {
                             blur: None,
                             noise: None,
                             saturation: None,
+                            contrast: None,
                             tint_color: None,
                             tint_amount: None,
                             edge_highlight: None,

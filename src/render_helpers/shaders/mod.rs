@@ -92,7 +92,7 @@ impl Shaders {
                 concat!(
                     include_str!("clipped_surface.frag"),
                     include_str!("rounding_alpha.frag"),
-                    "\nvec2 niri_refraction_offset(vec2 coords_geo) { return vec2(0.0); }",
+                    "\nvec2 niri_refraction_sample_coords(vec2 input_coords, vec2 coords_geo) { return input_coords; }",
                     "\nvec4 postprocess(vec4 color, vec2 coords_geo) { return color; }",
                 ),
                 &[
@@ -120,11 +120,13 @@ impl Shaders {
                     UniformName::new("geo_size", UniformType::_2f),
                     UniformName::new("corner_radius", UniformType::_4f),
                     UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                    UniformName::new("geo_to_input", UniformType::Matrix3x3),
                     UniformName::new("noise", UniformType::_1f),
                     UniformName::new("saturation", UniformType::_1f),
                     UniformName::new("bg_color", UniformType::_4f),
                     UniformName::new("tint_color", UniformType::_4f),
                     UniformName::new("tint_amount", UniformType::_1f),
+                    UniformName::new("contrast", UniformType::_1f),
                     UniformName::new("edge_highlight", UniformType::_1f),
                     UniformName::new("refraction", UniformType::_1f),
                     UniformName::new("inner_shadow", UniformType::_1f),

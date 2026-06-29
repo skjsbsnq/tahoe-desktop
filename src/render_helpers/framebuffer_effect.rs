@@ -103,7 +103,7 @@ impl FramebufferEffectElement {
         &self,
         crop: Rectangle<f64, Logical>,
         transform: Transform,
-    ) -> [Uniform<'static>; 14] {
+    ) -> [Uniform<'static>; 16] {
         let offset = crop.loc - (self.clip_geo.loc - self.geometry.loc);
         let offset = Vec2::new(offset.x as f32, offset.y as f32);
         let crop_size = Vec2::new(crop.size.w as f32, crop.size.h as f32);
@@ -118,6 +118,7 @@ impl FramebufferEffectElement {
             * Mat3::from_cols_array(transform.matrix().as_ref())
             * Mat3::from_translation(Vec2::new(-0.5, -0.5));
         let input_to_clip_geo = input_to_clip_geo * transform_mat;
+        let clip_geo_to_input = input_to_clip_geo.inverse();
 
         let clip_geo_size = (self.clip_geo.size.w as f32, self.clip_geo.size.h as f32);
 
@@ -126,11 +127,13 @@ impl FramebufferEffectElement {
             Uniform::new("geo_size", clip_geo_size),
             Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
             mat3_uniform("input_to_geo", input_to_clip_geo),
+            mat3_uniform("geo_to_input", clip_geo_to_input),
             Uniform::new("noise", self.noise),
             Uniform::new("saturation", self.saturation),
             Uniform::new("bg_color", [0f32, 0., 0., 0.]),
             Uniform::new("tint_color", self.glass.tint_color),
             Uniform::new("tint_amount", self.glass.tint_amount),
+            Uniform::new("contrast", self.glass.contrast),
             Uniform::new("edge_highlight", self.glass.edge_highlight),
             Uniform::new("refraction", self.glass.refraction),
             Uniform::new("inner_shadow", self.glass.inner_shadow),

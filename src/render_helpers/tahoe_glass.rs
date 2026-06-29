@@ -266,7 +266,9 @@ fn render_region(
     // and out for popup/backdrop enter/exit without touching region geometry.
     // `interaction` then boosts the refractive terms for hover/press/active states.
     let fade = |v: Option<f64>| v.map(|x| x * f64::from(material_alpha));
+    let fade_from_one = |v: Option<f64>| v.map(|x| 1.0 + (x - 1.0) * f64::from(material_alpha));
     effect.tint_amount = fade(effect.tint_amount);
+    effect.contrast = fade_from_one(effect.contrast);
     effect.edge_highlight = fade(effect.edge_highlight);
     effect.refraction = fade(effect.refraction);
     effect.inner_shadow = fade(effect.inner_shadow);
@@ -276,6 +278,8 @@ fn render_region(
     let interaction = region.interaction as f64;
     if interaction > 0.0 && material_alpha > 0.0 {
         let boost = |v: Option<f64>| v.map(|x| x * (1.0 + interaction));
+        let boost_from_one = |v: Option<f64>| v.map(|x| 1.0 + (x - 1.0) * (1.0 + interaction));
+        effect.contrast = boost_from_one(effect.contrast);
         effect.edge_highlight = boost(effect.edge_highlight);
         effect.refraction = boost(effect.refraction);
         effect.inner_shadow = boost(effect.inner_shadow);

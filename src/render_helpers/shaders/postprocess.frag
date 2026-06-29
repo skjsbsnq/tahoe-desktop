@@ -3,10 +3,12 @@ uniform float saturation;
 uniform vec4 bg_color;
 uniform vec4 tint_color;
 uniform float tint_amount;
+uniform float contrast;
 uniform float edge_highlight;
 uniform float refraction;
 uniform float inner_shadow;
 uniform float lens_depth;
+uniform mat3 geo_to_input;
 // Note: `chromatic` is declared in clipped_surface.frag (where the RGB-split
 // sampling lives) and shared with this translation unit. Declaring it here too
 // triggers a GLSL "redeclared" error and fails the postprocess_and_clip program.
@@ -22,6 +24,11 @@ float hash12(vec2 p) {
 vec3 saturate(vec3 color, float sat) {
     const vec3 w = vec3(0.2126, 0.7152, 0.0722);
     return mix(vec3(dot(color, w)), color, sat);
+}
+
+vec3 apply_contrast(vec3 color, float amount, float alpha) {
+    float pivot = 0.5 * alpha;
+    return clamp((color - vec3(pivot)) * amount + vec3(pivot), vec3(0.0), vec3(alpha));
 }
 
 float value_noise(vec2 p) {
@@ -44,6 +51,19 @@ float glass_surface_detail() {
     float area_fade = 1.0 - smoothstep(180000.0, 420000.0, area);
 
     return clamp(min(long_fade, area_fade), 0.0, 1.0);
+}
+
+float glass_large_surface_fade() {
+    return 0.18 + glass_surface_detail() * 0.82;
+}
+
+float glass_small_surface_boost() {
+    float short_edge = max(min(geo_size.x, geo_size.y), 1.0);
+    float area = max(geo_size.x * geo_size.y, 1.0);
+    float short_boost = 1.0 - smoothstep(220.0, 420.0, short_edge);
+    float area_boost = 1.0 - smoothstep(45000.0, 120000.0, area);
+
+    return 1.0 + clamp(min(short_boost, area_boost), 0.0, 1.0) * 0.18;
 }
 
 // Distance from the pixel to the rounded-rect edge, in geometry-space pixels.
@@ -120,6 +140,17 @@ float glass_light_strength(vec2 coords_geo) {
     );
 }
 
+vec2 niri_refraction_offset(vec2 coords_geo);
+
+vec2 niri_refraction_sample_coords(vec2 input_coords, vec2 coords_geo) {
+    vec2 offset_geo = niri_refraction_offset(coords_geo);
+    if (dot(offset_geo, offset_geo) <= 0.0) {
+        return input_coords;
+    }
+
+    return (geo_to_input * vec3(coords_geo + offset_geo, 1.0)).xy;
+}
+
 // Bottom-right inner shadow: darker where the SDF outward normal points away
 // from a bottom-right light, concentrated in the inner edge band. Driven by the
 // `inner_shadow` material parameter.
@@ -158,8 +189,7 @@ vec2 niri_refraction_offset(vec2 coords_geo) {
         value_noise(p * 0.044 + vec2(3.1, 9.7)) - 0.5,
         value_noise(p * 0.044 + vec2(21.4, 6.2)) - 0.5
     );
-    float detail = glass_surface_detail();
-    float amount_scale = 0.35 + detail * 0.65;
+    float amount_scale = glass_large_surface_fade() * glass_small_surface_boost();
 
     vec2 offset = (normal.xy * (0.55 + rim * 1.45) + turbulence * (0.18 + rim * 0.26))
         * amount * amount_scale;
@@ -171,7 +201,8 @@ vec2 niri_refraction_offset(vec2 coords_geo) {
         vec2 centered = p - half_size;
         float edge_dist = glass_edge_distance(coords);
         float bulge = glass_circle_map(clamp(edge_dist / max(half_size.x, half_size.y), 0.0, 1.0));
-        offset += normalize(centered + 0.00001) * lens * bulge * (0.4 + detail * 0.6);
+        offset += normalize(centered + 0.00001) * lens * bulge
+            * glass_large_surface_fade() * glass_small_surface_boost();
     }
 
     return offset;
@@ -195,12 +226,19 @@ vec4 postprocess(vec4 color, vec2 coords_geo) {
         color.rgb = mix(color.rgb, tint_color.rgb * color.a, tint_mix);
     }
 
-    float highlight = glass_light_strength(coords_geo) * clamp(edge_highlight, 0.0, 2.0);
+    float contrast_amount = clamp(contrast, 0.0, 3.0);
+    if (contrast_amount != 1.0) {
+        color.rgb = apply_contrast(color.rgb, contrast_amount, color.a);
+    }
+
+    float highlight = glass_light_strength(coords_geo) * clamp(edge_highlight, 0.0, 2.0)
+        * (0.38 + glass_surface_detail() * 0.62) * glass_small_surface_boost();
     if (highlight > 0.0) {
         color.rgb += vec3(highlight * color.a * 0.28);
     }
 
-    float inner = glass_inner_shadow(coords_geo) * clamp(inner_shadow, 0.0, 0.5);
+    float inner = glass_inner_shadow(coords_geo) * clamp(inner_shadow, 0.0, 0.5)
+        * (0.55 + glass_surface_detail() * 0.45);
     if (inner > 0.0) {
         color.rgb *= 1.0 - inner * 0.5;
     }
