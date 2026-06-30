@@ -89,7 +89,7 @@ pub enum Request {
     WindowThumbnail {
         /// Id of the window to render.
         id: u64,
-        /// Absolute path where the PNG thumbnail should be written.
+        /// Absolute path under `$XDG_RUNTIME_DIR/tahoe/window-thumbnails`.
         path: String,
         /// Maximum thumbnail width in physical pixels.
         max_width: u32,
@@ -200,7 +200,7 @@ pub struct PickedColor {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WindowThumbnail {
-    /// Absolute path where the PNG thumbnail was written.
+    /// Absolute path under `$XDG_RUNTIME_DIR/tahoe/window-thumbnails`.
     pub path: String,
     /// Written PNG width in physical pixels.
     pub width: u32,

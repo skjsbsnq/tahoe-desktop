@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -5977,6 +5977,22 @@ impl Niri {
         pixels: Vec<u8>,
     ) -> anyhow::Result<()> {
         ensure!(path.is_absolute(), "thumbnail path must be absolute");
+        ensure!(
+            !path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir)),
+            "thumbnail path must not contain '..'"
+        );
+
+        let runtime_dir = env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
+        let thumbnail_dir = PathBuf::from(runtime_dir)
+            .join("tahoe")
+            .join("window-thumbnails");
+        ensure!(
+            path.parent() == Some(thumbnail_dir.as_path()),
+            "thumbnail path must be inside {}",
+            thumbnail_dir.display()
+        );
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {

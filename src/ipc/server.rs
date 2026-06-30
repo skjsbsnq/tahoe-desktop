@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::{env, io, process};
@@ -40,6 +40,80 @@ use crate::window::Mapped;
 // If an event stream client fails to read events fast enough that we accumulate more than this
 // number in our buffer, we drop that event stream client.
 const EVENT_STREAM_BUFFER_SIZE: usize = 64;
+
+fn tahoe_thumbnail_directory() -> Result<PathBuf, String> {
+    let runtime_dir =
+        env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| String::from("XDG_RUNTIME_DIR is not set"))?;
+    Ok(PathBuf::from(runtime_dir)
+        .join("tahoe")
+        .join("window-thumbnails"))
+}
+
+fn validate_tahoe_thumbnail_path(path: &str) -> Result<(), String> {
+    let path = Path::new(path);
+    let allowed_dir = tahoe_thumbnail_directory()?;
+    validate_tahoe_thumbnail_path_in_dir(path, &allowed_dir)
+}
+
+fn validate_tahoe_thumbnail_path_in_dir(path: &Path, allowed_dir: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(String::from("thumbnail path must not contain '..'"));
+    }
+
+    if path.parent() != Some(allowed_dir) {
+        return Err(format!(
+            "thumbnail path must be inside {}",
+            allowed_dir.display()
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::validate_tahoe_thumbnail_path_in_dir;
+
+    #[test]
+    fn tahoe_thumbnail_path_accepts_runtime_thumbnail_dir_file() {
+        let allowed = Path::new("/run/user/1000/tahoe/window-thumbnails");
+        let path = Path::new("/run/user/1000/tahoe/window-thumbnails/window-42.png");
+
+        assert!(validate_tahoe_thumbnail_path_in_dir(path, allowed).is_ok());
+    }
+
+    #[test]
+    fn tahoe_thumbnail_path_rejects_parent_directory_escape() {
+        let allowed = Path::new("/run/user/1000/tahoe/window-thumbnails");
+        let path = Path::new("/run/user/1000/tahoe/window-thumbnails/../outside.png");
+
+        assert!(validate_tahoe_thumbnail_path_in_dir(path, allowed).is_err());
+    }
+
+    #[test]
+    fn tahoe_thumbnail_path_rejects_other_absolute_directory() {
+        let allowed = Path::new("/run/user/1000/tahoe/window-thumbnails");
+        let path = Path::new("/tmp/window-42.png");
+
+        assert!(validate_tahoe_thumbnail_path_in_dir(path, allowed).is_err());
+    }
+
+    #[test]
+    fn tahoe_thumbnail_path_rejects_nested_directory() {
+        let allowed = Path::new("/run/user/1000/tahoe/window-thumbnails");
+        let path = Path::new("/run/user/1000/tahoe/window-thumbnails/sub/window-42.png");
+
+        assert!(validate_tahoe_thumbnail_path_in_dir(path, allowed).is_err());
+    }
+}
 
 pub struct IpcServer {
     /// Path to the IPC socket.
@@ -384,9 +458,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             max_width,
             max_height,
         } => {
-            if !Path::new(&path).is_absolute() {
-                return Err(format!("path must be absolute: {path}"));
-            }
+            validate_tahoe_thumbnail_path(&path)?;
             if max_width == 0 || max_height == 0 {
                 return Err(String::from(
                     "max-width and max-height must be greater than zero",

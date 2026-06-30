@@ -84,7 +84,7 @@ pub enum Msg {
         /// Id of the window to render.
         #[arg(long)]
         id: u64,
-        /// Absolute path where the PNG thumbnail should be written.
+        /// Absolute path under $XDG_RUNTIME_DIR/tahoe/window-thumbnails.
         #[arg(long)]
         path: String,
         /// Maximum thumbnail width in physical pixels.
