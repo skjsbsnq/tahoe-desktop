@@ -243,20 +243,6 @@ fn render_region(
     let geometry = Rectangle::new(surface_location + rect.loc, rect.size);
     let material_alpha = region.material_alpha.clamp(0., 1.) * layer_alpha.clamp(0., 1.);
 
-    if region.flags.shadow && material_alpha > 0. {
-        renderer.shadow.update_config(material.shadow);
-        renderer.shadow.update_render_elements(
-            geometry.size,
-            true,
-            region.radius,
-            scale,
-            material_alpha,
-        );
-        renderer
-            .shadow
-            .render(ctx.renderer, geometry.loc, &mut |elem| push(elem.into()));
-    }
-
     let mut effect = material.background_effect;
     if !region.flags.blur {
         effect.blur = Some(false);
@@ -295,21 +281,37 @@ fn render_region(
         .background_effect
         .update_render_elements(region.radius, effect, region.flags.blur);
 
-    if !renderer.background_effect.is_visible() {
-        return;
+    if renderer.background_effect.is_visible() {
+        let params = RenderParams {
+            geometry: sample_geometry,
+            alpha: material_alpha,
+            subregion: None,
+            clip: region.flags.clip.then_some((geometry, region.radius)),
+            scale,
+        };
+        let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
+        renderer
+            .background_effect
+            .render(ctx.r(), ns, params, xray_pos, &mut |elem| push(elem.into()));
     }
 
-    let params = RenderParams {
-        geometry: sample_geometry,
-        alpha: material_alpha,
-        subregion: None,
-        clip: region.flags.clip.then_some((geometry, region.radius)),
-        scale,
-    };
-    let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
-    renderer
-        .background_effect
-        .render(ctx.r(), ns, params, xray_pos, &mut |elem| push(elem.into()));
+    // niri collects render elements front-to-back. Tahoe glass regions are
+    // below the QML layer surface, but inside the region the material must sit
+    // above its drop shadow; otherwise the shadow is composited over the glass
+    // and shows up as dark rounded-corner artifacts on transparent panels.
+    if region.flags.shadow && material_alpha > 0. {
+        renderer.shadow.update_config(material.shadow);
+        renderer.shadow.update_render_elements(
+            geometry.size,
+            true,
+            region.radius,
+            scale,
+            material_alpha,
+        );
+        renderer
+            .shadow
+            .render(ctx.renderer, geometry.loc, &mut |elem| push(elem.into()));
+    }
 }
 
 fn glass_sample_padding(
