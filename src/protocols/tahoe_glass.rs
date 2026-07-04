@@ -134,9 +134,16 @@ fn mark_pending_dirty(surface: &WlSurface) {
                     return false;
                 }
 
-                guard.pending_dirty = false;
+                let Some(committed) = validate_regions(states, &guard.pending) else {
+                    debug!(
+                        surface = %surface.id(),
+                        pending_count = guard.pending.len(),
+                        "deferring Tahoe glass region commit until surface geometry is available"
+                    );
+                    return false;
+                };
 
-                let committed = validate_regions(states, &guard.pending);
+                guard.pending_dirty = false;
                 if *guard.committed == committed {
                     return false;
                 }
@@ -170,10 +177,22 @@ fn mark_pending_dirty(surface: &WlSurface) {
     }
 }
 
-fn validate_regions(states: &SurfaceData, pending: &[TahoeGlassRegion]) -> Vec<TahoeGlassRegion> {
-    let Some(surface_geo) = surface_geo(states) else {
-        return Vec::new();
-    };
+fn validate_regions(
+    states: &SurfaceData,
+    pending: &[TahoeGlassRegion],
+) -> Option<Vec<TahoeGlassRegion>> {
+    validate_regions_for_surface_geo(surface_geo(states), pending)
+}
+
+fn validate_regions_for_surface_geo(
+    surface_geo: Option<Rectangle<i32, Logical>>,
+    pending: &[TahoeGlassRegion],
+) -> Option<Vec<TahoeGlassRegion>> {
+    if pending.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let surface_geo = surface_geo?;
 
     let surface_area = i64::from(surface_geo.size.w.max(0)) * i64::from(surface_geo.size.h.max(0));
     let mut total_area = 0i64;
@@ -214,7 +233,7 @@ fn validate_regions(states: &SurfaceData, pending: &[TahoeGlassRegion]) -> Vec<T
         committed.push(region.clone());
     }
 
-    committed
+    Some(committed)
 }
 
 fn make_region(
@@ -459,4 +478,53 @@ macro_rules! delegate_tahoe_glass {
             $crate::protocols::raw::tahoe_glass::v1::server::tahoe_glass_surface_v1::TahoeGlassSurfaceV1: $crate::protocols::tahoe_glass::TahoeGlassSurfaceUserData
         ] => $crate::protocols::tahoe_glass::TahoeGlassManagerState);
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(id: u32, x: i32, y: i32, width: i32, height: i32) -> TahoeGlassRegion {
+        TahoeGlassRegion {
+            id,
+            rect: Rectangle::new(Point::new(x, y), Size::new(width, height)),
+            radius: CornerRadius::default(),
+            material: "panel".to_owned(),
+            flags: TahoeGlassFlags {
+                blur: true,
+                shadow: true,
+                clip: true,
+            },
+            interaction: 0.,
+            material_alpha: 1.,
+        }
+    }
+
+    #[test]
+    fn validation_defers_non_empty_regions_until_surface_geometry_exists() {
+        assert_eq!(
+            validate_regions_for_surface_geo(None, &[region(1, 8, 4, 128, 32)]),
+            None
+        );
+    }
+
+    #[test]
+    fn validation_allows_empty_regions_without_surface_geometry() {
+        assert_eq!(
+            validate_regions_for_surface_geo(None, &[]),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn validation_keeps_only_regions_inside_surface_geometry() {
+        let surface_geo = Rectangle::new(Point::new(0, 0), Size::new(100, 40));
+        let inside = region(1, 8, 4, 84, 32);
+        let outside = region(2, 90, 4, 20, 32);
+
+        assert_eq!(
+            validate_regions_for_surface_geo(Some(surface_geo), &[inside.clone(), outside]),
+            Some(vec![inside])
+        );
+    }
 }
