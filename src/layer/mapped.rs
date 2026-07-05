@@ -2,10 +2,10 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{Config, LayerRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::CropRenderElement;
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
-use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 use smithay::wayland::compositor::{remove_pre_commit_hook, with_states, HookId};
 use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
 use std::sync::Arc;
@@ -452,6 +452,8 @@ impl MappedLayer {
         let crop_rect = open_state
             .and_then(|state| state.edge_reveal_crop_rect(base_location, open_size, scale));
         let location = base_location + open_offset;
+        let moving_surface_rect =
+            crop_rect.map(|_| Rectangle::new(location, open_size).to_physical_precise_round(scale));
         let xray_pos = xray_pos.offset(bob_offset + open_offset);
         let anchor = self.surface.cached_state().anchor;
         let open_origin = open_state.map(|state| {
@@ -462,7 +464,14 @@ impl MappedLayer {
             )
         });
         let mut push_opening = |elem| {
-            push_opening_element(elem, open_origin, scale, crop_rect, push);
+            push_opening_element(
+                elem,
+                open_origin,
+                scale,
+                crop_rect,
+                moving_surface_rect,
+                push,
+            );
         };
 
         let surface = self.surface.wl_surface();
@@ -586,6 +595,9 @@ impl MappedLayer {
         let xray_pos = xray_pos.offset(close_state.offset);
         let crop_rect =
             close_state.edge_reveal_crop_rect(base_location, self.block_out_buffer.size(), scale);
+        let moving_surface_rect = crop_rect.map(|_| {
+            Rectangle::new(location, self.block_out_buffer.size()).to_physical_precise_round(scale)
+        });
         let anchor = self.surface.cached_state().anchor;
         let origin = close_state.should_wrap().then(|| {
             close_animation_origin(
@@ -626,10 +638,11 @@ impl MappedLayer {
                         ),
                         scale,
                         crop_rect,
+                        moving_surface_rect,
                         push,
                     );
                 } else {
-                    push_close_effect_element(elem, scale, crop_rect, push);
+                    push_close_effect_element(elem, scale, crop_rect, moving_surface_rect, push);
                 }
             },
         );
@@ -655,10 +668,11 @@ impl MappedLayer {
                     ),
                     scale,
                     crop_rect,
+                    moving_surface_rect,
                     push,
                 );
             } else {
-                push_close_effect_element(elem, scale, crop_rect, push);
+                push_close_effect_element(elem, scale, crop_rect, moving_surface_rect, push);
             }
         });
 
@@ -690,10 +704,11 @@ impl MappedLayer {
                         ),
                         scale,
                         crop_rect,
+                        moving_surface_rect,
                         push,
                     );
                 } else {
-                    push_close_effect_element(elem, scale, crop_rect, push);
+                    push_close_effect_element(elem, scale, crop_rect, moving_surface_rect, push);
                 }
             },
         );
@@ -914,6 +929,7 @@ fn push_opening_element<R: NiriRenderer>(
     )>,
     scale: Scale<f64>,
     crop_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
+    moving_surface_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
     push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
 ) {
     if let Some((state, origin, offset)) = open_origin.filter(|(state, _, _)| state.should_wrap()) {
@@ -938,6 +954,7 @@ fn push_opening_element<R: NiriRenderer>(
             }
         }
         LayerSurfaceRenderElement::Shadow(elem) => {
+            let crop_rect = shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale));
             if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
                 push(elem.into());
             }
@@ -948,6 +965,12 @@ fn push_opening_element<R: NiriRenderer>(
             }
         }
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
+            let crop_rect = match &elem {
+                TahoeGlassElement::Shadow(_) => {
+                    shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale))
+                }
+                _ => crop_rect,
+            };
             if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
                 push(elem.into());
             }
@@ -960,6 +983,7 @@ fn push_close_effect_element<R: NiriRenderer>(
     elem: LayerSurfaceRenderElement<R>,
     scale: Scale<f64>,
     crop_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
+    moving_surface_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
     push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
 ) {
     let Some(crop_rect) = crop_rect else {
@@ -969,6 +993,7 @@ fn push_close_effect_element<R: NiriRenderer>(
 
     match elem {
         LayerSurfaceRenderElement::Shadow(elem) => {
+            let crop_rect = shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale));
             if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
                 push(elem.into());
             }
@@ -979,11 +1004,97 @@ fn push_close_effect_element<R: NiriRenderer>(
             }
         }
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
+            let crop_rect = match &elem {
+                TahoeGlassElement::Shadow(_) => {
+                    shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale))
+                }
+                _ => crop_rect,
+            };
             if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
                 push(elem.into());
             }
         }
         elem => push(elem),
+    }
+}
+
+fn shadow_crop_rect(
+    crop_rect: Rectangle<i32, Physical>,
+    moving_surface_rect: Option<Rectangle<i32, Physical>>,
+    shadow_geo: Rectangle<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    let Some(moving_surface_rect) = moving_surface_rect else {
+        return crop_rect;
+    };
+
+    let left = (i64::from(moving_surface_rect.loc.x) - i64::from(shadow_geo.loc.x)).max(0);
+    let top = (i64::from(moving_surface_rect.loc.y) - i64::from(shadow_geo.loc.y)).max(0);
+    let right = (rect_max_x(shadow_geo) - rect_max_x(moving_surface_rect)).max(0);
+    let bottom = (rect_max_y(shadow_geo) - rect_max_y(moving_surface_rect)).max(0);
+
+    expand_rect_i32(crop_rect, left, top, right, bottom)
+}
+
+fn rect_max_x(rect: Rectangle<i32, Physical>) -> i64 {
+    i64::from(rect.loc.x) + i64::from(rect.size.w)
+}
+
+fn rect_max_y(rect: Rectangle<i32, Physical>) -> i64 {
+    i64::from(rect.loc.y) + i64::from(rect.size.h)
+}
+
+fn expand_rect_i32(
+    rect: Rectangle<i32, Physical>,
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+) -> Rectangle<i32, Physical> {
+    let min_x = i64::from(rect.loc.x) - left;
+    let min_y = i64::from(rect.loc.y) - top;
+    let max_x = rect_max_x(rect) + right;
+    let max_y = rect_max_y(rect) + bottom;
+
+    let loc = Point::from((clamp_i64_to_i32(min_x), clamp_i64_to_i32(min_y)));
+    let size = Size::from((
+        clamp_i64_to_i32((max_x - min_x).max(0)),
+        clamp_i64_to_i32((max_y - min_y).max(0)),
+    ));
+
+    Rectangle::new(loc, size)
+}
+
+fn clamp_i64_to_i32(value: i64) -> i32 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadow_crop_rect_expands_by_shadow_excess() {
+        let crop = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let moving_surface = Rectangle::new(Point::from((100, 40)), Size::from((200, 100)));
+        let shadow = Rectangle::new(Point::from((88, 22)), Size::from((238, 146)));
+
+        let expanded = shadow_crop_rect(crop, Some(moving_surface), shadow);
+
+        assert_eq!(
+            expanded,
+            Rectangle::new(Point::from((88, 82)), Size::from((238, 146)))
+        );
+    }
+
+    #[test]
+    fn shadow_crop_rect_keeps_content_crop_without_shadow_excess() {
+        let crop = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let moving_surface = Rectangle::new(Point::from((100, 40)), Size::from((200, 100)));
+        let shadow = Rectangle::new(Point::from((120, 60)), Size::from((80, 40)));
+
+        let expanded = shadow_crop_rect(crop, Some(moving_surface), shadow);
+
+        assert_eq!(expanded, crop);
     }
 }
 
