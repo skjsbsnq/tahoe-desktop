@@ -6,7 +6,7 @@ use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
 use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
+    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::Color32F;
@@ -83,6 +83,12 @@ pub struct XrayElement {
     alpha: f32,
     bg_color: Color32F,
     program: Option<GlesTexProgram>,
+}
+
+#[derive(Debug, Default)]
+struct XrayElementCache {
+    /// Reusable storage for subregion-filtered damage rects.
+    filtered_damage: Vec<Rectangle<i32, Physical>>,
 }
 
 impl Xray {
@@ -286,6 +292,31 @@ impl XrayElement {
             Uniform::new("lens_depth", self.glass.lens_depth),
         ]
     }
+
+    fn draw_texture(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        texture: &GlesTexture,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        let uniforms = self.program.is_some().then(|| self.compute_uniforms());
+        let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
+
+        frame.render_texture_from_to(
+            texture,
+            src,
+            dst,
+            damage,
+            // FIXME: opaque regions need to be filtered like damage.
+            &[],
+            Transform::Normal,
+            self.alpha,
+            self.program.as_ref(),
+            uniforms,
+        )
+    }
 }
 
 impl Element for XrayElement {
@@ -320,7 +351,7 @@ impl RenderElement<GlesRenderer> for XrayElement {
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
-        _cache: Option<&UserDataMap>,
+        cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
         let mut buffer = self.buffer.borrow_mut();
         let texture = match buffer.render(frame, self.blur) {
@@ -331,45 +362,43 @@ impl RenderElement<GlesRenderer> for XrayElement {
             }
         };
 
-        // FIXME: avoid reallocating a fresh Vec here somehow.
-        let mut filtered_damage = Vec::new();
-        let damage = if let Some(subregion) = &self.subregion {
-            let src_to_geo = self.geometry.size / self.src.size;
-
-            // Compute crop in geometry coordinates.
-            let mut crop = src;
-            crop.loc -= self.src.loc;
-            crop = crop.upscale(src_to_geo);
-            let mut crop = crop.to_logical(1., Transform::Normal, &Size::default());
-
-            // Then convert to subregion coordinates.
-            crop.loc += self.geometry.loc;
-
-            subregion.filter_damage(crop, dst, damage, &mut filtered_damage);
-
-            if filtered_damage.is_empty() {
-                return Ok(());
-            }
-            &filtered_damage[..]
-        } else {
-            damage
+        let Some(subregion) = &self.subregion else {
+            return self.draw_texture(frame, &texture, src, dst, damage);
         };
 
-        let uniforms = self.program.is_some().then(|| self.compute_uniforms());
-        let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
+        let mut filter_damage =
+            |filtered_damage: &mut Vec<Rectangle<i32, Physical>>| -> Result<(), GlesError> {
+                let src_to_geo = self.geometry.size / self.src.size;
 
-        frame.render_texture_from_to(
-            &texture,
-            src,
-            dst,
-            damage,
-            // FIXME: opaque regions need to be filtered like damage.
-            &[],
-            Transform::Normal,
-            self.alpha,
-            self.program.as_ref(),
-            uniforms,
-        )
+                // Compute crop in geometry coordinates.
+                let mut crop = src;
+                crop.loc -= self.src.loc;
+                crop = crop.upscale(src_to_geo);
+                let mut crop = crop.to_logical(1., Transform::Normal, &Size::default());
+
+                // Then convert to subregion coordinates.
+                crop.loc += self.geometry.loc;
+
+                filtered_damage.clear();
+                subregion.filter_damage(crop, dst, damage, filtered_damage);
+
+                if filtered_damage.is_empty() {
+                    return Ok(());
+                }
+
+                self.draw_texture(frame, &texture, src, dst, filtered_damage)
+            };
+
+        if let Some(cache) = cache {
+            let storage = cache.get_or_insert::<RefCell<XrayElementCache>, _>(|| {
+                RefCell::new(XrayElementCache::default())
+            });
+            let mut storage = storage.borrow_mut();
+            filter_damage(&mut storage.filtered_damage)
+        } else {
+            let mut filtered_damage = Vec::with_capacity(damage.len());
+            filter_damage(&mut filtered_damage)
+        }
     }
 }
 

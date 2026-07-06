@@ -177,6 +177,8 @@ fn render_regions_for_layer(
     regions: Arc<Vec<TahoeGlassRegion>>,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
+    let _span = tracy_client::span!("TahoeGlass::render_regions_for_layer");
+
     if !config.namespace_allowed(namespace) {
         return false;
     }
@@ -185,6 +187,15 @@ fn render_regions_for_layer(
         if regions.is_empty() {
             return false;
         }
+
+        let region_count = regions.len();
+        let total_area: i64 = regions.iter().map(region_area).sum();
+        trace!(
+            namespace,
+            region_count,
+            total_area,
+            "rendering Tahoe glass regions"
+        );
 
         let renderer = SurfaceTahoeGlassRenderer::get(states);
         let mut renderer = renderer.0.lock().unwrap();
@@ -239,6 +250,8 @@ fn render_region(
     xray_pos: XrayPos,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) {
+    let _span = tracy_client::span!("TahoeGlass::render_region");
+
     let rect = region.rect.to_f64();
     let geometry = Rectangle::new(surface_location + rect.loc, rect.size);
     let material_alpha = region.material_alpha.clamp(0., 1.) * layer_alpha.clamp(0., 1.);
@@ -275,6 +288,15 @@ fn render_region(
 
     let sample_padding = glass_sample_padding(region, effect, blur_config);
     let sample_geometry = expand_rect(geometry, sample_padding);
+    trace!(
+        material = %region.material,
+        area = region_area(region),
+        sample_padding,
+        blur = region.flags.blur,
+        clip = region.flags.clip,
+        material_alpha,
+        "rendering Tahoe glass region"
+    );
 
     renderer.background_effect.update_config(blur_config);
     renderer
@@ -312,6 +334,10 @@ fn render_region(
             .shadow
             .render(ctx.renderer, geometry.loc, &mut |elem| push(elem.into()));
     }
+}
+
+fn region_area(region: &TahoeGlassRegion) -> i64 {
+    i64::from(region.rect.size.w.max(0)) * i64::from(region.rect.size.h.max(0))
 }
 
 fn glass_sample_padding(

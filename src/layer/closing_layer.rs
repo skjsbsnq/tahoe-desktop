@@ -272,9 +272,8 @@ impl ClosingLayer {
         };
         let scale = self.start_scale + (target_scale - self.start_scale) * transform_progress;
         let target_offset = match config.style {
-            // slide is a full-surface translation. edge-reveal currently reuses the
-            // same offset primitive with shorter configured distances, preserving a
-            // separate style hook for later clipped reveal rendering.
+            // slide uses the configured distance. edge-reveal uses the layer
+            // surface extent so close fully retracts the surface.
             niri_config::animations::LayerCloseAnimationStyle::Slide => {
                 edge_offset(config.edge, config.distance)
             }

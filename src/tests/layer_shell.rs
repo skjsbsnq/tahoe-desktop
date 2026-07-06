@@ -551,6 +551,131 @@ fn layer_close_animation_is_cancelled_on_reopen() {
 }
 
 #[test]
+fn layer_animation_fast_toggle_settles_without_residual_snapshots() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-open {
+                    style "edge-reveal"
+                    edge "top"
+                    opacity-from 0.8
+                    transform-duration-ms 120
+                    transform-curve "linear"
+                    opacity-duration-ms 80
+                    opacity-curve "linear"
+                }
+                layer-close {
+                    style "edge-reveal"
+                    edge "top"
+                    opacity-to 0.45
+                    transform-duration-ms 120
+                    transform-curve "linear"
+                    opacity-duration-ms 80
+                    opacity-curve "linear"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    freeze_layer_animation_clock(&mut f);
+    let surface = map_layer(&mut f, id, "animated-layer");
+    let (layer_open, layer_close, _) = resolved_layer_animation_rules(&mut f, "animated-layer");
+    assert_eq!(
+        layer_open.unwrap().transform_anim,
+        easing_anim(120, Curve::Linear)
+    );
+    assert_eq!(
+        layer_open.unwrap().opacity_anim,
+        easing_anim(80, Curve::Linear)
+    );
+    assert_eq!(
+        layer_close.unwrap().transform_anim,
+        easing_anim(120, Curve::Linear)
+    );
+    assert_eq!(
+        layer_close.unwrap().opacity_anim,
+        easing_anim(80, Curve::Linear)
+    );
+
+    for _ in 0..10 {
+        advance_layer_animations(&mut f, Duration::from_millis(20));
+        freeze_layer_animation_clock(&mut f);
+        unmap_layer(&mut f, id, &surface);
+        assert_eq!(f.niri().closing_layers.len(), 1);
+
+        advance_layer_animations(&mut f, Duration::from_millis(20));
+        assert_eq!(f.niri().closing_layers.len(), 1);
+
+        freeze_layer_animation_clock(&mut f);
+        remap_layer(&mut f, id, &surface);
+        assert!(f
+            .niri()
+            .mapped_layer_surfaces
+            .values()
+            .any(|mapped| mapped.surface().namespace() == "animated-layer"));
+        assert!(f.niri().closing_layers.is_empty());
+    }
+
+    advance_layer_animations(&mut f, Duration::from_millis(140));
+    let (_, _, animations_ongoing) = resolved_layer_animation_rules(&mut f, "animated-layer");
+    assert!(!animations_ongoing);
+    assert!(f.niri().closing_layers.is_empty());
+
+    freeze_layer_animation_clock(&mut f);
+    unmap_layer(&mut f, id, &surface);
+    assert_eq!(f.niri().closing_layers.len(), 1);
+    advance_layer_animations(&mut f, Duration::from_millis(140));
+    assert!(f.niri().closing_layers.is_empty());
+}
+
+#[test]
+fn layer_close_snapshot_releases_one_frame_after_duration() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-close {
+                    style "fade"
+                    opacity-to 0
+                    transform-duration-ms 120
+                    transform-curve "linear"
+                    opacity-duration-ms 120
+                    opacity-curve "linear"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    freeze_layer_animation_clock(&mut f);
+    let surface = map_layer(&mut f, id, "animated-layer");
+    freeze_layer_animation_clock(&mut f);
+    unmap_layer(&mut f, id, &surface);
+    assert_eq!(f.niri().closing_layers.len(), 1);
+
+    advance_layer_animations(&mut f, Duration::from_millis(140));
+    assert!(f.niri().closing_layers.is_empty());
+}
+
+#[test]
 fn layer_close_animation_interrupted_open_starts_from_current_visual_state() {
     let config = Config::parse_mem(
         r#"
@@ -1078,10 +1203,27 @@ fn resolved_layer_animation_rules(
 }
 
 fn advance_layer_animations(f: &mut Fixture, elapsed: Duration) {
+    let now = f.niri().clock.now();
+    set_layer_animation_time(f, now + elapsed);
+    f.niri().advance_animations();
+}
+
+fn freeze_layer_animation_clock(f: &mut Fixture) {
+    let now = f.niri().clock.now();
+    set_layer_animation_time(f, now);
+}
+
+fn set_layer_animation_time(f: &mut Fixture, time: Duration) {
     let niri = f.niri();
-    let now = niri.clock.now_unadjusted();
-    niri.clock.set_unadjusted(now + elapsed);
-    niri.advance_animations();
+    let now = niri.clock.now();
+    niri.clock.set_unadjusted(now);
+    let _ = niri.clock.now();
+    niri.clock.set_unadjusted(Duration::ZERO);
+    niri.clock.set_rate(1.0);
+    let _ = niri.clock.now();
+    niri.clock.set_unadjusted(time);
+    let _ = niri.clock.now();
+    niri.clock.set_rate(0.0);
 }
 
 fn easing_anim(duration_ms: u32, curve: Curve) -> Animation {
