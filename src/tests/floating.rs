@@ -508,6 +508,51 @@ fn interactive_move_unmaximize_to_floating_restores_size() {
 }
 
 #[test]
+fn interactive_move_top_snap_maximizes_floating_window() {
+    let config = r##"
+layout {
+    snap-assist {
+        on
+    }
+}
+"##;
+    let config = Config::parse_mem(config).unwrap();
+    let (mut f, id, surface) = set_up_with_config(config);
+
+    f.niri().layout.toggle_window_floating(None);
+    f.double_roundtrip(id);
+
+    // Change size while we're floating and commit.
+    let window = f.client(id).window(&surface);
+    window.set_size(200, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    let output = f.niri_output(1);
+    let niri = f.niri();
+    let mapped = niri.layout.windows().next().unwrap().1;
+    let window_id = mapped.window.clone();
+
+    niri.layout
+        .interactive_move_begin(window_id.clone(), &output, Point::default());
+    niri.layout.interactive_move_update(
+        &window_id,
+        Point::from((0., -1000.)),
+        output,
+        Point::from((500., 0.)),
+    );
+    niri.layout.interactive_move_end(&window_id);
+    f.double_roundtrip(id);
+
+    assert_snapshot!(
+        f.client(id).window(&surface).format_recent_configures(),
+        @"size: 1920 × 1080, bounds: 1888 × 1048, states: [Activated, Maximized]"
+    );
+}
+
+#[test]
 fn resize_during_interactive_move_propagates_to_floating() {
     let (mut f, id, surface) = set_up();
 

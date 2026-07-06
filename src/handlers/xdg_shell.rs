@@ -417,9 +417,8 @@ impl XdgShellHandler for State {
             mapped.set_needs_configure();
 
             let window = mapped.window.clone();
-            if self.niri.layout.snap_window_to_working_area(&window, true) {
-                self.niri.queue_redraw_all();
-            }
+            self.niri.layout.set_maximized(&window, true);
+            self.niri.queue_redraw_all();
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {

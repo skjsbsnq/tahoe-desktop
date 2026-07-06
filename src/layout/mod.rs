@@ -4663,119 +4663,152 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 };
 
-                let position = if snap_target.is_some() {
-                    InsertPosition::Floating
+                if snap_target.is_some_and(|target| target.edge == SnapEdge::Top) {
+                    let ws_id = mon.workspaces[ws_idx].id();
+                    mon.add_tile(
+                        move_.tile,
+                        MonitorAddWindowTarget::Workspace {
+                            id: ws_id,
+                            column_idx: None,
+                        },
+                        ActivateWindow::Yes,
+                        allow_to_activate_workspace,
+                        move_.width,
+                        move_.is_full_width,
+                        false,
+                    );
+
+                    if let Some(ws) = mon.workspaces.iter_mut().find(|ws| ws.has_window(&win_id)) {
+                        ws.set_maximized(&win_id, true);
+                        if let Some(tile) =
+                            ws.tiles_mut().find(|tile| tile.window().id() == &win_id)
+                        {
+                            tile.restore_to_floating = move_.is_floating;
+                        }
+                    } else {
+                        error!("workspace missing window after top snap maximize insertion");
+                    }
                 } else {
-                    position
-                };
+                    let position = if snap_target.is_some() {
+                        InsertPosition::Floating
+                    } else {
+                        position
+                    };
 
-                match position {
-                    InsertPosition::NewColumn(column_idx) => {
-                        let ws_id = mon.workspaces[ws_idx].id();
-                        mon.add_tile(
-                            move_.tile,
-                            MonitorAddWindowTarget::Workspace {
-                                id: ws_id,
-                                column_idx: Some(column_idx),
-                            },
-                            ActivateWindow::Yes,
-                            allow_to_activate_workspace,
-                            move_.width,
-                            move_.is_full_width,
-                            false,
-                        );
-                    }
-                    InsertPosition::InColumn(column_idx, tile_idx) => {
-                        mon.add_tile_to_column(
-                            ws_idx,
-                            column_idx,
-                            Some(tile_idx),
-                            move_.tile,
-                            true,
-                            allow_to_activate_workspace,
-                        );
-                    }
-                    InsertPosition::Floating => {
-                        let tile_render_loc = move_.tile_render_location(zoom);
+                    match position {
+                        InsertPosition::NewColumn(column_idx) => {
+                            let ws_id = mon.workspaces[ws_idx].id();
+                            mon.add_tile(
+                                move_.tile,
+                                MonitorAddWindowTarget::Workspace {
+                                    id: ws_id,
+                                    column_idx: Some(column_idx),
+                                },
+                                ActivateWindow::Yes,
+                                allow_to_activate_workspace,
+                                move_.width,
+                                move_.is_full_width,
+                                false,
+                            );
+                        }
+                        InsertPosition::InColumn(column_idx, tile_idx) => {
+                            mon.add_tile_to_column(
+                                ws_idx,
+                                column_idx,
+                                Some(tile_idx),
+                                move_.tile,
+                                true,
+                                allow_to_activate_workspace,
+                            );
+                        }
+                        InsertPosition::Floating => {
+                            let tile_render_loc = move_.tile_render_location(zoom);
 
-                        let mut tile = move_.tile;
-                        tile.floating_pos = None;
+                            let mut tile = move_.tile;
+                            tile.floating_pos = None;
 
-                        if let Some(snap_target) = snap_target {
-                            let restore_size = tile.snap_restore_window_size.unwrap_or_else(|| {
-                                tile.window()
-                                    .expected_size()
-                                    .unwrap_or_else(|| tile.window().size())
-                            });
-                            tile.snap_restore_window_size = Some(restore_size);
+                            if let Some(snap_target) = snap_target {
+                                let restore_size =
+                                    tile.snap_restore_window_size.unwrap_or_else(|| {
+                                        tile.window()
+                                            .expected_size()
+                                            .unwrap_or_else(|| tile.window().size())
+                                    });
+                                tile.snap_restore_window_size = Some(restore_size);
 
-                            let mut win_size = Size::from((
-                                tile.window_width_for_tile_width(snap_target.rect.size.w)
-                                    .round()
-                                    .clamp(1., 100000.) as i32,
-                                tile.window_height_for_tile_height(snap_target.rect.size.h)
-                                    .round()
-                                    .clamp(1., 100000.) as i32,
-                            ));
-                            let win = tile.window_mut();
-                            let min_size = win.min_size();
-                            let max_size = win.max_size();
-                            win_size.w = ensure_min_max_size(win_size.w, min_size.w, max_size.w);
-                            win_size.h = ensure_min_max_size(win_size.h, min_size.h, max_size.h);
-                            win.request_size_once(win_size, true);
-                            tile.floating_window_size = Some(win_size);
+                                let mut win_size = Size::from((
+                                    tile.window_width_for_tile_width(snap_target.rect.size.w)
+                                        .round()
+                                        .clamp(1., 100000.)
+                                        as i32,
+                                    tile.window_height_for_tile_height(snap_target.rect.size.h)
+                                        .round()
+                                        .clamp(1., 100000.)
+                                        as i32,
+                                ));
+                                let win = tile.window_mut();
+                                let min_size = win.min_size();
+                                let max_size = win.max_size();
+                                win_size.w =
+                                    ensure_min_max_size(win_size.w, min_size.w, max_size.w);
+                                win_size.h =
+                                    ensure_min_max_size(win_size.h, min_size.h, max_size.h);
+                                win.request_size_once(win_size, true);
+                                tile.floating_window_size = Some(win_size);
 
-                            if let Some(offset) = offset {
-                                let pos = (snap_target.rect.loc - offset).downscale(zoom);
-                                let pos = mon.workspaces[ws_idx].floating_logical_to_size_frac(pos);
-                                tile.floating_pos = Some(pos);
+                                if let Some(offset) = offset {
+                                    let pos = (snap_target.rect.loc - offset).downscale(zoom);
+                                    let pos =
+                                        mon.workspaces[ws_idx].floating_logical_to_size_frac(pos);
+                                    tile.floating_pos = Some(pos);
+                                } else {
+                                    error!(
+                                        "offset unset for inserting a snapped floating tile \
+                                         to existing workspace"
+                                    );
+                                }
                             } else {
-                                error!(
-                                    "offset unset for inserting a snapped floating tile \
-                                     to existing workspace"
-                                );
-                            }
-                        } else {
-                            match insert_ws {
-                                InsertWorkspace::Existing(_) => {
-                                    if let Some(offset) = offset {
-                                        let pos = (tile_render_loc - offset).downscale(zoom);
-                                        let pos = mon.workspaces[ws_idx]
-                                            .floating_logical_to_size_frac(pos);
-                                        tile.floating_pos = Some(pos);
-                                    } else {
-                                        error!(
-                                            "offset unset for inserting a floating tile \
-                                             to existing workspace"
-                                        );
+                                match insert_ws {
+                                    InsertWorkspace::Existing(_) => {
+                                        if let Some(offset) = offset {
+                                            let pos = (tile_render_loc - offset).downscale(zoom);
+                                            let pos = mon.workspaces[ws_idx]
+                                                .floating_logical_to_size_frac(pos);
+                                            tile.floating_pos = Some(pos);
+                                        } else {
+                                            error!(
+                                                "offset unset for inserting a floating tile \
+                                                 to existing workspace"
+                                            );
+                                        }
+                                    }
+                                    InsertWorkspace::NewAt(_) => {
+                                        // When putting a floating tile on a new workspace, we don't
+                                        // really have a good pre-existing position.
                                     }
                                 }
-                                InsertWorkspace::NewAt(_) => {
-                                    // When putting a floating tile on a new workspace, we don't
-                                    // really have a good pre-existing position.
+
+                                // Set the floating size so it takes into account any window resizing
+                                // that took place during the move.
+                                if let Some(size) = tile.window().expected_size() {
+                                    tile.floating_window_size = Some(size);
                                 }
                             }
 
-                            // Set the floating size so it takes into account any window resizing
-                            // that took place during the move.
-                            if let Some(size) = tile.window().expected_size() {
-                                tile.floating_window_size = Some(size);
-                            }
+                            let ws_id = mon.workspaces[ws_idx].id();
+                            mon.add_tile(
+                                tile,
+                                MonitorAddWindowTarget::Workspace {
+                                    id: ws_id,
+                                    column_idx: None,
+                                },
+                                ActivateWindow::Yes,
+                                allow_to_activate_workspace,
+                                move_.width,
+                                move_.is_full_width,
+                                true,
+                            );
                         }
-
-                        let ws_id = mon.workspaces[ws_idx].id();
-                        mon.add_tile(
-                            tile,
-                            MonitorAddWindowTarget::Workspace {
-                                id: ws_id,
-                                column_idx: None,
-                            },
-                            ActivateWindow::Yes,
-                            allow_to_activate_workspace,
-                            move_.width,
-                            move_.is_full_width,
-                            true,
-                        );
                     }
                 }
 
