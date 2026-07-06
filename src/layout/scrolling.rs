@@ -3296,6 +3296,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .is_fullscreen()
     }
 
+    pub fn active_window_covers_floating(&self) -> bool {
+        if self.columns.is_empty() {
+            return false;
+        }
+
+        if !self.view_offset.is_static() {
+            return false;
+        }
+
+        let mode = self.columns[self.active_column_idx].sizing_mode();
+        mode.is_fullscreen() || mode.is_maximized()
+    }
+
     pub fn render<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,

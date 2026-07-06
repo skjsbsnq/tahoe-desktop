@@ -3760,6 +3760,45 @@ fn move_column_to_workspace_focus_false_on_floating_window() {
 }
 
 #[test]
+fn active_maximized_window_covers_floating_layer() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams {
+                is_floating: true,
+                ..TestWindowParams::new(2)
+            },
+        },
+        Op::MoveFloatingWindow {
+            id: Some(2),
+            x: PositionChange::SetFixed(0.),
+            y: PositionChange::SetFixed(0.),
+            animate: false,
+        },
+        Op::MaximizeWindowToEdges { id: Some(1) },
+        Op::Communicate(1),
+        Op::CompleteAnimations,
+    ];
+
+    let mut layout = check_ops(ops);
+    let output = layout.outputs().next().unwrap().clone();
+    let pos = Point::from((50., 50.));
+
+    let (win, _) = layout.window_under(&output, pos).unwrap();
+    assert_eq!(*win.id(), 2);
+
+    layout.activate_window(&1);
+    layout.verify_invariants();
+
+    assert!(!layout.active_workspace().unwrap().is_floating_visible());
+    let (win, _) = layout.window_under(&output, pos).unwrap();
+    assert_eq!(*win.id(), 1);
+}
+
+#[test]
 fn restore_to_floating_persists_across_fullscreen_maximize() {
     let ops = [
         Op::AddOutput(1),

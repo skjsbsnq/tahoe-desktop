@@ -492,12 +492,8 @@ fn interactive_move_unmaximize_to_floating_restores_size() {
     let window = mapped.window.clone();
     niri.layout
         .interactive_move_begin(window.clone(), &output, Point::default());
-    niri.layout.interactive_move_update(
-        &window,
-        Point::from((1000., 0.)),
-        output,
-        Point::default(),
-    );
+    niri.layout
+        .interactive_move_update(&window, Point::from((1., 0.)), output, Point::default());
     f.double_roundtrip(id);
 
     // This should request the stored floating size (200 × 200).
@@ -505,6 +501,10 @@ fn interactive_move_unmaximize_to_floating_restores_size() {
         f.client(id).window(&surface).format_recent_configures(),
         @"size: 200 × 200, bounds: 1920 × 1080, states: [Activated]"
     );
+
+    let niri = f.niri();
+    niri.layout.interactive_move_end(&window);
+    assert!(niri.layout.active_workspace().unwrap().is_floating(&window));
 }
 
 #[test]

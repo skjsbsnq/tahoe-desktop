@@ -665,6 +665,10 @@ impl<W: LayoutElement> InteractiveMoveData<W> {
     }
 }
 
+fn interactive_move_treat_as_floating<W: LayoutElement>(is_floating: bool, tile: &Tile<W>) -> bool {
+    is_floating || (tile.restore_to_floating && tile.window().pending_sizing_mode().is_maximized())
+}
+
 impl SnapPreviewState {
     fn new(clock: Clock) -> Self {
         Self {
@@ -4226,6 +4230,7 @@ impl<W: LayoutElement> Layout<W> {
             .tiles_with_render_positions()
             .find(|(tile, _, _)| tile.window().id() == &window_id)
             .unwrap();
+        let treat_as_floating = interactive_move_treat_as_floating(is_floating, tile);
         let window_offset = tile.window_loc();
 
         let tile_pos = ws_geo.loc + tile_offset.upscale(zoom);
@@ -4249,7 +4254,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         // Lock the view for scrolling interactive move.
-        if !is_floating {
+        if !treat_as_floating {
             for ws in self.workspaces_mut() {
                 ws.dnd_scroll_gesture_begin();
             }
@@ -4298,18 +4303,19 @@ impl<W: LayoutElement> Layout<W> {
                 }
                 .band(sq_dist / INTERACTIVE_MOVE_START_THRESHOLD);
 
-                let (is_floating, tile, workspace_config) = self
+                let (treat_as_floating, tile, workspace_config) = self
                     .workspaces_mut()
                     .find(|ws| ws.has_window(&window_id))
                     .map(|ws| {
                         let workspace_config = ws.layout_config().cloned().map(|c| (ws.id(), c));
-                        (
-                            ws.is_floating(&window_id),
-                            ws.tiles_mut()
-                                .find(|tile| *tile.window().id() == window_id)
-                                .unwrap(),
-                            workspace_config,
-                        )
+                        let is_floating = ws.is_floating(&window_id);
+                        let tile = ws
+                            .tiles_mut()
+                            .find(|tile| *tile.window().id() == window_id)
+                            .unwrap();
+                        let treat_as_floating =
+                            interactive_move_treat_as_floating(is_floating, tile);
+                        (treat_as_floating, tile, workspace_config)
                     })
                     .unwrap();
                 tile.interactive_move_offset = pointer_delta.upscale(factor);
@@ -4321,7 +4327,7 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                 });
 
-                if !is_floating && sq_dist < INTERACTIVE_MOVE_START_THRESHOLD {
+                if !treat_as_floating && sq_dist < INTERACTIVE_MOVE_START_THRESHOLD {
                     return true;
                 }
 
