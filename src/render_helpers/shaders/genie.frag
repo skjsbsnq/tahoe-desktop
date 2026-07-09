@@ -7,8 +7,24 @@ vec4 genie_color(vec2 output_pos) {
     float progress = clamp(niri_clamped_progress, 0.0, 1.0);
     float morph = niri_direction > 0.0 ? progress : 1.0 - progress;
 
-    float top_progress = pow(morph, 1.45);
-    float bottom_progress = 1.0 - pow(1.0 - morph, 2.05);
+    // T04 two-phase suck-in. Phase 1 (morph 0..0.4): the target-side (bottom)
+    // edge stretches toward the target and docks — "pulling the tail" — while
+    // the far (top) edge barely creeps. Phase 2 (0.4..1.0): the whole body
+    // flows into the target. Both phase curves meet with zero slope at the
+    // 0.4 boundary, so there is no visible kink. On restore, morph runs
+    // 1 -> 0 and the phases play in reverse order: the body pours out first
+    // and the tail detaches from the icon last.
+    float tail = clamp(morph / 0.4, 0.0, 1.0);
+    float flow = clamp((morph - 0.4) / 0.6, 0.0, 1.0);
+    float tail_ease = 1.0 - pow(1.0 - tail, 2.3);
+    float flow_ease = flow * flow * (3.0 - 2.0 * flow);
+    float lag_creep = tail * tail * (3.0 - 2.0 * tail);
+
+    // Lead edge (bottom, target side) docks 62% of its travel in phase 1;
+    // the lag edge (top) creeps only 12%. Peak lead/lag gap is ~0.50 of the
+    // travel (was ~0.39 with the old single-phase power curves).
+    float bottom_progress = 0.62 * tail_ease + 0.38 * flow_ease;
+    float top_progress = 0.12 * lag_creep + 0.88 * flow_ease;
     float settle = smoothstep(0.62, 1.0, morph);
 
     float window_top = window_pos.y;
@@ -62,6 +78,8 @@ vec4 genie_color(vec2 output_pos) {
     }
 
     vec4 color = texture2D(niri_tex, tex_coords);
-    float end_fade = 1.0 - smoothstep(0.82, 1.0, morph);
+    // End fade over the last 8% of the morph (was 18%): the shape stays
+    // readable almost all the way into the icon, then vanishes quickly.
+    float end_fade = 1.0 - smoothstep(0.92, 1.0, morph);
     return color * end_fade;
 }

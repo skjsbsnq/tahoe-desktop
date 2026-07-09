@@ -766,7 +766,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         if minimized {
             if let Some(mut restore) = self.take_restore_animation(id) {
                 restore.reverse_to_minimize(
-                    self.options.animations.window_close.anim,
+                    self.options.animations.window_minimize_anim(),
                     _animation_rect.map(|rect| rect.rect.to_f64()),
                 );
                 self.minimize_animations
@@ -803,7 +803,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
             if let Some(restore) = &mut restore {
                 restore.reverse_to_restore(
-                    self.options.animations.window_open.anim,
+                    self.options.animations.window_restore_anim(),
                     _animation_rect.map(|rect| rect.rect.to_f64()),
                 );
             }
@@ -819,7 +819,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
                     1.,
                     1.,
                     1.,
-                    self.options.animations.window_open.anim,
+                    self.options.animations.window_restore_anim(),
                     false,
                 );
             }
@@ -1012,7 +1012,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             0.,
             1.,
             0.,
-            self.options.animations.window_close.anim,
+            self.options.animations.window_minimize_anim(),
         );
 
         let scale = Scale::from(self.scale);
@@ -1047,7 +1047,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             0.,
             1.,
             0.,
-            self.options.animations.window_open.anim,
+            self.options.animations.window_restore_anim(),
         );
 
         let scale = Scale::from(self.scale);

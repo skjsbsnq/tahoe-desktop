@@ -658,6 +658,85 @@ mod tests {
     }
 
     #[test]
+    fn parse_window_minimize_restore_nodes() {
+        // Nodes absent: genie timing inherits window-close/open (T02 finding:
+        // the historical behavior is bare inheritance, no duration floor).
+        let config = do_parse(
+            r#"
+            animations {
+                window-close {
+                    duration-ms 140
+                    curve "ease-out-quad"
+                }
+            }
+            "#,
+        );
+        let anims = &config.animations;
+        assert_eq!(anims.window_minimize, None);
+        assert_eq!(anims.window_restore, None);
+        assert_eq!(anims.window_minimize_anim(), anims.window_close.anim);
+        assert_eq!(anims.window_restore_anim(), anims.window_open.anim);
+
+        // Nodes present: dedicated timing decouples from window-close/open.
+        let config = do_parse(
+            r#"
+            animations {
+                window-minimize {
+                    duration-ms 420
+                    curve "cubic-bezier" 0.32 0 0.18 1
+                }
+                window-restore {
+                    duration-ms 360
+                    curve "emphasized-decel"
+                }
+            }
+            "#,
+        );
+        let anims = &config.animations;
+        assert_eq!(
+            anims.window_minimize_anim(),
+            Animation {
+                off: false,
+                kind: Kind::Easing(EasingParams {
+                    duration_ms: 420,
+                    curve: Curve::CubicBezier(0.32, 0., 0.18, 1.),
+                }),
+            }
+        );
+        assert_eq!(
+            anims.window_restore_anim(),
+            Animation {
+                off: false,
+                kind: Kind::Easing(EasingParams {
+                    duration_ms: 360,
+                    curve: Curve::CubicBezier(0.05, 0.7, 0.1, 1.),
+                }),
+            }
+        );
+        assert_ne!(anims.window_minimize_anim(), anims.window_close.anim);
+        assert_ne!(anims.window_restore_anim(), anims.window_open.anim);
+
+        // Empty nodes mirror the close/open defaults.
+        let config = do_parse(
+            r#"
+            animations {
+                window-minimize {}
+                window-restore {}
+            }
+            "#,
+        );
+        let anims = &config.animations;
+        assert_eq!(
+            anims.window_minimize_anim(),
+            crate::animations::WindowCloseAnim::default().anim
+        );
+        assert_eq!(
+            anims.window_restore_anim(),
+            crate::animations::WindowOpenAnim::default().anim
+        );
+    }
+
+    #[test]
     fn parse_layer_rule_animations() {
         let config = do_parse(
             r#"
@@ -1137,6 +1216,16 @@ mod tests {
 
                 window-close {
                     curve "cubic-bezier" 0.05 0.7 0.1 1
+                }
+
+                window-minimize {
+                    duration-ms 420
+                    curve "cubic-bezier" 0.32 0 0.18 1
+                }
+
+                window-restore {
+                    duration-ms 360
+                    curve "emphasized-decel"
                 }
 
                 recent-windows-close {
@@ -1844,6 +1933,42 @@ mod tests {
                     },
                     custom_shader: None,
                 },
+                window_minimize: Some(
+                    WindowMinimizeAnim(
+                        Animation {
+                            off: false,
+                            kind: Easing(
+                                EasingParams {
+                                    duration_ms: 420,
+                                    curve: CubicBezier(
+                                        0.32,
+                                        0.0,
+                                        0.18,
+                                        1.0,
+                                    ),
+                                },
+                            ),
+                        },
+                    ),
+                ),
+                window_restore: Some(
+                    WindowRestoreAnim(
+                        Animation {
+                            off: false,
+                            kind: Easing(
+                                EasingParams {
+                                    duration_ms: 360,
+                                    curve: CubicBezier(
+                                        0.05,
+                                        0.7,
+                                        0.1,
+                                        1.0,
+                                    ),
+                                },
+                            ),
+                        },
+                    ),
+                ),
                 horizontal_view_movement: HorizontalViewMovementAnim(
                     Animation {
                         off: false,

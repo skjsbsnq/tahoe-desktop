@@ -11,6 +11,8 @@ pub struct Animations {
     pub workspace_switch: WorkspaceSwitchAnim,
     pub window_open: WindowOpenAnim,
     pub window_close: WindowCloseAnim,
+    pub window_minimize: Option<WindowMinimizeAnim>,
+    pub window_restore: Option<WindowRestoreAnim>,
     pub horizontal_view_movement: HorizontalViewMovementAnim,
     pub window_movement: WindowMovementAnim,
     pub window_resize: WindowResizeAnim,
@@ -31,6 +33,8 @@ impl Default for Animations {
             window_movement: Default::default(),
             window_open: Default::default(),
             window_close: Default::default(),
+            window_minimize: None,
+            window_restore: None,
             window_resize: Default::default(),
             config_notification_open_close: Default::default(),
             exit_confirmation_open_close: Default::default(),
@@ -38,6 +42,25 @@ impl Default for Animations {
             overview_open_close: Default::default(),
             recent_windows_close: Default::default(),
         }
+    }
+}
+
+impl Animations {
+    /// Genie minimize timing: the dedicated `window-minimize` node when
+    /// configured, otherwise the window-close animation (the historical
+    /// coupling, kept as the default behavior).
+    pub fn window_minimize_anim(&self) -> Animation {
+        self.window_minimize
+            .map(|anim| anim.0)
+            .unwrap_or(self.window_close.anim)
+    }
+
+    /// Genie restore timing: the dedicated `window-restore` node when
+    /// configured, otherwise the window-open animation.
+    pub fn window_restore_anim(&self) -> Animation {
+        self.window_restore
+            .map(|anim| anim.0)
+            .unwrap_or(self.window_open.anim)
     }
 }
 
@@ -55,6 +78,10 @@ pub struct AnimationsPart {
     pub window_open: Option<WindowOpenAnim>,
     #[knuffel(child)]
     pub window_close: Option<WindowCloseAnim>,
+    #[knuffel(child)]
+    pub window_minimize: Option<WindowMinimizeAnim>,
+    #[knuffel(child)]
+    pub window_restore: Option<WindowRestoreAnim>,
     #[knuffel(child)]
     pub horizontal_view_movement: Option<HorizontalViewMovementAnim>,
     #[knuffel(child)]
@@ -98,6 +125,10 @@ impl MergeWith<AnimationsPart> for Animations {
             overview_open_close,
             recent_windows_close,
         );
+
+        // These two are optional on `Animations` itself (absent = inherit the
+        // window-close/open timing), so merge presence rather than values.
+        merge_clone_opt!((self, part), window_minimize, window_restore);
     }
 }
 
@@ -196,6 +227,30 @@ impl Default for WindowCloseAnim {
             },
             custom_shader: None,
         }
+    }
+}
+
+/// Dedicated genie minimize timing (T04). When the node is absent from the
+/// config, the minimize animation inherits `window-close` (see
+/// [`Animations::window_minimize_anim`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowMinimizeAnim(pub Animation);
+
+impl Default for WindowMinimizeAnim {
+    fn default() -> Self {
+        Self(WindowCloseAnim::default().anim)
+    }
+}
+
+/// Dedicated genie restore timing (T04). When the node is absent from the
+/// config, the restore animation inherits `window-open` (see
+/// [`Animations::window_restore_anim`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowRestoreAnim(pub Animation);
+
+impl Default for WindowRestoreAnim {
+    fn default() -> Self {
+        Self(WindowOpenAnim::default().anim)
     }
 }
 
@@ -534,6 +589,36 @@ where
             anim,
             custom_shader,
         })
+    }
+}
+
+impl<S> knuffel::Decode<S> for WindowMinimizeAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for WindowRestoreAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
     }
 }
 
@@ -1352,5 +1437,58 @@ where
             stiffness,
             epsilon,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_minimize_restore_default_to_close_open_coupling() {
+        let anims = Animations::default();
+        assert_eq!(anims.window_minimize, None);
+        assert_eq!(anims.window_restore, None);
+        assert_eq!(anims.window_minimize_anim(), anims.window_close.anim);
+        assert_eq!(anims.window_restore_anim(), anims.window_open.anim);
+    }
+
+    #[test]
+    fn window_minimize_restore_nodes_decouple_from_close_open() {
+        let minimize = Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 420,
+                curve: Curve::CubicBezier(0.32, 0., 0.18, 1.),
+            }),
+        };
+        let restore = Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 360,
+                curve: Curve::CubicBezier(0.05, 0.7, 0.1, 1.),
+            }),
+        };
+
+        let mut anims = Animations::default();
+        anims.window_minimize = Some(WindowMinimizeAnim(minimize));
+        anims.window_restore = Some(WindowRestoreAnim(restore));
+
+        assert_eq!(anims.window_minimize_anim(), minimize);
+        assert_eq!(anims.window_restore_anim(), restore);
+        assert_ne!(anims.window_minimize_anim(), anims.window_close.anim);
+        assert_ne!(anims.window_restore_anim(), anims.window_open.anim);
+    }
+
+    #[test]
+    fn window_minimize_restore_empty_nodes_mirror_close_open_defaults() {
+        assert_eq!(
+            WindowMinimizeAnim::default().0,
+            WindowCloseAnim::default().anim
+        );
+        assert_eq!(
+            WindowRestoreAnim::default().0,
+            WindowOpenAnim::default().anim
+        );
     }
 }
