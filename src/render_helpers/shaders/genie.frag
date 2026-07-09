@@ -80,6 +80,12 @@ vec4 genie_color(vec2 output_pos) {
     vec4 color = texture2D(niri_tex, tex_coords);
     // End fade over the last 8% of the morph (was 18%): the shape stays
     // readable almost all the way into the icon, then vanishes quickly.
-    float end_fade = 1.0 - smoothstep(0.92, 1.0, morph);
+    // Direction-aware: only minimize (morph 0->1) fades at the tail. Restore
+    // (morph 1->0) stays fully visible so the window pours out of the icon
+    // from the first frame instead of being invisible for the opening 8% and
+    // popping in mid-travel ("materializes out of nowhere" symptom).
+    float end_fade = (niri_direction > 0.0)
+        ? (1.0 - smoothstep(0.92, 1.0, morph))
+        : 1.0;
     return color * end_fade;
 }

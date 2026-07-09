@@ -265,16 +265,18 @@ impl ClosingLayer {
         let target_alpha = config.opacity_to;
         let alpha = self.start_alpha + (target_alpha - self.start_alpha) * opacity_progress as f32;
         let target_scale = match config.style {
-            niri_config::animations::LayerCloseAnimationStyle::Popout => config.scale_to,
+            niri_config::animations::LayerCloseAnimationStyle::Popout
+            | niri_config::animations::LayerCloseAnimationStyle::PopSlide => config.scale_to,
             niri_config::animations::LayerCloseAnimationStyle::Fade
             | niri_config::animations::LayerCloseAnimationStyle::Slide
             | niri_config::animations::LayerCloseAnimationStyle::EdgeReveal => 1.,
         };
         let scale = self.start_scale + (target_scale - self.start_scale) * transform_progress;
         let target_offset = match config.style {
-            // slide uses the configured distance. edge-reveal uses the layer
-            // surface extent so close fully retracts the surface.
-            niri_config::animations::LayerCloseAnimationStyle::Slide => {
+            // slide and pop-slide use the configured distance. edge-reveal uses
+            // the layer surface extent so close fully retracts the surface.
+            niri_config::animations::LayerCloseAnimationStyle::Slide
+            | niri_config::animations::LayerCloseAnimationStyle::PopSlide => {
                 edge_offset(config.edge, config.distance)
             }
             niri_config::animations::LayerCloseAnimationStyle::EdgeReveal => edge_offset(

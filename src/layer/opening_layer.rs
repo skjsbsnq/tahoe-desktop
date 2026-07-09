@@ -59,7 +59,8 @@ impl OpenAnimation {
 
         let alpha = config.opacity_from + (1. - config.opacity_from) * opacity_progress as f32;
         let scale = match config.style {
-            niri_config::animations::LayerOpenAnimationStyle::Popin => {
+            niri_config::animations::LayerOpenAnimationStyle::Popin
+            | niri_config::animations::LayerOpenAnimationStyle::PopSlide => {
                 config.scale_from + (1. - config.scale_from) * transform_progress
             }
             niri_config::animations::LayerOpenAnimationStyle::Fade
@@ -67,10 +68,9 @@ impl OpenAnimation {
             | niri_config::animations::LayerOpenAnimationStyle::EdgeReveal => 1.,
         };
         let offset = match config.style {
-            niri_config::animations::LayerOpenAnimationStyle::Slide => {
-                config.distance * (1. - transform_progress)
-            }
-            niri_config::animations::LayerOpenAnimationStyle::EdgeReveal => {
+            niri_config::animations::LayerOpenAnimationStyle::Slide
+            | niri_config::animations::LayerOpenAnimationStyle::EdgeReveal
+            | niri_config::animations::LayerOpenAnimationStyle::PopSlide => {
                 config.distance * (1. - transform_progress)
             }
             niri_config::animations::LayerOpenAnimationStyle::Fade

@@ -272,6 +272,15 @@ impl CompositorHandler for State {
                 // Must start the close animation before window.on_commit().
                 let transaction = Transaction::new();
                 if !is_mapped {
+                    // Store the unmap snapshot before on_commit() so the close
+                    // animation has a buffer to render from. The toplevel-destroyed
+                    // path (xdg_shell.rs) already stores; this on-commit unmap path
+                    // (e.g. an app unmapping its own surface on close) was skipping
+                    // the store, leaving take_unmap_snapshot() empty and dropping the
+                    // close animation — the "close animation sometimes missing"
+                    // symptom.
+                    self.store_unmap_snapshot(&window, output.as_ref());
+
                     let blocker = transaction.blocker();
                     self.backend.with_primary_renderer(|renderer| {
                         self.niri

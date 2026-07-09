@@ -336,6 +336,10 @@ impl Default for LayerCloseAnim {
 pub enum LayerOpenAnimationStyle {
     Fade,
     Popin,
+    /// Pop-slide: scale (like Popin) combined with an edge/distance travel
+    /// (like Slide). Use for menus that should drop down out of their anchor
+    /// while scaling. T21 pop-slide behavior.
+    PopSlide,
     Slide,
     EdgeReveal,
 }
@@ -344,6 +348,9 @@ pub enum LayerOpenAnimationStyle {
 pub enum LayerCloseAnimationStyle {
     Fade,
     Popout,
+    /// Pop-slide retract: scale (like Popout) combined with edge/distance
+    /// travel (like Slide). Pairs with the open PopSlide style.
+    PopSlide,
     Slide,
     EdgeReveal,
 }
@@ -1006,6 +1013,7 @@ fn parse_layer_open_style<S: knuffel::traits::ErrorSpan>(
     match value {
         "fade" => LayerOpenAnimationStyle::Fade,
         "popin" => LayerOpenAnimationStyle::Popin,
+        "pop-slide" => LayerOpenAnimationStyle::PopSlide,
         "slide" => LayerOpenAnimationStyle::Slide,
         "edge-reveal" => LayerOpenAnimationStyle::EdgeReveal,
         unexpected => {
@@ -1030,6 +1038,7 @@ fn parse_layer_close_style<S: knuffel::traits::ErrorSpan>(
     match value {
         "fade" => LayerCloseAnimationStyle::Fade,
         "popout" => LayerCloseAnimationStyle::Popout,
+        "pop-slide" => LayerCloseAnimationStyle::PopSlide,
         "slide" => LayerCloseAnimationStyle::Slide,
         "edge-reveal" => LayerCloseAnimationStyle::EdgeReveal,
         unexpected => {
