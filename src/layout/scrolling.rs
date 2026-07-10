@@ -1852,7 +1852,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let scale = Scale::from(self.scale);
         let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
+            renderer,
+            snapshot,
+            scale,
+            tile_size,
+            tile_pos,
+            blocker,
+            anim,
+            self.options.animations.window_close.scale_to,
         );
         match res {
             Ok(closing) => {

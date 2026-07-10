@@ -8,7 +8,7 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
     Anchor, KeyboardInteractivity,
 };
-use smithay::utils::Point;
+use smithay::utils::{Point, Size};
 use std::time::Duration;
 use wayland_client::protocol::wl_surface::WlSurface;
 
@@ -548,6 +548,72 @@ fn layer_close_animation_is_cancelled_on_reopen() {
         .mapped_layer_surfaces
         .values()
         .any(|mapped| mapped.surface().namespace() == "animated-layer"));
+}
+
+#[test]
+fn layer_close_animation_reopen_starts_from_current_visual_state() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^animated-layer$"
+
+            animations {
+                layer-open {
+                    style "pop-slide"
+                    edge "top"
+                    distance 40
+                    scale-from 0.8
+                    opacity-from 0.2
+                    duration-ms 1000
+                    curve "linear"
+                }
+                layer-close {
+                    style "pop-slide"
+                    edge "top"
+                    distance 30
+                    scale-to 0.6
+                    opacity-to 0.1
+                    duration-ms 1000
+                    curve "linear"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    freeze_layer_animation_clock(&mut f);
+    let surface = map_layer(&mut f, id, "animated-layer");
+    advance_layer_animations(&mut f, Duration::from_millis(1100));
+
+    freeze_layer_animation_clock(&mut f);
+    unmap_layer(&mut f, id, &surface);
+    advance_layer_animations(&mut f, Duration::from_millis(250));
+
+    assert_eq!(f.niri().closing_layers.len(), 1);
+    let before = f.niri().closing_layers[0].animation.render_state();
+
+    remap_layer(&mut f, id, &surface);
+
+    assert!(f.niri().closing_layers.is_empty());
+    let mapped = f
+        .niri()
+        .mapped_layer_surfaces
+        .values()
+        .find(|mapped| mapped.surface().namespace() == "animated-layer")
+        .unwrap();
+    let after = mapped.open_animation_state_for_tests().unwrap();
+    let after_offset = after.offset_for_size(Size::from((100., 100.)));
+
+    assert!((after.alpha - before.alpha).abs() < 0.001);
+    assert!((after.scale() - before.scale).abs() < 0.001);
+    assert!((after_offset.x - before.offset.x).abs() < 0.001);
+    assert!((after_offset.y - before.offset.y).abs() < 0.001);
 }
 
 #[test]

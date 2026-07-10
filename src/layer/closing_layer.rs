@@ -66,12 +66,11 @@ impl Default for CloseAnimationStartState {
 #[derive(Debug)]
 pub struct ClosingLayer {
     buffer: TextureBuffer<GlesTexture>,
-    blocked_out_buffer: TextureBuffer<GlesTexture>,
+    blocked_out: Option<(TextureBuffer<GlesTexture>, Point<f64, Logical>)>,
     block_out_from: Option<BlockOutFrom>,
     geo_size: Size<f64, Logical>,
     pos: Point<f64, Logical>,
     buffer_offset: Point<f64, Logical>,
-    blocked_out_buffer_offset: Point<f64, Logical>,
     transform_anim: Animation,
     opacity_anim: Animation,
     opacity_delay: Duration,
@@ -130,9 +129,14 @@ impl ClosingLayer {
 
         let (buffer, buffer_offset) =
             render_to_texture(snapshot.contents).context("error rendering contents")?;
-        let (blocked_out_buffer, blocked_out_buffer_offset) =
-            render_to_texture(snapshot.blocked_out_contents)
-                .context("error rendering blocked-out contents")?;
+        let blocked_out = if snapshot.block_out_from.is_some() {
+            Some(
+                render_to_texture(snapshot.blocked_out_contents)
+                    .context("error rendering blocked-out contents")?,
+            )
+        } else {
+            None
+        };
 
         if geo_size.w <= 0. || geo_size.h <= 0. {
             geo_size = snapshot.size;
@@ -148,12 +152,11 @@ impl ClosingLayer {
 
         Ok(Self {
             buffer,
-            blocked_out_buffer,
+            blocked_out,
             block_out_from: snapshot.block_out_from,
             geo_size,
             pos,
             buffer_offset,
-            blocked_out_buffer_offset,
             transform_anim,
             opacity_anim,
             opacity_delay: Duration::from_millis(u64::from(config.opacity_delay_ms)),
@@ -191,7 +194,11 @@ impl ClosingLayer {
         target: RenderTarget,
     ) -> ClosingLayerRenderElement {
         let (buffer, offset) = if target.should_block_out(self.block_out_from) {
-            (&self.blocked_out_buffer, self.blocked_out_buffer_offset)
+            let (buffer, offset) = self
+                .blocked_out
+                .as_ref()
+                .expect("blocked-out buffer must exist when block-out is configured");
+            (buffer, *offset)
         } else {
             (&self.buffer, self.buffer_offset)
         };

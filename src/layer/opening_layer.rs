@@ -22,6 +22,14 @@ pub struct OpenAnimation {
     opacity_anim: Animation,
     opacity_delay: Duration,
     config: niri_config::animations::LayerOpenAnim,
+    start: Option<OpenAnimationStartState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenAnimationStartState {
+    pub alpha: f32,
+    pub scale: f64,
+    pub offset: Point<f64, Logical>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -31,17 +39,35 @@ pub struct OpenAnimationState {
     origin: niri_config::animations::LayerAnimationOrigin,
     edge: niri_config::animations::LayerAnimationEdge,
     offset: f64,
+    start_offset: Option<Point<f64, Logical>>,
     remaining: f64,
     style: niri_config::animations::LayerOpenAnimationStyle,
 }
 
 impl OpenAnimation {
     pub fn new(clock: Clock, config: niri_config::animations::LayerOpenAnim) -> Self {
+        Self::new_with_state(clock, config, None)
+    }
+
+    pub fn new_from_state(
+        clock: Clock,
+        config: niri_config::animations::LayerOpenAnim,
+        start: OpenAnimationStartState,
+    ) -> Self {
+        Self::new_with_state(clock, config, Some(start))
+    }
+
+    fn new_with_state(
+        clock: Clock,
+        config: niri_config::animations::LayerOpenAnim,
+        start: Option<OpenAnimationStartState>,
+    ) -> Self {
         Self {
             transform_anim: Animation::new(clock.clone(), 0., 1., 0., config.transform_anim),
             opacity_anim: Animation::new(clock, 0., 1., 0., config.opacity_anim),
             opacity_delay: Duration::from_millis(u64::from(config.opacity_delay_ms)),
             config,
+            start,
         }
     }
 
@@ -57,16 +83,19 @@ impl OpenAnimation {
             .clamp(0., 1.);
         let config = self.config;
 
-        let alpha = config.opacity_from + (1. - config.opacity_from) * opacity_progress as f32;
-        let scale = match config.style {
-            niri_config::animations::LayerOpenAnimationStyle::Popin
-            | niri_config::animations::LayerOpenAnimationStyle::PopSlide => {
-                config.scale_from + (1. - config.scale_from) * transform_progress
-            }
-            niri_config::animations::LayerOpenAnimationStyle::Fade
-            | niri_config::animations::LayerOpenAnimationStyle::Slide
-            | niri_config::animations::LayerOpenAnimationStyle::EdgeReveal => 1.,
-        };
+        let alpha_from = self.start.map_or(config.opacity_from, |start| start.alpha);
+        let alpha = alpha_from + (1. - alpha_from) * opacity_progress as f32;
+        let scale_from = self.start.map_or_else(
+            || match config.style {
+                niri_config::animations::LayerOpenAnimationStyle::Popin
+                | niri_config::animations::LayerOpenAnimationStyle::PopSlide => config.scale_from,
+                niri_config::animations::LayerOpenAnimationStyle::Fade
+                | niri_config::animations::LayerOpenAnimationStyle::Slide
+                | niri_config::animations::LayerOpenAnimationStyle::EdgeReveal => 1.,
+            },
+            |start| start.scale,
+        );
+        let scale = scale_from + (1. - scale_from) * transform_progress;
         let offset = match config.style {
             niri_config::animations::LayerOpenAnimationStyle::Slide
             | niri_config::animations::LayerOpenAnimationStyle::EdgeReveal
@@ -83,6 +112,7 @@ impl OpenAnimation {
             origin: config.origin,
             edge: config.edge,
             offset,
+            start_offset: self.start.map(|start| start.offset),
             remaining: 1. - transform_progress,
             style: config.style,
         }
@@ -124,6 +154,10 @@ impl OpenAnimationState {
     }
 
     pub fn offset_for_size(self, size: Size<f64, Logical>) -> Point<f64, Logical> {
+        if let Some(offset) = self.start_offset {
+            return Point::new(offset.x * self.remaining, offset.y * self.remaining);
+        }
+
         if self.style != niri_config::animations::LayerOpenAnimationStyle::EdgeReveal {
             return self.offset();
         }

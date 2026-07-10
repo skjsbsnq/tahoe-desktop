@@ -24,6 +24,10 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::{render_to_encompassing_texture, RenderCtx, RenderTarget};
 use crate::utils::transaction::TransactionBlocker;
 
+fn native_scale(progress: f64, scale_to: f64) -> f64 {
+    (1. + progress * (scale_to - 1.)).max(0.)
+}
+
 #[derive(Debug)]
 pub struct ClosingWindow {
     /// Contents of the window.
@@ -35,8 +39,8 @@ pub struct ClosingWindow {
     /// can be used instead.
     buffer_with_blocked_out_bg: Option<TextureBuffer<GlesTexture>>,
 
-    /// Blocked-out contents of the window.
-    blocked_out_buffer: TextureBuffer<GlesTexture>,
+    /// Blocked-out contents of the window and their texture offset.
+    blocked_out_buffer: Option<(TextureBuffer<GlesTexture>, Point<f64, Logical>)>,
 
     /// Where the window should be blocked out from.
     block_out_from: Option<BlockOutFrom>,
@@ -53,11 +57,11 @@ pub struct ClosingWindow {
     /// How much the texture with blocked-out bg should be offset.
     buffer_with_blocked_out_bg_offset: Point<f64, Logical>,
 
-    /// How much the blocked-out texture should be offset.
-    blocked_out_buffer_offset: Point<f64, Logical>,
-
     /// The closing animation.
     anim_state: AnimationState,
+
+    /// Final scale of the built-in scale-and-fade animation.
+    scale_to: f64,
 
     /// Random seed for the shader.
     random_seed: f32,
@@ -102,6 +106,7 @@ impl ClosingWindow {
         pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
         anim: Animation,
+        scale_to: f64,
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("ClosingWindow::new");
 
@@ -138,9 +143,14 @@ impl ClosingWindow {
             } else {
                 (None, Point::default())
             };
-        let (blocked_out_buffer, blocked_out_buffer_offset) =
-            render_to_texture(snapshot.blocked_out_contents)
-                .context("error rendering blocked-out contents")?;
+        let blocked_out_buffer = if snapshot.block_out_from.is_some() {
+            Some(
+                render_to_texture(snapshot.blocked_out_contents)
+                    .context("error rendering blocked-out contents")?,
+            )
+        } else {
+            None
+        };
 
         Ok(Self {
             buffer,
@@ -151,8 +161,8 @@ impl ClosingWindow {
             pos,
             buffer_offset,
             buffer_with_blocked_out_bg_offset,
-            blocked_out_buffer_offset,
             anim_state: AnimationState::new(blocker, anim),
+            scale_to,
             random_seed: fastrand::f32(),
         })
     }
@@ -183,7 +193,11 @@ impl ClosingWindow {
         scale: Scale<f64>,
     ) -> ClosingWindowRenderElement {
         let (buffer, offset) = if ctx.target.should_block_out(self.block_out_from) {
-            (&self.blocked_out_buffer, self.blocked_out_buffer_offset)
+            let (buffer, offset) = self
+                .blocked_out_buffer
+                .as_ref()
+                .expect("blocked-out buffer must exist when block-out is requested");
+            (buffer, *offset)
         } else if ctx.target != RenderTarget::Output && self.buffer_with_blocked_out_bg.is_some() {
             (
                 self.buffer_with_blocked_out_bg.as_ref().unwrap(),
@@ -286,7 +300,7 @@ impl ClosingWindow {
         let elem = RescaleRenderElement::from_element(
             elem,
             (center - offset).to_physical_precise_round(scale),
-            ((1. - clamped_progress) / 5. + 0.8).max(0.),
+            native_scale(clamped_progress, self.scale_to),
         );
 
         let mut location = self.pos + offset;
@@ -298,5 +312,19 @@ impl ClosingWindow {
         );
 
         elem.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use approx::assert_relative_eq;
+
+    use super::native_scale;
+
+    #[test]
+    fn native_scale_interpolates_to_configured_value() {
+        assert_relative_eq!(native_scale(0., 0.97), 1.);
+        assert_relative_eq!(native_scale(0.5, 0.97), 0.985);
+        assert_relative_eq!(native_scale(1., 0.97), 0.97);
     }
 }

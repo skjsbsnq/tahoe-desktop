@@ -17,9 +17,14 @@ use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, Offscreen
 use crate::render_helpers::shader_element::ShaderRenderElement;
 use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
 
+fn native_scale(progress: f64, scale_from: f64) -> f64 {
+    (scale_from + progress * (1. - scale_from)).max(0.)
+}
+
 #[derive(Debug)]
 pub struct OpenAnimation {
     anim: Animation,
+    scale_from: f64,
     random_seed: f32,
     buffer: OffscreenBuffer,
 }
@@ -32,9 +37,10 @@ niri_render_elements! {
 }
 
 impl OpenAnimation {
-    pub fn new(anim: Animation) -> Self {
+    pub fn new(anim: Animation, scale_from: f64) -> Self {
         Self {
             anim,
+            scale_from,
             random_seed: fastrand::f32(),
             buffer: OffscreenBuffer::default(),
         }
@@ -128,7 +134,7 @@ impl OpenAnimation {
         let elem = RescaleRenderElement::from_element(
             elem,
             center.to_physical_precise_round(scale),
-            (progress / 2. + 0.5).max(0.),
+            native_scale(progress, self.scale_from),
         );
 
         let elem = RelocateRenderElement::from_element(
@@ -138,5 +144,19 @@ impl OpenAnimation {
         );
 
         Ok((elem.into(), data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use approx::assert_relative_eq;
+
+    use super::native_scale;
+
+    #[test]
+    fn native_scale_interpolates_from_configured_value() {
+        assert_relative_eq!(native_scale(0., 0.97), 0.97);
+        assert_relative_eq!(native_scale(0.5, 0.97), 0.985);
+        assert_relative_eq!(native_scale(1., 0.97), 1.);
     }
 }

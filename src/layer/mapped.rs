@@ -16,7 +16,7 @@ use crate::layer::closing_layer::{
     CloseAnimationRenderState, CloseAnimationStartState, ClosingLayerRenderElement,
 };
 use crate::layer::opening_layer::{
-    self, OpenAnimation, OpenAnimationState, OpeningLayerRenderElement,
+    self, OpenAnimation, OpenAnimationStartState, OpenAnimationState, OpeningLayerRenderElement,
     OpeningLayerSolidColorRenderElement, OpeningLayerWaylandRenderElement,
 };
 use crate::layout::shadow::Shadow;
@@ -259,7 +259,7 @@ impl MappedLayer {
         }
     }
 
-    pub fn start_open_animation(&mut self) {
+    pub fn start_open_animation(&mut self, start: Option<OpenAnimationStartState>) {
         let Some(anim_config) = self.rules.layer_open else {
             return;
         };
@@ -267,7 +267,10 @@ impl MappedLayer {
             return;
         }
 
-        self.open_animation = Some(OpenAnimation::new(self.clock.clone(), anim_config));
+        self.open_animation = Some(match start {
+            Some(start) => OpenAnimation::new_from_state(self.clock.clone(), anim_config, start),
+            None => OpenAnimation::new(self.clock.clone(), anim_config),
+        });
     }
 
     fn open_animation_state(&self) -> Option<OpenAnimationState> {
@@ -277,6 +280,11 @@ impl MappedLayer {
         }
 
         Some(animation.state())
+    }
+
+    #[cfg(test)]
+    pub fn open_animation_state_for_tests(&self) -> Option<OpenAnimationState> {
+        self.open_animation_state()
     }
 
     pub fn store_unmap_snapshot(&mut self, renderer: &mut GlesRenderer) {

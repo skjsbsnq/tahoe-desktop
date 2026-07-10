@@ -191,6 +191,7 @@ impl Default for WorkspaceSwitchAnim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowOpenAnim {
     pub anim: Animation,
+    pub scale_from: f64,
     pub custom_shader: Option<String>,
 }
 
@@ -204,6 +205,7 @@ impl Default for WindowOpenAnim {
                     curve: Curve::EaseOutExpo,
                 }),
             },
+            scale_from: 0.5,
             custom_shader: None,
         }
     }
@@ -212,6 +214,7 @@ impl Default for WindowOpenAnim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowCloseAnim {
     pub anim: Animation,
+    pub scale_to: f64,
     pub custom_shader: Option<String>,
 }
 
@@ -225,6 +228,7 @@ impl Default for WindowCloseAnim {
                     curve: Curve::EaseOutQuad,
                 }),
             },
+            scale_to: 0.8,
             custom_shader: None,
         }
     }
@@ -555,19 +559,28 @@ where
         node: &knuffel::ast::SpannedNode<S>,
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().anim;
+        let default = Self::default();
+        let mut scale_from = None;
         let mut custom_shader = None;
-        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
-            if &**child.node_name == "custom-shader" {
-                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
-                Ok(true)
-            } else {
-                Ok(false)
+        let anim = Animation::decode_node(node, ctx, default.anim, |child, ctx| {
+            match &**child.node_name {
+                "scale-from" => {
+                    check_duplicate_node(ctx, child, scale_from.is_some(), "scale-from");
+                    let value: FloatOrInt<0, 10> = parse_arg_node("scale-from", child, ctx)?;
+                    scale_from = Some(value.0);
+                    Ok(true)
+                }
+                "custom-shader" => {
+                    custom_shader = parse_arg_node("custom-shader", child, ctx)?;
+                    Ok(true)
+                }
+                _ => Ok(false),
             }
         })?;
 
         Ok(Self {
             anim,
+            scale_from: scale_from.unwrap_or(default.scale_from),
             custom_shader,
         })
     }
@@ -581,19 +594,28 @@ where
         node: &knuffel::ast::SpannedNode<S>,
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().anim;
+        let default = Self::default();
+        let mut scale_to = None;
         let mut custom_shader = None;
-        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
-            if &**child.node_name == "custom-shader" {
-                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
-                Ok(true)
-            } else {
-                Ok(false)
+        let anim = Animation::decode_node(node, ctx, default.anim, |child, ctx| {
+            match &**child.node_name {
+                "scale-to" => {
+                    check_duplicate_node(ctx, child, scale_to.is_some(), "scale-to");
+                    let value: FloatOrInt<0, 10> = parse_arg_node("scale-to", child, ctx)?;
+                    scale_to = Some(value.0);
+                    Ok(true)
+                }
+                "custom-shader" => {
+                    custom_shader = parse_arg_node("custom-shader", child, ctx)?;
+                    Ok(true)
+                }
+                _ => Ok(false),
             }
         })?;
 
         Ok(Self {
             anim,
+            scale_to: scale_to.unwrap_or(default.scale_to),
             custom_shader,
         })
     }

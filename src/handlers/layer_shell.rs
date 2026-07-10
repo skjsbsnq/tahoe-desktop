@@ -15,6 +15,7 @@ use smithay::wayland::shell::xdg::PopupSurface;
 
 use crate::animation::Animation;
 use crate::layer::closing_layer::ClosingLayer;
+use crate::layer::opening_layer::OpenAnimationStartState;
 use crate::layer::{MappedLayer, ResolvedLayerRules};
 use crate::niri::{ClosingLayerState, State};
 use crate::utils::{is_mapped, output_size, send_scale_transform};
@@ -132,9 +133,20 @@ impl State {
         let mut needs_output_resize = map.arrange();
 
         if is_mapped(surface) {
-            self.niri
-                .closing_layers
-                .retain(|closing| closing.surface != layer);
+            let mut reopen_start = None;
+            self.niri.closing_layers.retain(|closing| {
+                if closing.surface != layer {
+                    return true;
+                }
+
+                let state = closing.animation.render_state();
+                reopen_start = Some(OpenAnimationStartState {
+                    alpha: state.alpha,
+                    scale: state.scale,
+                    offset: state.offset,
+                });
+                false
+            });
 
             let was_unmapped = self.niri.unmapped_layer_surfaces.remove(surface);
 
@@ -160,7 +172,7 @@ impl State {
                     self.niri.clock.clone(),
                     &config,
                 );
-                mapped.start_open_animation();
+                mapped.start_open_animation(reopen_start);
 
                 let prev = self
                     .niri

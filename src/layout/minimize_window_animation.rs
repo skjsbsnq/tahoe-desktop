@@ -50,8 +50,10 @@ pub struct MinimizeWindowAnimation {
     /// can be used instead.
     buffer_with_blocked_out_bg: Option<TextureBuffer<GlesTexture>>,
 
-    /// Blocked-out contents of the window.
-    blocked_out_buffer: TextureBuffer<GlesTexture>,
+    /// Blocked-out contents of the window and its texture offset.
+    ///
+    /// This is only rendered when the window has a block-out rule.
+    blocked_out: Option<(TextureBuffer<GlesTexture>, Point<f64, Logical>)>,
 
     /// Where the window should be blocked out from.
     block_out_from: Option<BlockOutFrom>,
@@ -64,9 +66,6 @@ pub struct MinimizeWindowAnimation {
 
     /// How much the texture with blocked-out bg should be offset.
     buffer_with_blocked_out_bg_offset: Point<f64, Logical>,
-
-    /// How much the blocked-out texture should be offset.
-    blocked_out_buffer_offset: Point<f64, Logical>,
 
     /// The minimizing animation.
     anim: Animation,
@@ -214,18 +213,20 @@ impl MinimizeWindowAnimation {
             } else {
                 (None, Point::default())
             };
-        let (blocked_out_buffer, blocked_out_buffer_offset) =
-            render_to_texture(snapshot.blocked_out_contents)?;
+        let blocked_out = if snapshot.block_out_from.is_some() {
+            Some(render_to_texture(snapshot.blocked_out_contents)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             buffer,
             buffer_with_blocked_out_bg,
-            blocked_out_buffer,
+            blocked_out,
             block_out_from: snapshot.block_out_from,
             pos,
             buffer_offset,
             buffer_with_blocked_out_bg_offset,
-            blocked_out_buffer_offset,
             anim,
             alpha_from,
             alpha_to,
@@ -287,7 +288,11 @@ impl MinimizeWindowAnimation {
         scale: Scale<f64>,
     ) -> MinimizeWindowAnimationRenderElement {
         let (buffer, offset) = if ctx.target.should_block_out(self.block_out_from) {
-            (&self.blocked_out_buffer, self.blocked_out_buffer_offset)
+            let (buffer, offset) = self
+                .blocked_out
+                .as_ref()
+                .expect("blocked-out buffer must exist when block-out is configured");
+            (buffer, *offset)
         } else if ctx.target != RenderTarget::Output && self.buffer_with_blocked_out_bg.is_some() {
             (
                 self.buffer_with_blocked_out_bg.as_ref().unwrap(),

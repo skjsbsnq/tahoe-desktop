@@ -175,9 +175,16 @@ animations {
     window-open {
         duration-ms 150
         curve "ease-out-expo"
+        scale-from 0.5
     }
 }
 ```
+
+##### `scale-from`
+
+Sets the initial window scale for the built-in scale-and-fade animation, from 0 to 10.
+The default is 0.5, and the window animates from this scale to its full size.
+An active `custom-shader` replaces the built-in animation and does not use this setting.
 
 ##### `custom-shader`
 
@@ -236,9 +243,16 @@ animations {
     window-close {
         duration-ms 150
         curve "ease-out-quad"
+        scale-to 0.8
     }
 }
 ```
+
+##### `scale-to`
+
+Sets the final window scale for the built-in scale-and-fade animation, from 0 to 10.
+The default is 0.8, and the window animates from its full size to this scale.
+An active `custom-shader` replaces the built-in animation and does not use this setting.
 
 When no valid dock rectangle is available, when the rectangle belongs to another output, or when the Genie shader is unavailable, minimize and restore fall back to the regular fade path.
 Restore animations use the `window-open` timing.

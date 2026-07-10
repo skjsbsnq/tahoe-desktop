@@ -658,6 +658,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_window_open_close_scales() {
+        let defaults = Config::parse_mem("").unwrap().animations;
+        assert_eq!(defaults.window_open.scale_from, 0.5);
+        assert_eq!(defaults.window_close.scale_to, 0.8);
+
+        let config = do_parse(
+            r#"
+            animations {
+                window-open {
+                    scale-from 0.97
+                    custom-shader "open shader"
+                }
+                window-close {
+                    scale-to 1.02
+                    custom-shader "close shader"
+                }
+            }
+            "#,
+        );
+        assert_eq!(config.animations.window_open.scale_from, 0.97);
+        assert_eq!(config.animations.window_close.scale_to, 1.02);
+        assert_eq!(
+            config.animations.window_open.custom_shader.as_deref(),
+            Some("open shader")
+        );
+        assert_eq!(
+            config.animations.window_close.custom_shader.as_deref(),
+            Some("close shader")
+        );
+
+        for invalid in [
+            "window-open { scale-from -0.01; }",
+            "window-close { scale-to 10.01; }",
+        ] {
+            let text = format!("animations {{ {invalid} }}");
+            assert!(Config::parse_mem(&text).is_err(), "accepted `{invalid}`");
+        }
+    }
+
+    #[test]
     fn parse_window_minimize_restore_nodes() {
         // Nodes absent: genie timing inherits window-close/open (T02 finding:
         // the historical behavior is bare inheritance, no duration floor).
@@ -1914,6 +1954,7 @@ mod tests {
                             },
                         ),
                     },
+                    scale_from: 0.5,
                     custom_shader: None,
                 },
                 window_close: WindowCloseAnim {
@@ -1931,6 +1972,7 @@ mod tests {
                             },
                         ),
                     },
+                    scale_to: 0.8,
                     custom_shader: None,
                 },
                 window_minimize: Some(
