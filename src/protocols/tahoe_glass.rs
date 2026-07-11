@@ -38,7 +38,7 @@ impl TahoeGlassFlags {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TahoeGlassRegion {
     pub id: u32,
     pub rect: Rectangle<i32, Logical>,
@@ -51,6 +51,21 @@ pub struct TahoeGlassRegion {
     /// Per-region material alpha in [0, 1] for compositor-side enter/exit fades.
     /// 1 = fully visible; 0 = material parameters faded out.
     pub material_alpha: f32,
+}
+
+impl PartialEq for TahoeGlassRegion {
+    fn eq(&self, other: &Self) -> bool {
+        // Ignore sub-step float noise so clients that re-send nearly identical
+        // interaction/alpha do not force damage + redraw every frame.
+        const FLOAT_EPS: f32 = 0.02;
+        self.id == other.id
+            && self.rect == other.rect
+            && self.radius == other.radius
+            && self.material == other.material
+            && self.flags == other.flags
+            && (self.interaction - other.interaction).abs() < FLOAT_EPS
+            && (self.material_alpha - other.material_alpha).abs() < FLOAT_EPS
+    }
 }
 
 pub struct TahoeGlassSurfaceUserData {
