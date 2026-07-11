@@ -156,6 +156,26 @@ struct OptionalEasingParams {
     curve: Option<Curve>,
 }
 
+/// Optional per-channel override for layer open/close transform/opacity.
+/// Either easing (`*-duration-ms` / `*-curve`) or spring (`*-spring { … }`),
+/// never both. When empty, the channel inherits the main-channel animation.
+#[derive(Default, Clone, Copy, PartialEq)]
+struct OptionalChannelParams {
+    duration_ms: Option<u32>,
+    curve: Option<Curve>,
+    spring: Option<SpringParams>,
+}
+
+impl OptionalChannelParams {
+    fn is_empty(self) -> bool {
+        self.duration_ms.is_none() && self.curve.is_none() && self.spring.is_none()
+    }
+
+    fn has_easing(self) -> bool {
+        self.duration_ms.is_some() || self.curve.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Curve {
     Linear,
@@ -211,6 +231,13 @@ impl Default for WindowOpenAnim {
     }
 }
 
+impl WindowOpenAnim {
+    /// Resolved GLSL body for the open shader, expanding named presets (T22).
+    pub fn resolved_custom_shader(&self) -> Option<String> {
+        resolve_open_shader(self.custom_shader.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowCloseAnim {
     pub anim: Animation,
@@ -233,6 +260,73 @@ impl Default for WindowCloseAnim {
         }
     }
 }
+
+impl WindowCloseAnim {
+    /// Resolved GLSL body for the close shader, expanding named presets (T22).
+    pub fn resolved_custom_shader(&self) -> Option<String> {
+        resolve_close_shader(self.custom_shader.as_deref())
+    }
+}
+
+/// Named open shader presets (T22). Values are full `open_color` GLSL bodies
+/// equivalent to the historical Tahoe scale+fade custom shaders.
+pub fn resolve_open_shader(src: Option<&str>) -> Option<String> {
+    let src = src?.trim();
+    if src.is_empty() {
+        return None;
+    }
+    // Named presets are short identifiers without whitespace / braces.
+    let body = match src {
+        "scale-fade" | "tahoe-scale-fade" => OPEN_SHADER_SCALE_FADE,
+        // Anything containing a space, brace, or paren is treated as inline GLSL.
+        _ if src.contains('{') || src.contains('(') || src.contains(' ') => src,
+        // Unknown bare name: pass through so compile failure surfaces as warn.
+        other => other,
+    };
+    Some(body.to_string())
+}
+
+pub fn resolve_close_shader(src: Option<&str>) -> Option<String> {
+    let src = src?.trim();
+    if src.is_empty() {
+        return None;
+    }
+    let body = match src {
+        "scale-fade" | "tahoe-scale-fade" => CLOSE_SHADER_SCALE_FADE,
+        _ if src.contains('{') || src.contains('(') || src.contains(' ') => src,
+        other => other,
+    };
+    Some(body.to_string())
+}
+
+/// Scale 0.965→1 + fade-in driven by niri_clamped_progress (T02 historical shader).
+const OPEN_SHADER_SCALE_FADE: &str = r#"
+vec4 open_color(vec3 coords_geo, vec3 size_geo) {
+    float p = clamp(niri_clamped_progress, 0.0, 1.0);
+    // Scale from 0.965 toward 1.0 around geometry center.
+    float s = 0.965 + (1.0 - 0.965) * p;
+    vec2 center = vec2(0.5, 0.5);
+    vec2 c = (coords_geo.xy - center) / s + center;
+    vec3 coords_tex = niri_geo_to_tex * vec3(c, 1.0);
+    vec4 color = texture2D(niri_tex, coords_tex.st);
+    // Soft fade completes slightly before end for a snappier settle.
+    float fade = smoothstep(0.0, 0.7, p);
+    return color * fade;
+}
+"#;
+
+/// Scale 1→0.97 + fade-out driven by niri_clamped_progress.
+const CLOSE_SHADER_SCALE_FADE: &str = r#"
+vec4 close_color(vec3 coords_geo, vec3 size_geo) {
+    float p = clamp(niri_clamped_progress, 0.0, 1.0);
+    float s = 1.0 + (0.97 - 1.0) * p;
+    vec2 center = vec2(0.5, 0.5);
+    vec2 c = (coords_geo.xy - center) / s + center;
+    vec3 coords_tex = niri_geo_to_tex * vec3(c, 1.0);
+    vec4 color = texture2D(niri_tex, coords_tex.st);
+    return color * (1.0 - p);
+}
+"#;
 
 /// Dedicated genie minimize timing (T04). When the node is absent from the
 /// config, the minimize animation inherits `window-close` (see
@@ -363,6 +457,10 @@ pub enum LayerCloseAnimationStyle {
 pub enum LayerAnimationOrigin {
     Center,
     Anchor,
+    /// Scale origin follows the seat pointer location captured when the
+    /// animation starts (T22). Falls back to Center if the pointer position
+    /// is unavailable.
+    Pointer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -666,8 +764,8 @@ where
         let mut origin = None;
         let mut edge = None;
         let mut distance = None;
-        let mut transform_params = OptionalEasingParams::default();
-        let mut opacity_params = OptionalEasingParams::default();
+        let mut transform_params = OptionalChannelParams::default();
+        let mut opacity_params = OptionalChannelParams::default();
         let mut opacity_delay_ms = None;
 
         let anim = Animation::decode_node(node, ctx, default.anim, |child, ctx| {
@@ -709,45 +807,27 @@ where
                     Ok(true)
                 }
                 "transform-duration-ms" => {
-                    check_duplicate_node(
-                        ctx,
-                        child,
-                        transform_params.duration_ms.is_some(),
-                        "transform-duration-ms",
-                    );
-                    transform_params.duration_ms =
-                        Some(parse_arg_node("transform-duration-ms", child, ctx)?);
+                    decode_channel_duration_ms(ctx, child, &mut transform_params, "transform")?;
                     Ok(true)
                 }
                 "transform-curve" => {
-                    check_duplicate_node(
-                        ctx,
-                        child,
-                        transform_params.curve.is_some(),
-                        "transform-curve",
-                    );
-                    transform_params.curve = parse_animation_curve_node(child, ctx)?;
+                    decode_channel_curve(ctx, child, &mut transform_params, "transform")?;
+                    Ok(true)
+                }
+                "transform-spring" => {
+                    decode_channel_spring(ctx, child, &mut transform_params, "transform")?;
                     Ok(true)
                 }
                 "opacity-duration-ms" => {
-                    check_duplicate_node(
-                        ctx,
-                        child,
-                        opacity_params.duration_ms.is_some(),
-                        "opacity-duration-ms",
-                    );
-                    opacity_params.duration_ms =
-                        Some(parse_arg_node("opacity-duration-ms", child, ctx)?);
+                    decode_channel_duration_ms(ctx, child, &mut opacity_params, "opacity")?;
                     Ok(true)
                 }
                 "opacity-curve" => {
-                    check_duplicate_node(
-                        ctx,
-                        child,
-                        opacity_params.curve.is_some(),
-                        "opacity-curve",
-                    );
-                    opacity_params.curve = parse_animation_curve_node(child, ctx)?;
+                    decode_channel_curve(ctx, child, &mut opacity_params, "opacity")?;
+                    Ok(true)
+                }
+                "opacity-spring" => {
+                    decode_channel_spring(ctx, child, &mut opacity_params, "opacity")?;
                     Ok(true)
                 }
                 "opacity-delay-ms" => {
@@ -763,8 +843,8 @@ where
                 _ => Ok(false),
             }
         })?;
-        let transform_anim = animation_from_optional_easing_params(anim, transform_params);
-        let opacity_anim = animation_from_optional_easing_params(anim, opacity_params);
+        let transform_anim = animation_from_optional_channel_params(anim, transform_params);
+        let opacity_anim = animation_from_optional_channel_params(anim, opacity_params);
 
         Ok(Self {
             anim,
@@ -796,8 +876,8 @@ where
         let mut origin = None;
         let mut edge = None;
         let mut distance = None;
-        let mut transform_params = OptionalEasingParams::default();
-        let mut opacity_params = OptionalEasingParams::default();
+        let mut transform_params = OptionalChannelParams::default();
+        let mut opacity_params = OptionalChannelParams::default();
         let mut opacity_delay_ms = None;
 
         let anim = Animation::decode_node(node, ctx, default.anim, |child, ctx| {
@@ -839,45 +919,27 @@ where
                     Ok(true)
                 }
                 "transform-duration-ms" => {
-                    check_duplicate_node(
-                        ctx,
-                        child,
-                        transform_params.duration_ms.is_some(),
-                        "transform-duration-ms",
-                    );
-                    transform_params.duration_ms =
-                        Some(parse_arg_node("transform-duration-ms", child, ctx)?);
+                    decode_channel_duration_ms(ctx, child, &mut transform_params, "transform")?;
                     Ok(true)
                 }
                 "transform-curve" => {
-                    check_duplicate_node(
-                        ctx,
-                        child,
-                        transform_params.curve.is_some(),
-                        "transform-curve",
-                    );
-                    transform_params.curve = parse_animation_curve_node(child, ctx)?;
+                    decode_channel_curve(ctx, child, &mut transform_params, "transform")?;
+                    Ok(true)
+                }
+                "transform-spring" => {
+                    decode_channel_spring(ctx, child, &mut transform_params, "transform")?;
                     Ok(true)
                 }
                 "opacity-duration-ms" => {
-                    check_duplicate_node(
-                        ctx,
-                        child,
-                        opacity_params.duration_ms.is_some(),
-                        "opacity-duration-ms",
-                    );
-                    opacity_params.duration_ms =
-                        Some(parse_arg_node("opacity-duration-ms", child, ctx)?);
+                    decode_channel_duration_ms(ctx, child, &mut opacity_params, "opacity")?;
                     Ok(true)
                 }
                 "opacity-curve" => {
-                    check_duplicate_node(
-                        ctx,
-                        child,
-                        opacity_params.curve.is_some(),
-                        "opacity-curve",
-                    );
-                    opacity_params.curve = parse_animation_curve_node(child, ctx)?;
+                    decode_channel_curve(ctx, child, &mut opacity_params, "opacity")?;
+                    Ok(true)
+                }
+                "opacity-spring" => {
+                    decode_channel_spring(ctx, child, &mut opacity_params, "opacity")?;
                     Ok(true)
                 }
                 "opacity-delay-ms" => {
@@ -893,8 +955,8 @@ where
                 _ => Ok(false),
             }
         })?;
-        let transform_anim = animation_from_optional_easing_params(anim, transform_params);
-        let opacity_anim = animation_from_optional_easing_params(anim, opacity_params);
+        let transform_anim = animation_from_optional_channel_params(anim, transform_params);
+        let opacity_anim = animation_from_optional_channel_params(anim, opacity_params);
 
         Ok(Self {
             anim,
@@ -1085,13 +1147,14 @@ fn parse_layer_animation_origin<S: knuffel::traits::ErrorSpan>(
     match value {
         "center" => LayerAnimationOrigin::Center,
         "anchor" => LayerAnimationOrigin::Anchor,
+        "pointer" => LayerAnimationOrigin::Pointer,
         unexpected => {
             ctx.emit_error(DecodeError::unexpected(
                 node,
                 "node",
                 format!(
                     "unexpected layer animation origin `{unexpected}`. \
-                    Supported origins are `center` and `anchor`."
+                    Supported origins are `center`, `anchor` and `pointer`."
                 ),
             ));
             LayerAnimationOrigin::Center
@@ -1147,6 +1210,89 @@ fn animation_from_optional_easing_params(
             curve: params.curve.unwrap_or(default_easing.curve),
         }),
     }
+}
+
+/// Build a channel animation from optional easing *or* spring overrides.
+/// Empty params inherit `default` (main channel) unchanged — including springs.
+fn animation_from_optional_channel_params(
+    default: Animation,
+    params: OptionalChannelParams,
+) -> Animation {
+    if params.is_empty() {
+        return default;
+    }
+
+    if let Some(spring) = params.spring {
+        return Animation {
+            off: default.off,
+            kind: Kind::Spring(spring),
+        };
+    }
+
+    animation_from_optional_easing_params(
+        default,
+        OptionalEasingParams {
+            duration_ms: params.duration_ms,
+            curve: params.curve,
+        },
+    )
+}
+
+fn decode_channel_duration_ms<S: knuffel::traits::ErrorSpan>(
+    ctx: &mut knuffel::decode::Context<S>,
+    child: &knuffel::ast::SpannedNode<S>,
+    params: &mut OptionalChannelParams,
+    channel: &str,
+) -> Result<(), DecodeError<S>> {
+    let name = format!("{channel}-duration-ms");
+    if params.spring.is_some() {
+        ctx.emit_error(DecodeError::unexpected(
+            child,
+            "node",
+            format!("cannot set both {channel}-spring and {channel} easing parameters at once"),
+        ));
+    }
+    check_duplicate_node(ctx, child, params.duration_ms.is_some(), &name);
+    params.duration_ms = Some(parse_arg_node(&name, child, ctx)?);
+    Ok(())
+}
+
+fn decode_channel_curve<S: knuffel::traits::ErrorSpan>(
+    ctx: &mut knuffel::decode::Context<S>,
+    child: &knuffel::ast::SpannedNode<S>,
+    params: &mut OptionalChannelParams,
+    channel: &str,
+) -> Result<(), DecodeError<S>> {
+    let name = format!("{channel}-curve");
+    if params.spring.is_some() {
+        ctx.emit_error(DecodeError::unexpected(
+            child,
+            "node",
+            format!("cannot set both {channel}-spring and {channel} easing parameters at once"),
+        ));
+    }
+    check_duplicate_node(ctx, child, params.curve.is_some(), &name);
+    params.curve = parse_animation_curve_node(child, ctx)?;
+    Ok(())
+}
+
+fn decode_channel_spring<S: knuffel::traits::ErrorSpan>(
+    ctx: &mut knuffel::decode::Context<S>,
+    child: &knuffel::ast::SpannedNode<S>,
+    params: &mut OptionalChannelParams,
+    channel: &str,
+) -> Result<(), DecodeError<S>> {
+    let name = format!("{channel}-spring");
+    if params.has_easing() {
+        ctx.emit_error(DecodeError::unexpected(
+            child,
+            "node",
+            format!("cannot set both {channel}-spring and {channel} easing parameters at once"),
+        ));
+    }
+    check_duplicate_node(ctx, child, params.spring.is_some(), &name);
+    params.spring = Some(SpringParams::decode_node(child, ctx)?);
+    Ok(())
 }
 
 fn parse_animation_curve_node<S: knuffel::traits::ErrorSpan>(

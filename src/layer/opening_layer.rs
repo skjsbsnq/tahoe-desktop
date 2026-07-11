@@ -23,6 +23,8 @@ pub struct OpenAnimation {
     opacity_delay: Duration,
     config: niri_config::animations::LayerOpenAnim,
     start: Option<OpenAnimationStartState>,
+    /// Absolute (output-local) pointer position for `origin "pointer"`.
+    pointer_origin: Option<Point<f64, Logical>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,11 +44,14 @@ pub struct OpenAnimationState {
     start_offset: Option<Point<f64, Logical>>,
     remaining: f64,
     style: niri_config::animations::LayerOpenAnimationStyle,
+    /// Absolute (output-local) pointer position captured at animation start
+    /// when origin is Pointer. Used as the scale pivot.
+    pointer_origin: Option<Point<f64, Logical>>,
 }
 
 impl OpenAnimation {
     pub fn new(clock: Clock, config: niri_config::animations::LayerOpenAnim) -> Self {
-        Self::new_with_state(clock, config, None)
+        Self::new_with_state(clock, config, None, None)
     }
 
     pub fn new_from_state(
@@ -54,13 +59,24 @@ impl OpenAnimation {
         config: niri_config::animations::LayerOpenAnim,
         start: OpenAnimationStartState,
     ) -> Self {
-        Self::new_with_state(clock, config, Some(start))
+        Self::new_with_state(clock, config, Some(start), None)
+    }
+
+    /// Construct with an optional absolute pointer location for `origin "pointer"`.
+    pub fn new_with_pointer(
+        clock: Clock,
+        config: niri_config::animations::LayerOpenAnim,
+        start: Option<OpenAnimationStartState>,
+        pointer_origin: Option<Point<f64, Logical>>,
+    ) -> Self {
+        Self::new_with_state(clock, config, start, pointer_origin)
     }
 
     fn new_with_state(
         clock: Clock,
         config: niri_config::animations::LayerOpenAnim,
         start: Option<OpenAnimationStartState>,
+        pointer_origin: Option<Point<f64, Logical>>,
     ) -> Self {
         Self {
             transform_anim: Animation::new(clock.clone(), 0., 1., 0., config.transform_anim),
@@ -68,6 +84,7 @@ impl OpenAnimation {
             opacity_delay: Duration::from_millis(u64::from(config.opacity_delay_ms)),
             config,
             start,
+            pointer_origin,
         }
     }
 
@@ -115,6 +132,7 @@ impl OpenAnimation {
             start_offset: self.start.map(|start| start.offset),
             remaining: 1. - transform_progress,
             style: config.style,
+            pointer_origin: self.pointer_origin,
         }
     }
 }
@@ -144,6 +162,10 @@ impl OpenAnimationState {
                     anchor.contains(Anchor::BOTTOM),
                 ),
             ),
+            // Pointer: use captured seat location if present; otherwise center.
+            niri_config::animations::LayerAnimationOrigin::Pointer => {
+                self.pointer_origin.unwrap_or(center)
+            }
         };
 
         origin.to_physical_precise_round(output_scale)

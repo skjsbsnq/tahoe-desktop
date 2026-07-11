@@ -259,7 +259,11 @@ impl MappedLayer {
         }
     }
 
-    pub fn start_open_animation(&mut self, start: Option<OpenAnimationStartState>) {
+    pub fn start_open_animation(
+        &mut self,
+        start: Option<OpenAnimationStartState>,
+        pointer_origin: Option<Point<f64, Logical>>,
+    ) {
         let Some(anim_config) = self.rules.layer_open else {
             return;
         };
@@ -267,10 +271,18 @@ impl MappedLayer {
             return;
         }
 
-        self.open_animation = Some(match start {
-            Some(start) => OpenAnimation::new_from_state(self.clock.clone(), anim_config, start),
-            None => OpenAnimation::new(self.clock.clone(), anim_config),
-        });
+        // Only capture pointer for origin "pointer"; other origins ignore it.
+        let pointer = match anim_config.origin {
+            niri_config::animations::LayerAnimationOrigin::Pointer => pointer_origin,
+            _ => None,
+        };
+
+        self.open_animation = Some(OpenAnimation::new_with_pointer(
+            self.clock.clone(),
+            anim_config,
+            start,
+            pointer,
+        ));
     }
 
     fn open_animation_state(&self) -> Option<OpenAnimationState> {
@@ -607,6 +619,8 @@ impl MappedLayer {
             Rectangle::new(location, self.block_out_buffer.size()).to_physical_precise_round(scale)
         });
         let anchor = self.surface.cached_state().anchor;
+        // Live close effects use Center/Anchor; Pointer needs a captured
+        // location which live path does not store — fall back to Center.
         let origin = close_state.should_wrap().then(|| {
             close_animation_origin(
                 close_state.origin,
@@ -614,6 +628,7 @@ impl MappedLayer {
                 self.block_out_buffer.size(),
                 anchor,
                 scale,
+                None,
             )
         });
 
@@ -825,6 +840,7 @@ fn close_animation_origin(
     size: Size<f64, Logical>,
     anchor: smithay::wayland::shell::wlr_layer::Anchor,
     output_scale: Scale<f64>,
+    pointer_origin: Option<Point<f64, Logical>>,
 ) -> Point<i32, smithay::utils::Physical> {
     let center = location + size.to_point().downscale(2.);
     let origin = match origin {
@@ -843,6 +859,9 @@ fn close_animation_origin(
                 anchor.contains(smithay::wayland::shell::wlr_layer::Anchor::BOTTOM),
             ),
         ),
+        niri_config::animations::LayerAnimationOrigin::Pointer => {
+            pointer_origin.unwrap_or(center)
+        }
     };
 
     origin.to_physical_precise_round(output_scale)

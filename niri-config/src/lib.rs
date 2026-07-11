@@ -698,6 +698,83 @@ mod tests {
     }
 
     #[test]
+    fn resolve_window_shader_presets() {
+        // T22: named presets expand to full GLSL; inline GLSL passes through.
+        use crate::animations::{resolve_close_shader, resolve_open_shader};
+
+        let open_preset = resolve_open_shader(Some("scale-fade")).unwrap();
+        assert!(open_preset.contains("open_color"));
+        assert!(open_preset.contains("0.965"));
+        assert_eq!(
+            resolve_open_shader(Some("scale-fade")).as_deref(),
+            resolve_open_shader(Some("tahoe-scale-fade")).as_deref()
+        );
+
+        let close_preset = resolve_close_shader(Some("scale-fade")).unwrap();
+        assert!(close_preset.contains("close_color"));
+        assert!(close_preset.contains("0.97"));
+
+        let inline = "vec4 open_color(vec3 coords_geo, vec3 size_geo) { return vec4(1.0); }";
+        assert_eq!(
+            resolve_open_shader(Some(inline)).as_deref(),
+            Some(inline)
+        );
+
+        let config = do_parse(
+            r#"
+            animations {
+                window-open {
+                    custom-shader "scale-fade"
+                }
+                window-close {
+                    custom-shader "scale-fade"
+                }
+            }
+            "#,
+        );
+        let open_resolved = config.animations.window_open.resolved_custom_shader().unwrap();
+        let close_resolved = config.animations.window_close.resolved_custom_shader().unwrap();
+        assert!(open_resolved.contains("open_color"));
+        assert!(close_resolved.contains("close_color"));
+        // Stored value remains the short name; resolution is at compile time.
+        assert_eq!(
+            config.animations.window_open.custom_shader.as_deref(),
+            Some("scale-fade")
+        );
+    }
+
+    #[test]
+    fn parse_layer_animation_origin_pointer() {
+        let config = do_parse(
+            r#"
+            layer-rule {
+                animations {
+                    layer-open {
+                        style "popin"
+                        origin "pointer"
+                        scale-from 0.94
+                    }
+                    layer-close {
+                        style "popout"
+                        origin "pointer"
+                        scale-to 0.98
+                    }
+                }
+            }
+            "#,
+        );
+        let animations = config.layer_rules[0].animations.as_ref().unwrap();
+        assert_eq!(
+            animations.layer_open.as_ref().unwrap().origin,
+            LayerAnimationOrigin::Pointer
+        );
+        assert_eq!(
+            animations.layer_close.as_ref().unwrap().origin,
+            LayerAnimationOrigin::Pointer
+        );
+    }
+
+    #[test]
     fn parse_window_minimize_restore_nodes() {
         // Nodes absent: genie timing inherits window-close/open (T02 finding:
         // the historical behavior is bare inheritance, no duration floor).
@@ -920,6 +997,115 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn parse_layer_rule_animation_channel_springs() {
+        // T21: transform/opacity channel overrides accept spring nodes while
+        // remaining backward compatible with transform-duration-ms / curve.
+        use crate::animations::{Kind, SpringParams};
+
+        let config = do_parse(
+            r#"
+            layer-rule {
+                match namespace="^tahoe-menu$"
+
+                animations {
+                    layer-open {
+                        style "pop-slide"
+                        origin "anchor"
+                        edge "top"
+                        distance 4
+                        scale-from 0.94
+                        opacity-from 0
+                        spring damping-ratio=0.88 stiffness=500 epsilon=0.001
+                        transform-spring damping-ratio=0.9 stiffness=420 epsilon=0.0005
+                        opacity-duration-ms 90
+                        opacity-curve "standard-decel"
+                    }
+                    layer-close {
+                        style "pop-slide"
+                        origin "anchor"
+                        edge "top"
+                        distance 4
+                        scale-to 0.98
+                        opacity-to 0
+                        transform-duration-ms 180
+                        transform-curve "emphasized-accel"
+                        opacity-spring damping-ratio=1.0 stiffness=300 epsilon=0.001
+                    }
+                }
+            }
+            "#,
+        );
+
+        let animations = config.layer_rules[0].animations.as_ref().unwrap();
+        let open = animations.layer_open.as_ref().unwrap();
+        assert_eq!(open.style, LayerOpenAnimationStyle::PopSlide);
+        assert_eq!(open.origin, LayerAnimationOrigin::Anchor);
+        assert_eq!(open.edge, LayerAnimationEdge::Top);
+        assert_eq!(open.distance, 4.);
+        assert_eq!(open.scale_from, 0.94);
+        // Main channel spring is inherited by transform when only transform-spring
+        // is set — transform-spring overrides, opacity keeps easing override.
+        assert!(matches!(
+            open.transform_anim.kind,
+            Kind::Spring(SpringParams {
+                damping_ratio,
+                stiffness: 420,
+                ..
+            }) if (damping_ratio - 0.9).abs() < 1e-9
+        ));
+        assert!(matches!(
+            open.opacity_anim.kind,
+            Kind::Easing(params) if params.duration_ms == 90
+        ));
+
+        let close = animations.layer_close.as_ref().unwrap();
+        assert_eq!(close.style, LayerCloseAnimationStyle::PopSlide);
+        assert!(matches!(
+            close.transform_anim.kind,
+            Kind::Easing(params) if params.duration_ms == 180
+        ));
+        assert!(matches!(
+            close.opacity_anim.kind,
+            Kind::Spring(SpringParams {
+                damping_ratio,
+                stiffness: 300,
+                ..
+            }) if (damping_ratio - 1.0).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn parse_layer_rule_rejects_mixed_channel_spring_and_easing() {
+        for invalid in [
+            r#"
+            layer-rule {
+                animations {
+                    layer-open {
+                        transform-duration-ms 120
+                        transform-spring damping-ratio=0.9 stiffness=400 epsilon=0.001
+                    }
+                }
+            }
+            "#,
+            r#"
+            layer-rule {
+                animations {
+                    layer-close {
+                        opacity-spring damping-ratio=1.0 stiffness=300 epsilon=0.001
+                        opacity-curve "linear"
+                    }
+                }
+            }
+            "#,
+        ] {
+            assert!(
+                Config::parse_mem(invalid).is_err(),
+                "accepted mixed spring/easing channel override:\n{invalid}"
+            );
+        }
     }
 
     #[test]

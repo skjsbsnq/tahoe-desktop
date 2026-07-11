@@ -79,6 +79,8 @@ pub struct ClosingLayer {
     start_scale: f64,
     start_offset: Point<f64, Logical>,
     anchor: Anchor,
+    /// Absolute (output-local) pointer position for `origin "pointer"`.
+    pointer_origin: Option<Point<f64, Logical>>,
 }
 
 niri_render_elements! {
@@ -102,6 +104,7 @@ impl ClosingLayer {
         config: niri_config::animations::LayerCloseAnim,
         start: CloseAnimationStartState,
         anchor: Anchor,
+        pointer_origin: Option<Point<f64, Logical>>,
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("ClosingLayer::new");
 
@@ -165,6 +168,10 @@ impl ClosingLayer {
             start_scale: start.start_scale,
             start_offset: start.start_offset,
             anchor,
+            pointer_origin: match config.origin {
+                niri_config::animations::LayerAnimationOrigin::Pointer => pointer_origin,
+                _ => None,
+            },
         })
     }
 
@@ -215,10 +222,9 @@ impl ClosingLayer {
         );
         let elem = PrimaryGpuTextureRenderElement(elem);
 
+        let center = self.geo_size.to_point().downscale(2.);
         let origin = match state.origin {
-            niri_config::animations::LayerAnimationOrigin::Center => {
-                self.geo_size.to_point().downscale(2.)
-            }
+            niri_config::animations::LayerAnimationOrigin::Center => center,
             niri_config::animations::LayerAnimationOrigin::Anchor => Point::new(
                 anchor_axis_origin(
                     self.geo_size.w,
@@ -231,6 +237,12 @@ impl ClosingLayer {
                     self.anchor.contains(Anchor::BOTTOM),
                 ),
             ),
+            // ClosingLayer coords are local to the buffer; convert absolute
+            // pointer (output space) into buffer-local by subtracting pos.
+            niri_config::animations::LayerAnimationOrigin::Pointer => self
+                .pointer_origin
+                .map(|p| Point::new(p.x - self.pos.x, p.y - self.pos.y))
+                .unwrap_or(center),
         };
         let elem = RescaleRenderElement::from_element(
             elem,

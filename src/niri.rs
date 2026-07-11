@@ -1585,7 +1585,9 @@ impl State {
         if config.animations.window_close.custom_shader
             != old_config.animations.window_close.custom_shader
         {
-            let src = config.animations.window_close.custom_shader.as_deref();
+            // T22: expand named presets (e.g. "scale-fade") before compile.
+            let resolved = config.animations.window_close.resolved_custom_shader();
+            let src = resolved.as_deref();
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_close_program(renderer, src);
             });
@@ -1595,7 +1597,8 @@ impl State {
         if config.animations.window_open.custom_shader
             != old_config.animations.window_open.custom_shader
         {
-            let src = config.animations.window_open.custom_shader.as_deref();
+            let resolved = config.animations.window_open.resolved_custom_shader();
+            let src = resolved.as_deref();
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_open_program(renderer, src);
             });

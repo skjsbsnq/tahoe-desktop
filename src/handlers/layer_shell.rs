@@ -172,7 +172,8 @@ impl State {
                     self.niri.clock.clone(),
                     &config,
                 );
-                mapped.start_open_animation(reopen_start);
+                let pointer = self.pointer_location_on_output(&output);
+                mapped.start_open_animation(reopen_start, pointer);
 
                 let prev = self
                     .niri
@@ -304,6 +305,8 @@ impl State {
         let output = output.clone();
         let surface = layer.clone();
 
+        // Capture pointer before borrowing backend mutably (T22 origin pointer).
+        let pointer = self.pointer_location_on_output(&output);
         let mut animation = None;
         self.backend.with_primary_renderer(|renderer| {
             let snapshot = mapped.take_unmap_snapshot().or_else(|| {
@@ -336,6 +339,7 @@ impl State {
                 anim_config,
                 unmap_snapshot.close_start,
                 layer.cached_state().anchor,
+                pointer,
             ) {
                 Ok(layer_animation) => animation = Some(layer_animation),
                 Err(err) => warn!("error starting layer close animation: {err:?}"),
@@ -354,6 +358,28 @@ impl State {
             animation,
             live_close_effects: render_close_effects_live.then_some(mapped),
         });
+    }
+}
+
+impl State {
+    /// Pointer location in the given output's local logical coordinates, if
+    /// the seat pointer is currently on that output. Used by `origin "pointer"`
+    /// layer animations (T22) — no new protocol; reuses the seat pointer.
+    fn pointer_location_on_output(
+        &self,
+        output: &Output,
+    ) -> Option<smithay::utils::Point<f64, Logical>> {
+        let pointer = self.niri.seat.get_pointer()?;
+        let global = pointer.current_location();
+        let output_geo = self.niri.global_space.output_geometry(output)?;
+        let local = global - output_geo.loc.to_f64();
+        // Accept any finite local point; out-of-bounds still produces a useful
+        // scale pivot near the click that opened the menu on multi-output.
+        if local.x.is_finite() && local.y.is_finite() {
+            Some(local)
+        } else {
+            None
+        }
     }
 }
 
