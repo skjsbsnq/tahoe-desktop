@@ -97,6 +97,14 @@ niri_render_elements! {
         OpeningShadow = OpeningLayerRenderElement<ShadowRenderElement>,
         OpeningBackgroundEffect = OpeningLayerRenderElement<BackgroundEffectElement>,
         OpeningTahoeGlass = OpeningLayerRenderElement<TahoeGlassElement>,
+        // Crop after rescale/relocate so edge-reveal clip and destination share
+        // the same absolute physical space when animation scale != 1.0.
+        CroppedOpeningWayland = CropRenderElement<OpeningLayerWaylandRenderElement<R>>,
+        CroppedOpeningSolidColor = CropRenderElement<OpeningLayerSolidColorRenderElement>,
+        CroppedOpeningShadow = CropRenderElement<OpeningLayerRenderElement<ShadowRenderElement>>,
+        CroppedOpeningBackgroundEffect =
+            CropRenderElement<OpeningLayerRenderElement<BackgroundEffectElement>>,
+        CroppedOpeningTahoeGlass = CropRenderElement<OpeningLayerRenderElement<TahoeGlassElement>>,
         Closing = ClosingLayerRenderElement,
     }
 }
@@ -638,6 +646,15 @@ impl MappedLayer {
             .close_tahoe_glass_regions
             .clone()
             .unwrap_or_else(|| with_states(surface, get_committed_regions));
+        // When close inherits a non-1.0 scale (interrupted popin → edge-reveal),
+        // rescale the moving surface rect with the same pivot so shadow excess
+        // is measured in post-wrap absolute physical space.
+        let post_wrap_moving_surface_rect = match origin {
+            Some(origin) => moving_surface_rect
+                .map(|rect| rescale_physical_rect(rect, origin, close_state.scale)),
+            None => moving_surface_rect,
+        };
+
         let rendered_tahoe_glass = tahoe_glass::render_frozen_regions_for_layer(
             ctx.as_gles(),
             ns,
@@ -663,7 +680,7 @@ impl MappedLayer {
                         ),
                         scale,
                         crop_rect,
-                        moving_surface_rect,
+                        post_wrap_moving_surface_rect,
                         push,
                     );
                 } else {
@@ -693,7 +710,7 @@ impl MappedLayer {
                     ),
                     scale,
                     crop_rect,
-                    moving_surface_rect,
+                    post_wrap_moving_surface_rect,
                     push,
                 );
             } else {
@@ -729,7 +746,7 @@ impl MappedLayer {
                         ),
                         scale,
                         crop_rect,
-                        moving_surface_rect,
+                        post_wrap_moving_surface_rect,
                         push,
                     );
                 } else {
@@ -896,6 +913,12 @@ fn wrap_opening_render_element<R: NiriRenderer>(
         LayerSurfaceRenderElement::BackgroundEffect(elem) => {
             opening_layer::wrap(elem, state, origin, offset).into()
         }
+        // Peel Tahoe glass shadow into OpeningShadow so post-wrap crop can
+        // expand for shadow excess without treating padded glass content as
+        // shadow (would widen the reveal viewport).
+        LayerSurfaceRenderElement::TahoeGlass(TahoeGlassElement::Shadow(elem)) => {
+            opening_layer::wrap(elem, state, origin, offset).into()
+        }
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
             opening_layer::wrap(elem, state, origin, offset).into()
         }
@@ -903,8 +926,13 @@ fn wrap_opening_render_element<R: NiriRenderer>(
         | elem @ LayerSurfaceRenderElement::CroppedSolidColor(_)
         | elem @ LayerSurfaceRenderElement::CroppedShadow(_)
         | elem @ LayerSurfaceRenderElement::CroppedBackgroundEffect(_)
-        | elem @ LayerSurfaceRenderElement::CroppedTahoeGlass(_) => elem,
-        elem @ LayerSurfaceRenderElement::OpeningWayland(_)
+        | elem @ LayerSurfaceRenderElement::CroppedTahoeGlass(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningWayland(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningSolidColor(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningShadow(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningBackgroundEffect(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningTahoeGlass(_)
+        | elem @ LayerSurfaceRenderElement::OpeningWayland(_)
         | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)
         | elem @ LayerSurfaceRenderElement::OpeningShadow(_)
         | elem @ LayerSurfaceRenderElement::OpeningBackgroundEffect(_)
@@ -932,6 +960,9 @@ fn wrap_render_element_with_transform<R: NiriRenderer>(
         LayerSurfaceRenderElement::BackgroundEffect(elem) => {
             opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
         }
+        LayerSurfaceRenderElement::TahoeGlass(TahoeGlassElement::Shadow(elem)) => {
+            opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
+        }
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
             opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
         }
@@ -939,14 +970,35 @@ fn wrap_render_element_with_transform<R: NiriRenderer>(
         | elem @ LayerSurfaceRenderElement::CroppedSolidColor(_)
         | elem @ LayerSurfaceRenderElement::CroppedShadow(_)
         | elem @ LayerSurfaceRenderElement::CroppedBackgroundEffect(_)
-        | elem @ LayerSurfaceRenderElement::CroppedTahoeGlass(_) => elem,
-        elem @ LayerSurfaceRenderElement::OpeningWayland(_)
+        | elem @ LayerSurfaceRenderElement::CroppedTahoeGlass(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningWayland(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningSolidColor(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningShadow(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningBackgroundEffect(_)
+        | elem @ LayerSurfaceRenderElement::CroppedOpeningTahoeGlass(_)
+        | elem @ LayerSurfaceRenderElement::OpeningWayland(_)
         | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)
         | elem @ LayerSurfaceRenderElement::OpeningShadow(_)
         | elem @ LayerSurfaceRenderElement::OpeningBackgroundEffect(_)
         | elem @ LayerSurfaceRenderElement::OpeningTahoeGlass(_)
         | elem @ LayerSurfaceRenderElement::Closing(_) => elem,
     }
+}
+
+/// Whether this element already carries edge-reveal draw_clip internally.
+///
+/// Framebuffer glass expands capture beyond the panel for sample padding.
+/// Cropping it would shrink capture and change the sampled texture when the
+/// animation settles; draw_clip keeps capture full-sized and only restricts
+/// rasterization. draw_clip is absolute physical (pre-rescale destination
+/// space); when the element is later rescaled, RescaleRenderElement remaps
+/// dst to the post-scale destination, and clip_damage intersects absolute
+/// draw_clip with that dst — so reveal clipping remains correct after wrap.
+fn tahoe_glass_uses_internal_draw_clip(elem: &TahoeGlassElement) -> bool {
+    matches!(
+        elem,
+        TahoeGlassElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(_))
+    )
 }
 
 fn push_opening_element<R: NiriRenderer>(
@@ -961,11 +1013,69 @@ fn push_opening_element<R: NiriRenderer>(
     moving_surface_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
     push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
 ) {
-    if let Some((state, origin, offset)) = open_origin.filter(|(state, _, _)| state.should_wrap()) {
-        push(wrap_opening_render_element(elem, state, origin, offset));
-        return;
-    }
+    // Coordinate contract (edge-reveal + optional inherited popin scale):
+    // 1. crop_rect / draw_clip: absolute physical, reveal viewport at rest
+    //    (base_location, unscaled size).
+    // 2. Element geometry before wrap: absolute physical of the *moving*
+    //    surface (base_location + open_offset).
+    // 3. Rescale wraps around a pivot in absolute physical space; geometry
+    //    after wrap is still absolute physical (post-scale destination).
+    // 4. Crop after wrap so crop_rect and destination share one space.
+    // 5. Internal draw_clip stays absolute physical and is applied against
+    //    the post-scale dst by FramebufferEffectElement::draw.
+    // 6. moving_surface_rect used for shadow excess must be transformed with
+    //    the same rescale so excess is measured in post-scale space.
+    let (elem, moving_surface_rect) = if let Some((state, origin, offset)) =
+        open_origin.filter(|(state, _, _)| state.should_wrap())
+    {
+        let elem = wrap_opening_render_element(elem, state, origin, offset);
+        let moving_surface_rect = moving_surface_rect.map(|rect| {
+            let mut rect = rescale_physical_rect(rect, origin, state.scale());
+            rect.loc += offset;
+            rect
+        });
+        (elem, moving_surface_rect)
+    } else {
+        (elem, moving_surface_rect)
+    };
 
+    crop_layer_element(elem, scale, crop_rect, moving_surface_rect, push);
+}
+
+fn push_close_effect_element<R: NiriRenderer>(
+    elem: LayerSurfaceRenderElement<R>,
+    scale: Scale<f64>,
+    crop_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
+    moving_surface_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
+    push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+) {
+    // Close path wraps (rescale) before calling this helper when scale != 1.
+    // Callers must pass a moving_surface_rect already expressed in the same
+    // post-wrap absolute physical space as `elem`.
+    crop_layer_element(elem, scale, crop_rect, moving_surface_rect, push);
+}
+
+/// Match [`RescaleRenderElement`] geometry transform: translate by -origin,
+/// upscale, translate by +origin. Used so shadow excess and crop share the
+/// post-animation-scale absolute physical space with the wrapped element.
+fn rescale_physical_rect(
+    mut rect: Rectangle<i32, Physical>,
+    origin: Point<i32, Physical>,
+    scale: f64,
+) -> Rectangle<i32, Physical> {
+    rect.loc -= origin;
+    rect = rect.to_f64().upscale(Scale::from(scale)).to_i32_round();
+    rect.loc += origin;
+    rect
+}
+
+fn crop_layer_element<R: NiriRenderer>(
+    elem: LayerSurfaceRenderElement<R>,
+    scale: Scale<f64>,
+    crop_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
+    moving_surface_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
+    push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+) {
     let Some(crop_rect) = crop_rect else {
         push(elem);
         return;
@@ -994,15 +1104,7 @@ fn push_opening_element<R: NiriRenderer>(
             }
         }
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
-            // Tahoe glass expands its framebuffer sample beyond the visible
-            // panel for blur/refraction padding. Its non-xray effect carries
-            // the reveal clip internally so capture stays full-sized and only
-            // drawing is clipped. Wrapping it in CropRenderElement would crop
-            // capture too, then change the sampled texture on the settle frame.
-            if matches!(
-                &elem,
-                TahoeGlassElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(_))
-            ) {
+            if tahoe_glass_uses_internal_draw_clip(&elem) {
                 push(elem.into());
                 return;
             }
@@ -1012,6 +1114,42 @@ fn push_opening_element<R: NiriRenderer>(
                 }
                 _ => crop_rect,
             };
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::OpeningWayland(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::OpeningSolidColor(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::OpeningShadow(elem) => {
+            let crop_rect = shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale));
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::OpeningBackgroundEffect(elem) => {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
+                push(elem.into());
+            }
+        }
+        LayerSurfaceRenderElement::OpeningTahoeGlass(elem) => {
+            // Framebuffer glass still relies on internal draw_clip — do not crop
+            // capture geometry. is_framebuffer_effect is forwarded through the
+            // rescale/relocate wrappers.
+            if elem.is_framebuffer_effect() {
+                push(LayerSurfaceRenderElement::OpeningTahoeGlass(elem));
+                return;
+            }
+            // Non-shadow glass content only (shadow was peeled to OpeningShadow
+            // at wrap time). Never expand the reveal crop for sample padding /
+            // ExtraDamage / xray geometry — that would leak past edge-reveal.
             if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
                 push(elem.into());
             }
@@ -1020,50 +1158,36 @@ fn push_opening_element<R: NiriRenderer>(
     }
 }
 
-fn push_close_effect_element<R: NiriRenderer>(
-    elem: LayerSurfaceRenderElement<R>,
-    scale: Scale<f64>,
-    crop_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
-    moving_surface_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
-    push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
-) {
+/// Crop decision for a layer element after optional animation rescale.
+///
+/// Returns whether the element was accepted (intersects crop or no crop) and
+/// the geometry that would be drawn. Used by unit tests to lock wrap-then-crop
+/// control flow without a GPU. Mirrors [`crop_layer_element`] policy for the
+/// stub content / shadow / padded-glass cases.
+#[cfg(test)]
+fn crop_policy_geometry(
+    elem_geo: Rectangle<i32, Physical>,
+    crop_rect: Option<Rectangle<i32, Physical>>,
+    moving_surface_rect: Option<Rectangle<i32, Physical>>,
+    kind: CropPolicyKind,
+) -> Option<Rectangle<i32, Physical>> {
     let Some(crop_rect) = crop_rect else {
-        push(elem);
-        return;
+        return Some(elem_geo);
     };
+    let crop_rect = match kind {
+        CropPolicyKind::Content | CropPolicyKind::PaddedGlass => crop_rect,
+        CropPolicyKind::Shadow => shadow_crop_rect(crop_rect, moving_surface_rect, elem_geo),
+    };
+    elem_geo.intersection(crop_rect).filter(|r| !r.is_empty())
+}
 
-    match elem {
-        LayerSurfaceRenderElement::Shadow(elem) => {
-            let crop_rect = shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale));
-            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
-                push(elem.into());
-            }
-        }
-        LayerSurfaceRenderElement::BackgroundEffect(elem) => {
-            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
-                push(elem.into());
-            }
-        }
-        LayerSurfaceRenderElement::TahoeGlass(elem) => {
-            if matches!(
-                &elem,
-                TahoeGlassElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(_))
-            ) {
-                push(elem.into());
-                return;
-            }
-            let crop_rect = match &elem {
-                TahoeGlassElement::Shadow(_) => {
-                    shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale))
-                }
-                _ => crop_rect,
-            };
-            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_rect) {
-                push(elem.into());
-            }
-        }
-        elem => push(elem),
-    }
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropPolicyKind {
+    Content,
+    Shadow,
+    /// Sample-padded / xray glass content: must NOT expand reveal crop.
+    PaddedGlass,
 }
 
 fn shadow_crop_rect(
@@ -1119,6 +1243,70 @@ fn clamp_i64_to_i32(value: i64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smithay::backend::renderer::element::utils::{
+        Relocate, RelocateRenderElement, RescaleRenderElement,
+    };
+    use smithay::backend::renderer::element::{Element, Id, Kind};
+    use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+    use smithay::utils::Buffer;
+
+    /// Minimal Element used to exercise rescale + crop composition without a GPU.
+    #[derive(Debug)]
+    struct StubElement {
+        id: Id,
+        geo: Rectangle<i32, Physical>,
+    }
+
+    impl StubElement {
+        fn new(geo: Rectangle<i32, Physical>) -> Self {
+            Self {
+                id: Id::new(),
+                geo,
+            }
+        }
+    }
+
+    impl Element for StubElement {
+        fn id(&self) -> &Id {
+            &self.id
+        }
+
+        fn current_commit(&self) -> CommitCounter {
+            CommitCounter::default()
+        }
+
+        fn src(&self) -> Rectangle<f64, Buffer> {
+            // Physical size as a unit-scale buffer rectangle for stub tests.
+            Rectangle::from_size(Size::from((
+                f64::from(self.geo.size.w),
+                f64::from(self.geo.size.h),
+            )))
+        }
+
+        fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+            self.geo
+        }
+
+        fn damage_since(
+            &self,
+            _scale: Scale<f64>,
+            _commit: Option<CommitCounter>,
+        ) -> DamageSet<i32, Physical> {
+            DamageSet::from_slice(&[Rectangle::from_size(self.geo.size)])
+        }
+
+        fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+            OpaqueRegions::default()
+        }
+
+        fn alpha(&self) -> f32 {
+            1.
+        }
+
+        fn kind(&self) -> Kind {
+            Kind::Unspecified
+        }
+    }
 
     #[test]
     fn shadow_crop_rect_expands_by_shadow_excess() {
@@ -1143,6 +1331,161 @@ mod tests {
         let expanded = shadow_crop_rect(crop, Some(moving_surface), shadow);
 
         assert_eq!(expanded, crop);
+    }
+
+    #[test]
+    fn rescale_physical_rect_matches_rescale_render_element_geometry() {
+        let output_scale = Scale::from(1.);
+        let origin = Point::from((200, 150));
+        let anim_scale = 0.5;
+        let pre = Rectangle::new(Point::from((100, 50)), Size::from((200, 100)));
+
+        let stub = StubElement::new(pre);
+        let wrapped = RescaleRenderElement::from_element(stub, origin, anim_scale);
+        let expected = wrapped.geometry(output_scale);
+
+        assert_eq!(
+            rescale_physical_rect(pre, origin, anim_scale),
+            expected,
+            "helper must mirror RescaleRenderElement geometry transform"
+        );
+    }
+
+    /// Regression: edge-reveal crop must apply AFTER rescale so content and
+    /// crop share absolute physical destination space when anim scale != 1.
+    ///
+    /// Old open path returned early on should_wrap and never cropped. Old close
+    /// path wrapped first then failed to match Opening* variants for crop.
+    /// Crop-after-wrap keeps the reveal viewport and rescaled destination
+    /// consistent: geometry is the intersection of post-scale dst with crop.
+    #[test]
+    fn edge_reveal_crop_after_rescale_clips_to_reveal_viewport() {
+        let output_scale = Scale::from(1.);
+        // Rest reveal viewport (edge-reveal crop_rect / draw_clip space).
+        let crop_rect = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        // Moving surface currently above the rest slot (sliding from top).
+        let pre_geo = Rectangle::new(Point::from((100, 40)), Size::from((200, 100)));
+        let origin = Point::from((200, 90)); // center of pre_geo
+        let anim_scale = 0.5;
+
+        let stub = StubElement::new(pre_geo);
+        let wrapped = RelocateRenderElement::from_element(
+            RescaleRenderElement::from_element(stub, origin, anim_scale),
+            Point::from((0, 0)),
+            Relocate::Relative,
+        );
+        let post_geo = wrapped.geometry(output_scale);
+        let cropped = CropRenderElement::from_element(wrapped, output_scale, crop_rect)
+            .expect("rescaled element still intersects the reveal viewport");
+
+        let expected = post_geo
+            .intersection(crop_rect)
+            .expect("post-scale geometry must overlap reveal crop");
+        assert!(!expected.is_empty());
+        assert_eq!(cropped.geometry(output_scale), expected);
+
+        // Content that scaled entirely outside the reveal viewport is dropped.
+        let far = StubElement::new(Rectangle::new(
+            Point::from((100, -200)),
+            Size::from((200, 100)),
+        ));
+        let far_wrapped = RescaleRenderElement::from_element(far, Point::from((200, -150)), 0.5);
+        assert!(
+            CropRenderElement::from_element(far_wrapped, output_scale, crop_rect).is_none(),
+            "elements fully outside the reveal viewport must not be drawn"
+        );
+    }
+
+    /// Shadow excess expansion must use a moving_surface_rect already expressed
+    /// in the same post-rescale space as the shadow geometry.
+    #[test]
+    fn shadow_crop_uses_rescaled_moving_surface_rect() {
+        let crop = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let pre_surface = Rectangle::new(Point::from((100, 40)), Size::from((200, 100)));
+        let origin = Point::from((200, 90));
+        let anim_scale = 0.5;
+
+        // Shadow extends 12px past the pre-scale surface on each side.
+        let pre_shadow = expand_rect_i32(pre_surface, 12, 12, 12, 12);
+        let post_surface = rescale_physical_rect(pre_surface, origin, anim_scale);
+        let post_shadow = rescale_physical_rect(pre_shadow, origin, anim_scale);
+
+        let expanded = shadow_crop_rect(crop, Some(post_surface), post_shadow);
+
+        // Excess after scale is half the pre-scale excess (scale=0.5).
+        let expected = expand_rect_i32(crop, 6, 6, 6, 6);
+        assert_eq!(expanded, expected);
+    }
+
+    /// Control-flow regression: after wrap, crop must still apply. Encodes the
+    /// open early-return bug (wrap then skip crop) and close Opening* mismatch.
+    #[test]
+    fn wrap_then_crop_policy_still_clips_content() {
+        let crop = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let pre = Rectangle::new(Point::from((100, 40)), Size::from((200, 100)));
+        let origin = Point::from((200, 90));
+        let post = rescale_physical_rect(pre, origin, 0.5);
+
+        // Old bug: wrap and push without crop → full post geometry drawn.
+        let uncropped = crop_policy_geometry(post, None, Some(post), CropPolicyKind::Content);
+        assert_eq!(uncropped, Some(post));
+
+        // Fixed: wrap then crop → intersection with rest reveal viewport.
+        let cropped =
+            crop_policy_geometry(post, Some(crop), Some(post), CropPolicyKind::Content).unwrap();
+        assert_eq!(cropped, post.intersection(crop).unwrap());
+        assert_ne!(cropped, post, "content must not draw outside reveal viewport");
+    }
+
+    /// Padded glass / ExtraDamage must not expand the reveal crop the way shadow does.
+    #[test]
+    fn padded_glass_does_not_expand_reveal_crop() {
+        let crop = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let surface = Rectangle::new(Point::from((100, 40)), Size::from((200, 100)));
+        // Sample padding extends 16px past the panel.
+        let padded = expand_rect_i32(surface, 16, 16, 16, 16);
+
+        let as_content =
+            crop_policy_geometry(padded, Some(crop), Some(surface), CropPolicyKind::PaddedGlass)
+                .unwrap();
+        let as_shadow =
+            crop_policy_geometry(padded, Some(crop), Some(surface), CropPolicyKind::Shadow)
+                .unwrap();
+
+        // Content/padded glass: strict rest crop.
+        assert_eq!(as_content, padded.intersection(crop).unwrap());
+        // Shadow path expands crop by excess — larger than rest crop.
+        assert!(
+            as_shadow.size.w > as_content.size.w || as_shadow.size.h > as_content.size.h,
+            "shadow excess expands crop; padded glass must not use that path"
+        );
+    }
+
+    /// Fractional output scale: crop_rect and geometry stay in the same physical
+    /// space after to_physical_precise_round + animation rescale.
+    #[test]
+    fn edge_reveal_crop_after_rescale_with_fractional_output_scale() {
+        let output_scale = Scale::from(1.25);
+        let base_loc = Point::from((80., 80.));
+        let size = Size::from((160., 80.));
+        let crop_rect = Rectangle::new(base_loc, size).to_physical_precise_round(output_scale);
+
+        // Moving surface shifted up (edge-reveal from top).
+        let moving_loc = Point::from((80., 20.));
+        let pre_geo = Rectangle::new(moving_loc, size).to_physical_precise_round(output_scale);
+        let origin = (moving_loc + size.to_point().downscale(2.)).to_physical_precise_round(output_scale);
+        let anim_scale = 0.6;
+
+        let stub = StubElement::new(pre_geo);
+        let wrapped = RescaleRenderElement::from_element(stub, origin, anim_scale);
+        let post_geo = wrapped.geometry(output_scale);
+        let cropped = CropRenderElement::from_element(wrapped, output_scale, crop_rect)
+            .expect("rescaled content still intersects reveal viewport at 1.25 scale");
+
+        assert_eq!(
+            cropped.geometry(output_scale),
+            post_geo.intersection(crop_rect).unwrap()
+        );
     }
 }
 

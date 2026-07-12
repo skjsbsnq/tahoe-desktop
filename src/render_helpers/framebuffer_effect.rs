@@ -555,6 +555,40 @@ mod tests {
         );
         assert_eq!(element.draw_clip, Some(draw_clip));
     }
+
+    /// When a popin scale is inherited into edge-reveal, RescaleRenderElement
+    /// remaps destination to post-scale absolute physical space while draw_clip
+    /// stays the absolute reveal viewport. clip_damage must still restrict
+    /// rasterization to that viewport (no magic padding / scale=1 force).
+    #[test]
+    fn draw_clip_intersects_rescaled_destination_with_reveal_viewport() {
+        // Post-rescale glass destination (shrunk around a pivot, partially
+        // overlapping the rest reveal slot).
+        let rescaled_dst = Rectangle::new(Point::from((125, 70)), Size::from((150, 120)));
+        // Absolute edge-reveal viewport at rest.
+        let draw_clip = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let mut damage = vec![Rectangle::from_size(rescaled_dst.size)];
+
+        clip_damage(&mut damage, rescaled_dst, draw_clip);
+
+        // Intersection of rescaled_dst and draw_clip is (125,100)-(275,190)
+        // size 150x90, then made relative to rescaled_dst.loc (125,70).
+        assert_eq!(
+            damage,
+            vec![Rectangle::new(Point::from((0, 30)), Size::from((150, 90)))]
+        );
+    }
+
+    #[test]
+    fn draw_clip_clears_when_rescaled_destination_misses_reveal_viewport() {
+        let rescaled_dst = Rectangle::new(Point::from((100, 0)), Size::from((200, 50)));
+        let draw_clip = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let mut damage = vec![Rectangle::from_size(rescaled_dst.size)];
+
+        clip_damage(&mut damage, rescaled_dst, draw_clip);
+
+        assert!(damage.is_empty());
+    }
 }
 
 impl Inner {
