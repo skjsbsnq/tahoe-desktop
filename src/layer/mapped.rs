@@ -536,6 +536,7 @@ impl MappedLayer {
                 self.blur_config,
                 &self.tahoe_glass_config,
                 open_alpha,
+                crop_rect,
                 xray_pos,
                 &mut |elem| push_opening(elem.into()),
             )
@@ -647,6 +648,7 @@ impl MappedLayer {
             self.blur_config,
             &self.tahoe_glass_config,
             surface_alpha,
+            crop_rect,
             xray_pos,
             regions,
             &mut |elem| {
@@ -992,6 +994,18 @@ fn push_opening_element<R: NiriRenderer>(
             }
         }
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
+            // Tahoe glass expands its framebuffer sample beyond the visible
+            // panel for blur/refraction padding. Its non-xray effect carries
+            // the reveal clip internally so capture stays full-sized and only
+            // drawing is clipped. Wrapping it in CropRenderElement would crop
+            // capture too, then change the sampled texture on the settle frame.
+            if matches!(
+                &elem,
+                TahoeGlassElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(_))
+            ) {
+                push(elem.into());
+                return;
+            }
             let crop_rect = match &elem {
                 TahoeGlassElement::Shadow(_) => {
                     shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale))
@@ -1031,6 +1045,13 @@ fn push_close_effect_element<R: NiriRenderer>(
             }
         }
         LayerSurfaceRenderElement::TahoeGlass(elem) => {
+            if matches!(
+                &elem,
+                TahoeGlassElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(_))
+            ) {
+                push(elem.into());
+                return;
+            }
             let crop_rect = match &elem {
                 TahoeGlassElement::Shadow(_) => {
                     shadow_crop_rect(crop_rect, moving_surface_rect, elem.geometry(scale))

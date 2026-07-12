@@ -40,6 +40,7 @@ pub struct FramebufferEffectElement {
     saturation: f32,
     glass: GlassOptions,
     alpha: f32,
+    draw_clip: Option<Rectangle<i32, Physical>>,
 }
 
 #[derive(Debug)]
@@ -94,6 +95,7 @@ impl FramebufferEffect {
             saturation,
             glass,
             alpha: params.alpha,
+            draw_clip: params.draw_clip,
         }
     }
 }
@@ -390,6 +392,15 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             });
         }
 
+        // Keep framebuffer capture on the full effect geometry, but restrict
+        // rasterization to the edge-reveal viewport. Damage rectangles are
+        // relative to clamped_dst at this point, so clipping damage preserves
+        // the full texture-to-destination mapping and works for transformed
+        // outputs without inventing a second sampling coordinate system.
+        if let Some(draw_clip) = self.draw_clip {
+            clip_damage(filtered, clamped_dst, draw_clip);
+        }
+
         if filtered.is_empty() {
             return Ok(());
         }
@@ -422,6 +433,26 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             uniforms,
         )
     }
+}
+
+fn clip_damage(
+    damage: &mut Vec<Rectangle<i32, Physical>>,
+    dst: Rectangle<i32, Physical>,
+    clip: Rectangle<i32, Physical>,
+) {
+    let Some(mut clip) = dst.intersection(clip) else {
+        damage.clear();
+        return;
+    };
+    clip.loc -= dst.loc;
+    damage.retain_mut(|d| {
+        if let Some(crop) = d.intersection(clip) {
+            *d = crop;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
@@ -457,6 +488,72 @@ impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
             cache,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::utils::{Point, Size};
+
+    #[test]
+    fn draw_clip_is_relative_to_clamped_destination() {
+        let dst = Rectangle::new(Point::from((90, 80)), Size::from((240, 160)));
+        let clip = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let mut damage = vec![Rectangle::from_size(dst.size)];
+
+        clip_damage(&mut damage, dst, clip);
+
+        assert_eq!(
+            damage,
+            vec![Rectangle::new(
+                Point::from((10, 20)),
+                Size::from((200, 100))
+            )]
+        );
+    }
+
+    #[test]
+    fn draw_clip_discards_damage_outside_reveal_viewport() {
+        let dst = Rectangle::new(Point::from((40, 50)), Size::from((100, 80)));
+        let clip = Rectangle::new(Point::from((200, 200)), Size::from((30, 30)));
+        let mut damage = vec![Rectangle::from_size(dst.size)];
+
+        clip_damage(&mut damage, dst, clip);
+
+        assert!(damage.is_empty());
+    }
+
+    #[test]
+    fn draw_clip_does_not_crop_framebuffer_capture_geometry() {
+        let geometry = Rectangle::new(Point::from((84., 84.)), Size::from((232., 132.)));
+        let draw_clip = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
+        let effect = FramebufferEffect::new();
+        let element = effect.render(
+            None,
+            RenderParams {
+                geometry,
+                alpha: 1.,
+                subregion: None,
+                clip: None,
+                scale: 1.25,
+                draw_clip: Some(draw_clip),
+            },
+            None,
+            0.,
+            1.,
+            GlassOptions::default(),
+        );
+
+        assert_eq!(
+            element.src(),
+            Rectangle::from_size(geometry.size.to_buffer(1., Transform::Normal))
+        );
+        assert_eq!(
+            element.geometry(Scale::from(1.25)),
+            geometry.to_physical_precise_round(Scale::from(1.25))
+        );
+        assert_eq!(element.draw_clip, Some(draw_clip));
     }
 }
 

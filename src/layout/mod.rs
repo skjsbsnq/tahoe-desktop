@@ -5400,6 +5400,7 @@ impl<W: LayoutElement> Layout<W> {
                 subregion: None,
                 clip: Some((rect, radius)),
                 scale,
+                draw_clip: None,
             };
             let elem = move_.snap_preview.effect.render(
                 None,

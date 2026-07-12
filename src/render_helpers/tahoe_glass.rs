@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use niri_config::{TahoeGlass, TahoeGlassMaterial};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 
 use crate::layout::shadow::Shadow;
@@ -111,6 +111,7 @@ pub fn render_for_layer(
     blur_config: niri_config::Blur,
     config: &TahoeGlass,
     layer_alpha: f32,
+    draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
@@ -125,6 +126,7 @@ pub fn render_for_layer(
         blur_config,
         config,
         layer_alpha,
+        draw_clip,
         xray_pos,
         regions,
         push,
@@ -142,6 +144,7 @@ pub fn render_frozen_regions_for_layer(
     blur_config: niri_config::Blur,
     config: &TahoeGlass,
     layer_alpha: f32,
+    draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
     regions: Arc<Vec<TahoeGlassRegion>>,
     push: &mut dyn FnMut(TahoeGlassElement),
@@ -156,6 +159,7 @@ pub fn render_frozen_regions_for_layer(
         blur_config,
         config,
         layer_alpha,
+        draw_clip,
         xray_pos,
         regions,
         push,
@@ -173,6 +177,7 @@ fn render_regions_for_layer(
     blur_config: niri_config::Blur,
     config: &TahoeGlass,
     layer_alpha: f32,
+    draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
     regions: Arc<Vec<TahoeGlassRegion>>,
     push: &mut dyn FnMut(TahoeGlassElement),
@@ -227,6 +232,7 @@ fn render_regions_for_layer(
                 scale,
                 blur_config,
                 layer_alpha,
+                draw_clip,
                 xray_pos,
                 push,
             );
@@ -247,6 +253,7 @@ fn render_region(
     scale: f64,
     blur_config: niri_config::Blur,
     layer_alpha: f32,
+    draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) {
@@ -310,6 +317,7 @@ fn render_region(
             subregion: None,
             clip: region.flags.clip.then_some((geometry, region.radius)),
             scale,
+            draw_clip,
         };
         let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
         renderer

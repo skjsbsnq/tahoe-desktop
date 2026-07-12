@@ -121,6 +121,14 @@ pub struct RenderParams {
     pub clip: Option<(Rectangle<f64, Logical>, CornerRadius)>,
     /// Scale to use for rounding to physical pixels.
     pub scale: f64,
+    /// Additional physical-space clip applied only while drawing.
+    ///
+    /// Unlike wrapping the render element in `CropRenderElement`, this keeps
+    /// framebuffer capture on the full effect geometry. This is needed by
+    /// edge-reveal animations: Tahoe glass samples outside its visible panel
+    /// bounds for blur/refraction padding, while the panel itself must remain
+    /// clipped to the reveal edge.
+    pub draw_clip: Option<Rectangle<i32, smithay::utils::Physical>>,
 }
 
 /// Geometry to use when the client supplied an explicit blur region.
@@ -347,6 +355,7 @@ fn render_params_for_tile(
         subregion,
         clip,
         scale,
+        draw_clip: None,
     })
 }
 

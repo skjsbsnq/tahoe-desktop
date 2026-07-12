@@ -38,7 +38,7 @@ impl TahoeGlassFlags {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TahoeGlassRegion {
     pub id: u32,
     pub rect: Rectangle<i32, Logical>,
@@ -51,21 +51,6 @@ pub struct TahoeGlassRegion {
     /// Per-region material alpha in [0, 1] for compositor-side enter/exit fades.
     /// 1 = fully visible; 0 = material parameters faded out.
     pub material_alpha: f32,
-}
-
-impl PartialEq for TahoeGlassRegion {
-    fn eq(&self, other: &Self) -> bool {
-        // Ignore sub-step float noise so clients that re-send nearly identical
-        // interaction/alpha do not force damage + redraw every frame.
-        const FLOAT_EPS: f32 = 0.02;
-        self.id == other.id
-            && self.rect == other.rect
-            && self.radius == other.radius
-            && self.material == other.material
-            && self.flags == other.flags
-            && (self.interaction - other.interaction).abs() < FLOAT_EPS
-            && (self.material_alpha - other.material_alpha).abs() < FLOAT_EPS
-    }
 }
 
 pub struct TahoeGlassSurfaceUserData {
@@ -541,5 +526,21 @@ mod tests {
             validate_regions_for_surface_geo(Some(surface_geo), &[inside.clone(), outside]),
             Some(vec![inside])
         );
+    }
+
+    #[test]
+    fn equality_preserves_adjacent_protocol_quantization_steps() {
+        let mut before = region(1, 0, 0, 100, 40);
+        let mut after = before.clone();
+
+        // Wayland fixed values are multiples of 1/256. The old 0.02 fuzzy
+        // comparison swallowed common adjacent 0.02 client buckets because
+        // five fixed steps are only 0.01953125 apart, including 0.98 -> 1.0.
+        before.material_alpha = 251. / 256.;
+        after.material_alpha = 1.;
+        assert_ne!(before, after);
+
+        let exact = after.clone();
+        assert_eq!(after, exact);
     }
 }
