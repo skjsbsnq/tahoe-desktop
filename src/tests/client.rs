@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_manager_v1::TahoeGlassManagerV1;
+use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_surface_v1::TahoeGlassSurfaceV1;
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
@@ -58,6 +60,7 @@ pub struct State {
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
+    pub tahoe_glass_manager: Option<TahoeGlassManagerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
 
@@ -187,6 +190,7 @@ impl Client {
             xdg_wm_base: None,
             layer_shell: None,
             foreign_toplevel_manager: None,
+            tahoe_glass_manager: None,
             spbm: None,
             viewporter: None,
             windows: Vec::new(),
@@ -244,6 +248,13 @@ impl Client {
 
     pub fn foreign_toplevel(&self, idx: usize) -> ZwlrForeignToplevelHandleV1 {
         self.state.foreign_toplevels[idx].clone()
+    }
+
+    pub fn tahoe_glass_manager(&self) -> TahoeGlassManagerV1 {
+        self.state
+            .tahoe_glass_manager
+            .clone()
+            .expect("tahoe_glass_manager global not bound")
     }
 
     pub fn output(&mut self, name: &str) -> WlOutput {
@@ -533,6 +544,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwlrForeignToplevelManagerV1::interface().name {
                     let version = min(version, ZwlrForeignToplevelManagerV1::interface().version);
                     state.foreign_toplevel_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == TahoeGlassManagerV1::interface().name {
+                    let version = min(version, TahoeGlassManagerV1::interface().version);
+                    state.tahoe_glass_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpSinglePixelBufferManagerV1::interface().name {
                     let version = min(version, WpSinglePixelBufferManagerV1::interface().version);
                     state.spbm = Some(registry.bind(name, version, qh, ()));
@@ -657,6 +671,32 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<TahoeGlassManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &TahoeGlassManagerV1,
+        _event: <TahoeGlassManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<TahoeGlassSurfaceV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &TahoeGlassSurfaceV1,
+        _event: <TahoeGlassSurfaceV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
     }
 }
 

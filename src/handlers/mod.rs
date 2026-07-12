@@ -986,7 +986,15 @@ delegate_output_management!(State);
 impl MutterX11InteropHandler for State {}
 delegate_mutter_x11_interop!(State);
 
-impl TahoeGlassHandler for State {}
+impl TahoeGlassHandler for State {
+    fn queue_redraw_for_tahoe_glass_surface(&mut self, surface: &WlSurface) {
+        if let Some(output) = self.niri.output_for_root(surface).cloned() {
+            self.niri.queue_redraw(&output);
+        } else {
+            self.niri.queue_redraw_all();
+        }
+    }
+}
 delegate_tahoe_glass!(State);
 
 delegate_single_pixel_buffer!(State);

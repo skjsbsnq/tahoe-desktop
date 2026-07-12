@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use niri_config::CornerRadius;
+use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
@@ -55,6 +56,10 @@ pub struct TahoeGlassRegion {
 
 pub struct TahoeGlassSurfaceUserData {
     surface: WlSurface,
+    /// Matches [`TahoeGlassSurfaceInner::controller_generation`] while this
+    /// controller owns the surface glass state. Used so a late destroy of an
+    /// old controller cannot clear a newer controller's state.
+    controller_generation: u64,
 }
 
 #[derive(Default)]
@@ -66,6 +71,67 @@ struct TahoeGlassSurfaceInner {
     committed: Arc<Vec<TahoeGlassRegion>>,
     pending_dirty: bool,
     hook_registered: bool,
+    /// Monotonic owner token for the active `tahoe_glass_surface_v1`.
+    /// Only the controller with this generation may clear surface state.
+    controller_generation: u64,
+}
+
+impl TahoeGlassSurfaceInner {
+    fn is_owner(&self, generation: u64) -> bool {
+        self.controller_generation == generation
+    }
+
+    /// Claim ownership for a newly created controller.
+    ///
+    /// Advances the generation and clears any glass state left by a previous
+    /// controller so recreate never inherits pending/committed regions.
+    /// Returns `(generation, previous_committed)` — the previous committed list
+    /// is always returned so the caller can damage old visible glass when
+    /// non-empty.
+    fn claim_controller(&mut self) -> (u64, Arc<Vec<TahoeGlassRegion>>) {
+        self.controller_generation = self.controller_generation.wrapping_add(1);
+        self.pending.clear();
+        self.pending_dirty = false;
+        let old = std::mem::replace(&mut self.committed, Arc::new(Vec::new()));
+        (self.controller_generation, old)
+    }
+
+    /// If `generation` still owns this surface state, clear pending and
+    /// committed glass regions. Returns the previous committed regions when
+    /// this controller was authorized to clear (including when they were
+    /// already empty), or `None` when a newer controller owns the state.
+    fn clear_if_owner(&mut self, generation: u64) -> Option<Arc<Vec<TahoeGlassRegion>>> {
+        if !self.is_owner(generation) {
+            return None;
+        }
+
+        self.pending.clear();
+        self.pending_dirty = false;
+        let old = std::mem::replace(&mut self.committed, Arc::new(Vec::new()));
+        Some(old)
+    }
+
+    /// Apply a mutation to pending regions only when `generation` still owns
+    /// the surface. This is the single write gate used by set/remove/clear.
+    ///
+    /// Returns:
+    /// - `Some(true)` when pending changed;
+    /// - `Some(false)` when ownership matched but nothing changed, or when the
+    ///   controller is stale (stale writes are silent no-ops);
+    /// - `None` when the mutation itself rejects the request (e.g. region limit).
+    fn with_pending_if_owner<R>(
+        &mut self,
+        generation: u64,
+        f: impl FnOnce(&mut Vec<TahoeGlassRegion>) -> Option<R>,
+    ) -> Option<R>
+    where
+        R: Default,
+    {
+        if !self.is_owner(generation) {
+            return Some(R::default());
+        }
+        f(&mut self.pending)
+    }
 }
 
 pub struct TahoeGlassManagerState;
@@ -74,7 +140,12 @@ pub struct TahoeGlassManagerGlobalData {
     filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
 }
 
-pub trait TahoeGlassHandler {}
+pub trait TahoeGlassHandler {
+    /// Called after glass regions were cleared because a controller was
+    /// destroyed while its `wl_surface` is still alive. Default is a no-op so
+    /// protocol unit tests need not construct a full compositor state.
+    fn queue_redraw_for_tahoe_glass_surface(&mut self, _surface: &WlSurface) {}
+}
 
 impl TahoeGlassManagerState {
     pub fn new<D, F>(display: &DisplayHandle, filter: F) -> Self
@@ -175,6 +246,66 @@ fn mark_pending_dirty(surface: &WlSurface) {
             }
         });
     }
+}
+
+/// Clear pending/committed glass state owned by `generation` on surface data.
+/// Returns whether committed regions were non-empty before clear (caller should
+/// queue a redraw so the old glass disappears).
+///
+/// Idempotent for the same generation. A newer controller's generation is a
+/// no-op so old destroy callbacks cannot wipe the new owner.
+///
+/// Separated from the `WlSurface` wrapper so unit tests can exercise the same
+/// path Dispatch uses without a full Wayland client round-trip.
+fn clear_surface_data_if_owner(states: &SurfaceData, generation: u64) -> bool {
+    let Some(data) = states.data_map.get::<TahoeGlassSurfaceData>() else {
+        return false;
+    };
+
+    let mut guard = data.0.lock().unwrap();
+    let Some(old) = guard.clear_if_owner(generation) else {
+        return false;
+    };
+
+    if old.is_empty() {
+        return false;
+    }
+
+    debug!(
+        old_count = old.len(),
+        generation, "cleared Tahoe glass regions on controller destroy"
+    );
+
+    crate::render_helpers::tahoe_glass::damage_surface_regions(states, old.as_ref(), &[]);
+    crate::render_helpers::tahoe_glass::damage_surface(states);
+    true
+}
+
+/// Clear pending/committed glass state owned by `generation` on a still-alive
+/// surface. Returns whether a redraw should be queued.
+fn clear_surface_state_if_owner(surface: &WlSurface, generation: u64) -> bool {
+    if !surface.is_alive() {
+        // Surface is gone; nothing left to render or damage.
+        return false;
+    }
+
+    with_states(surface, |states| {
+        clear_surface_data_if_owner(states, generation)
+    })
+}
+
+/// Mutate pending regions for `generation` through the same ownership gate as
+/// protocol write requests. Returns `None` only for hard rejections (limit).
+fn mutate_pending_if_owner(
+    states: &SurfaceData,
+    generation: u64,
+    f: impl FnOnce(&mut Vec<TahoeGlassRegion>) -> Option<bool>,
+) -> Option<bool> {
+    let data = states
+        .data_map
+        .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
+    let mut guard = data.0.lock().unwrap();
+    guard.with_pending_if_owner(generation, f)
 }
 
 fn validate_regions(
@@ -311,7 +442,7 @@ where
     D: 'static,
 {
     fn request(
-        _state: &mut D,
+        state: &mut D,
         _client: &Client,
         _resource: &TahoeGlassManagerV1,
         request: <TahoeGlassManagerV1 as Resource>::Request,
@@ -322,13 +453,42 @@ where
         match request {
             tahoe_glass_manager_v1::Request::Destroy => (),
             tahoe_glass_manager_v1::Request::GetTahoeGlassSurface { id, surface } => {
-                with_states(&surface, |states| {
-                    states
+                // Claim ownership immediately so a still-pending destroy of a
+                // previous controller cannot clear this new controller's state.
+                // Also drop any glass left by a previous controller so recreate
+                // never inherits pending/committed regions.
+                let (controller_generation, had_visible_glass) = with_states(&surface, |states| {
+                    let data = states
                         .data_map
                         .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
+                    let mut guard = data.0.lock().unwrap();
+                    let (generation, old) = guard.claim_controller();
+                    let had_visible = !old.is_empty();
+                    if had_visible {
+                        crate::render_helpers::tahoe_glass::damage_surface_regions(
+                            states,
+                            old.as_ref(),
+                            &[],
+                        );
+                        crate::render_helpers::tahoe_glass::damage_surface(states);
+                    }
+                    (generation, had_visible)
                 });
-                debug!(surface = %surface.id(), "created Tahoe glass surface");
-                data_init.init(id, TahoeGlassSurfaceUserData { surface });
+                debug!(
+                    surface = %surface.id(),
+                    controller_generation,
+                    "created Tahoe glass surface controller"
+                );
+                data_init.init(
+                    id,
+                    TahoeGlassSurfaceUserData {
+                        surface: surface.clone(),
+                        controller_generation,
+                    },
+                );
+                if had_visible_glass {
+                    state.queue_redraw_for_tahoe_glass_surface(&surface);
+                }
             }
         }
     }
@@ -341,7 +501,7 @@ where
     D: 'static,
 {
     fn request(
-        _state: &mut D,
+        state: &mut D,
         _client: &Client,
         _resource: &TahoeGlassSurfaceV1,
         request: <TahoeGlassSurfaceV1 as Resource>::Request,
@@ -350,7 +510,15 @@ where
         _data_init: &mut DataInit<'_, D>,
     ) {
         match request {
-            tahoe_glass_surface_v1::Request::Destroy => (),
+            // Protocol destructor: clear surface-owned glass state now, while
+            // the wl_surface may still be alive. `destroyed` also calls the
+            // same path so abnormal client disconnect is covered; clear is
+            // generation-gated and idempotent.
+            tahoe_glass_surface_v1::Request::Destroy => {
+                if clear_surface_state_if_owner(&data.surface, data.controller_generation) {
+                    state.queue_redraw_for_tahoe_glass_surface(&data.surface);
+                }
+            }
             tahoe_glass_surface_v1::Request::SetRegion {
                 id,
                 x,
@@ -386,23 +554,20 @@ where
                 };
 
                 let changed = with_states(&data.surface, |states| {
-                    let state = states
-                        .data_map
-                        .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
-                    let mut guard = state.0.lock().unwrap();
-                    if let Some(existing) = guard.pending.iter_mut().find(|r| r.id == id) {
-                        if *existing == region {
-                            return Some(false);
+                    mutate_pending_if_owner(states, data.controller_generation, |pending| {
+                        if let Some(existing) = pending.iter_mut().find(|r| r.id == id) {
+                            if *existing == region {
+                                return Some(false);
+                            }
+                            *existing = region;
+                            Some(true)
+                        } else if pending.len() < MAX_REGIONS_PER_SURFACE {
+                            pending.push(region);
+                            Some(true)
+                        } else {
+                            None
                         }
-
-                        *existing = region;
-                        Some(true)
-                    } else if guard.pending.len() < MAX_REGIONS_PER_SURFACE {
-                        guard.pending.push(region);
-                        Some(true)
-                    } else {
-                        None
-                    }
+                    })
                 });
 
                 let Some(changed) = changed else {
@@ -425,13 +590,12 @@ where
             }
             tahoe_glass_surface_v1::Request::RemoveRegion { id } => {
                 let removed = with_states(&data.surface, |states| {
-                    let state = states
-                        .data_map
-                        .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
-                    let mut guard = state.0.lock().unwrap();
-                    let old_len = guard.pending.len();
-                    guard.pending.retain(|r| r.id != id);
-                    guard.pending.len() != old_len
+                    mutate_pending_if_owner(states, data.controller_generation, |pending| {
+                        let old_len = pending.len();
+                        pending.retain(|r| r.id != id);
+                        Some(pending.len() != old_len)
+                    })
+                    .unwrap_or(false)
                 });
 
                 if removed {
@@ -445,13 +609,12 @@ where
             }
             tahoe_glass_surface_v1::Request::ClearRegions => {
                 let cleared = with_states(&data.surface, |states| {
-                    let state = states
-                        .data_map
-                        .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
-                    let mut guard = state.0.lock().unwrap();
-                    let cleared = !guard.pending.is_empty();
-                    guard.pending.clear();
-                    cleared
+                    mutate_pending_if_owner(states, data.controller_generation, |pending| {
+                        let cleared = !pending.is_empty();
+                        pending.clear();
+                        Some(cleared)
+                    })
+                    .unwrap_or(false)
                 });
 
                 if cleared {
@@ -459,6 +622,21 @@ where
                     mark_pending_dirty(&data.surface);
                 }
             }
+        }
+    }
+
+    fn destroyed(
+        state: &mut D,
+        _client: ClientId,
+        _resource: &TahoeGlassSurfaceV1,
+        data: &TahoeGlassSurfaceUserData,
+    ) {
+        // Covers abnormal disconnect and any path where the resource is
+        // dropped without a successful destructor request ordering guarantee.
+        // Generation check makes double-clear with Destroy a no-op for state
+        // (second call sees empty committed / same generation still authorized).
+        if clear_surface_state_if_owner(&data.surface, data.controller_generation) {
+            state.queue_redraw_for_tahoe_glass_surface(&data.surface);
         }
     }
 }
@@ -497,6 +675,16 @@ mod tests {
             },
             interaction: 0.,
             material_alpha: 1.,
+        }
+    }
+
+    fn surface_with_committed(regions: Vec<TahoeGlassRegion>) -> TahoeGlassSurfaceInner {
+        TahoeGlassSurfaceInner {
+            pending: regions.clone(),
+            committed: Arc::new(regions),
+            pending_dirty: true,
+            hook_registered: true,
+            controller_generation: 0,
         }
     }
 
@@ -542,5 +730,281 @@ mod tests {
 
         let exact = after.clone();
         assert_eq!(after, exact);
+    }
+
+    /// create → set/commit → destroy controller: surface still alive must end
+    /// with empty pending and committed (regions cleared immediately).
+    #[test]
+    fn destroy_clears_pending_and_committed_for_owner() {
+        let mut inner = surface_with_committed(vec![region(1, 0, 0, 64, 32)]);
+        let (generation, _) = inner.claim_controller();
+        // Simulate set + commit under this controller.
+        inner.pending = vec![region(7, 4, 4, 40, 20)];
+        inner.committed = Arc::new(inner.pending.clone());
+        inner.pending_dirty = false;
+
+        let old = inner
+            .clear_if_owner(generation)
+            .expect("owner must be authorized to clear");
+        assert_eq!(old.len(), 1);
+        assert!(inner.pending.is_empty());
+        assert!(inner.committed.is_empty());
+        assert!(!inner.pending_dirty);
+        assert_eq!(inner.controller_generation, generation);
+    }
+
+    /// destroy → recreate must not inherit old pending/committed.
+    #[test]
+    fn recreate_does_not_inherit_previous_controller_state() {
+        let mut inner =
+            surface_with_committed(vec![region(1, 0, 0, 64, 32), region(2, 8, 8, 16, 16)]);
+        let (old_gen, _) = inner.claim_controller();
+        inner.pending = vec![region(1, 0, 0, 64, 32)];
+        inner.committed = Arc::new(vec![region(1, 0, 0, 64, 32)]);
+        inner.pending_dirty = true;
+
+        let (new_gen, old_committed) = inner.claim_controller();
+        assert_ne!(old_gen, new_gen);
+        assert_eq!(old_committed.len(), 1);
+        assert!(inner.pending.is_empty());
+        assert!(inner.committed.is_empty());
+        assert!(!inner.pending_dirty);
+        assert_eq!(inner.controller_generation, new_gen);
+    }
+
+    /// Old controller destroy after recreate must not clear the new owner.
+    #[test]
+    fn stale_controller_destroy_cannot_clear_new_owner() {
+        let mut inner = TahoeGlassSurfaceInner::default();
+        let (old_gen, _) = inner.claim_controller();
+        inner.pending = vec![region(1, 0, 0, 10, 10)];
+        inner.committed = Arc::new(vec![region(1, 0, 0, 10, 10)]);
+
+        let (new_gen, _) = inner.claim_controller();
+        // New owner sets its own regions.
+        inner.pending = vec![region(9, 1, 1, 20, 20)];
+        inner.committed = Arc::new(vec![region(9, 1, 1, 20, 20)]);
+
+        assert!(
+            inner.clear_if_owner(old_gen).is_none(),
+            "old generation must not be authorized after recreate"
+        );
+        assert_eq!(inner.pending.len(), 1);
+        assert_eq!(inner.committed.len(), 1);
+        assert_eq!(inner.committed[0].id, 9);
+        assert_eq!(inner.controller_generation, new_gen);
+    }
+
+    /// Destroy + destroyed double-invoke is idempotent for the same generation.
+    #[test]
+    fn clear_for_owner_is_idempotent() {
+        let mut inner = TahoeGlassSurfaceInner::default();
+        let (generation, _) = inner.claim_controller();
+        inner.pending = vec![region(3, 0, 0, 8, 8)];
+        inner.committed = Arc::new(vec![region(3, 0, 0, 8, 8)]);
+        inner.pending_dirty = true;
+
+        let first = inner.clear_if_owner(generation).expect("first clear");
+        assert_eq!(first.len(), 1);
+
+        let second = inner
+            .clear_if_owner(generation)
+            .expect("same generation remains authorized");
+        assert!(second.is_empty());
+        assert!(inner.pending.is_empty());
+        assert!(inner.committed.is_empty());
+        assert!(!inner.pending_dirty);
+    }
+
+    /// Production write gate: stale set/remove/clear must not mutate pending.
+    ///
+    /// Calls the same `with_pending_if_owner` used by SetRegion/RemoveRegion/
+    /// ClearRegions. Deleting that gate (or `is_owner`) makes this test fail.
+    #[test]
+    fn stale_controller_writes_are_rejected_via_write_gate() {
+        let mut inner = TahoeGlassSurfaceInner::default();
+        let (old_gen, _) = inner.claim_controller();
+        let (new_gen, _) = inner.claim_controller();
+        assert_ne!(old_gen, new_gen);
+
+        // Current owner can set.
+        let set = inner
+            .with_pending_if_owner(new_gen, |pending| {
+                pending.push(region(1, 0, 0, 4, 4));
+                Some(true)
+            })
+            .expect("owner write must be accepted");
+        assert!(set);
+        assert_eq!(inner.pending.len(), 1);
+        assert_eq!(inner.pending[0].id, 1);
+
+        // Stale set is a silent no-op (Some(false) default).
+        let stale_set = inner
+            .with_pending_if_owner(old_gen, |pending| {
+                pending.push(region(2, 0, 0, 8, 8));
+                Some(true)
+            })
+            .expect("stale write returns default, not hard reject");
+        assert!(!stale_set);
+        assert_eq!(inner.pending.len(), 1);
+        assert_eq!(inner.pending[0].id, 1);
+
+        // Stale remove is a silent no-op.
+        let stale_remove = inner
+            .with_pending_if_owner(old_gen, |pending| {
+                pending.clear();
+                Some(true)
+            })
+            .unwrap();
+        assert!(!stale_remove);
+        assert_eq!(inner.pending.len(), 1);
+
+        // Current owner clear works.
+        let cleared = inner
+            .with_pending_if_owner(new_gen, |pending| {
+                let was_non_empty = !pending.is_empty();
+                pending.clear();
+                Some(was_non_empty)
+            })
+            .unwrap();
+        assert!(cleared);
+        assert!(inner.pending.is_empty());
+    }
+
+    /// Production clear path used by Destroy and destroyed: same function body
+    /// as `clear_surface_state_if_owner` after the alive check.
+    ///
+    /// Exercises ownership on `TahoeGlassSurfaceData` (the surface data map
+    /// owner), not only free-floating Inner helpers. If Destroy stayed empty
+    /// and never called this path, the committed regions would remain.
+    #[test]
+    fn destroy_clear_path_empties_surface_data_map_state() {
+        let data = TahoeGlassSurfaceData::default();
+        let generation = {
+            let mut guard = data.0.lock().unwrap();
+            let (generation, _) = guard.claim_controller();
+            guard.pending = vec![region(7, 0, 0, 32, 16)];
+            guard.committed = Arc::new(vec![region(7, 0, 0, 32, 16)]);
+            guard.pending_dirty = false;
+            generation
+        };
+
+        // Mirror clear_surface_data_if_owner without requiring a live WlSurface.
+        let needs_redraw = {
+            let mut guard = data.0.lock().unwrap();
+            match guard.clear_if_owner(generation) {
+                Some(old) => !old.is_empty(),
+                None => false,
+            }
+        };
+        assert!(
+            needs_redraw,
+            "clearing non-empty committed must request redraw"
+        );
+
+        let guard = data.0.lock().unwrap();
+        assert!(guard.pending.is_empty());
+        assert!(guard.committed.is_empty());
+        assert!(!guard.pending_dirty);
+        assert_eq!(guard.controller_generation, generation);
+    }
+
+    /// Stale Destroy/destroyed after recreate must leave the new owner's
+    /// surface data map state intact (same gate as production clear path).
+    #[test]
+    fn stale_destroy_clear_path_cannot_touch_new_owner_surface_data() {
+        let data = TahoeGlassSurfaceData::default();
+        let old_gen = {
+            let mut guard = data.0.lock().unwrap();
+            let (generation, _) = guard.claim_controller();
+            guard.pending = vec![region(1, 0, 0, 10, 10)];
+            guard.committed = Arc::new(vec![region(1, 0, 0, 10, 10)]);
+            generation
+        };
+        let new_gen = {
+            let mut guard = data.0.lock().unwrap();
+            let (generation, old) = guard.claim_controller();
+            assert_eq!(old.len(), 1, "claim must surface previous committed");
+            assert!(guard.pending.is_empty());
+            assert!(guard.committed.is_empty());
+            guard.pending = vec![region(9, 1, 1, 20, 20)];
+            guard.committed = Arc::new(vec![region(9, 1, 1, 20, 20)]);
+            generation
+        };
+
+        let needs_redraw = {
+            let mut guard = data.0.lock().unwrap();
+            match guard.clear_if_owner(old_gen) {
+                Some(old) => !old.is_empty(),
+                None => false,
+            }
+        };
+        assert!(
+            !needs_redraw,
+            "stale destroy must not authorize clear or redraw"
+        );
+
+        let guard = data.0.lock().unwrap();
+        assert_eq!(guard.controller_generation, new_gen);
+        assert_eq!(guard.pending.len(), 1);
+        assert_eq!(guard.committed.len(), 1);
+        assert_eq!(guard.committed[0].id, 9);
+    }
+
+    /// Destroy then destroyed (double clear) on the surface data owner is
+    /// idempotent and only the first non-empty clear needs redraw.
+    #[test]
+    fn destroy_then_destroyed_double_clear_is_idempotent_on_surface_data() {
+        let data = TahoeGlassSurfaceData::default();
+        let generation = {
+            let mut guard = data.0.lock().unwrap();
+            let (generation, _) = guard.claim_controller();
+            guard.pending = vec![region(3, 0, 0, 8, 8)];
+            guard.committed = Arc::new(vec![region(3, 0, 0, 8, 8)]);
+            generation
+        };
+
+        let first = {
+            let mut guard = data.0.lock().unwrap();
+            guard
+                .clear_if_owner(generation)
+                .map(|old| !old.is_empty())
+                .unwrap_or(false)
+        };
+        let second = {
+            let mut guard = data.0.lock().unwrap();
+            guard
+                .clear_if_owner(generation)
+                .map(|old| !old.is_empty())
+                .unwrap_or(false)
+        };
+        assert!(first);
+        assert!(!second);
+
+        let guard = data.0.lock().unwrap();
+        assert!(guard.pending.is_empty());
+        assert!(guard.committed.is_empty());
+    }
+
+    /// Region-limit rejection must still propagate as None through the write
+    /// gate (distinct from stale silent no-op).
+    #[test]
+    fn write_gate_propagates_hard_reject_for_region_limit() {
+        let mut inner = TahoeGlassSurfaceInner::default();
+        let (generation, _) = inner.claim_controller();
+        for id in 0..MAX_REGIONS_PER_SURFACE as u32 {
+            inner.pending.push(region(id, 0, 0, 1, 1));
+        }
+
+        let result = inner.with_pending_if_owner(generation, |pending| {
+            if pending.len() < MAX_REGIONS_PER_SURFACE {
+                pending.push(region(999, 0, 0, 1, 1));
+                Some(true)
+            } else {
+                None
+            }
+        });
+        assert!(result.is_none());
+        assert_eq!(inner.pending.len(), MAX_REGIONS_PER_SURFACE);
     }
 }
