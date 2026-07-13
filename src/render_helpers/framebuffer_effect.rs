@@ -589,6 +589,77 @@ mod tests {
 
         assert!(damage.is_empty());
     }
+
+    /// Task 16 negative contract: omitting `clip` makes draw bounds fall back
+    /// to capture geometry. For Tahoe glass that means sample padding becomes
+    /// a visible halo — callers must always pass `Some(visible_region)`.
+    #[test]
+    fn missing_clip_falls_back_to_geometry_as_clip_geo() {
+        let sample = Rectangle::new(Point::from((76., 26.)), Size::from((248., 128.)));
+        let effect = FramebufferEffect::new();
+        let element = effect.render(
+            None,
+            RenderParams {
+                geometry: sample,
+                alpha: 1.,
+                subregion: None,
+                clip: None,
+                scale: 1.25,
+                draw_clip: None,
+            },
+            None,
+            0.,
+            1.,
+            GlassOptions::default(),
+        );
+
+        assert_eq!(
+            element.clip_geo, sample,
+            "clip=None must fall back to params.geometry (sample) — the halo path"
+        );
+        assert_eq!(element.corner_radius, CornerRadius::default());
+    }
+
+    /// Task 16 positive contract: an explicit visible clip keeps capture on the
+    /// expanded sample while draw clip_geo stays on the protocol region.
+    #[test]
+    fn explicit_clip_keeps_clip_geo_on_visible_not_sample() {
+        let visible = Rectangle::new(Point::from((100., 50.)), Size::from((200., 80.)));
+        let sample = Rectangle::new(Point::from((76., 26.)), Size::from((248., 128.)));
+        let radius = CornerRadius {
+            top_left: 12.,
+            top_right: 12.,
+            bottom_right: 12.,
+            bottom_left: 12.,
+        };
+        let effect = FramebufferEffect::new();
+        let element = effect.render(
+            None,
+            RenderParams {
+                geometry: sample,
+                alpha: 1.,
+                subregion: None,
+                clip: Some((visible, radius)),
+                scale: 1.25,
+                draw_clip: None,
+            },
+            None,
+            0.,
+            1.,
+            GlassOptions::default(),
+        );
+
+        assert_eq!(element.geometry, sample, "capture geometry stays expanded");
+        assert_eq!(
+            element.clip_geo, visible,
+            "draw clip must stay on the protocol-visible region"
+        );
+        assert_ne!(
+            element.clip_geo, sample,
+            "draw clip must not equal sample padding bounds"
+        );
+        assert_eq!(element.corner_radius, radius);
+    }
 }
 
 impl Inner {

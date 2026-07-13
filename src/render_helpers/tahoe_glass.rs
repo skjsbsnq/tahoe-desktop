@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use niri_config::{TahoeGlass, TahoeGlassMaterial};
+use niri_config::{CornerRadius, TahoeGlass, TahoeGlassMaterial};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
@@ -294,7 +294,26 @@ fn render_region(
     }
 
     let sample_padding = glass_sample_padding(region, effect, blur_config);
+    // Capture/sample geometry may expand beyond the protocol region so blur
+    // and refraction have enough context. Draw/visible geometry must stay
+    // exactly on the protocol region — sample padding must never become a
+    // visible halo. The `clip` flag only selects rounded vs rectangular
+    // corner semantics inside that visible bound.
     let sample_geometry = expand_rect(geometry, sample_padding);
+    let params = glass_region_render_params(
+        geometry,
+        sample_geometry,
+        region.flags.clip,
+        region.radius,
+        material_alpha,
+        scale,
+        draw_clip,
+    );
+    let visible_radius = params
+        .clip
+        .as_ref()
+        .map(|(_, radius)| *radius)
+        .unwrap_or(region.radius);
     trace!(
         material = %region.material,
         area = region_area(region),
@@ -306,19 +325,13 @@ fn render_region(
     );
 
     renderer.background_effect.update_config(blur_config);
+    // Corner radius stored on the effect is what render() writes into clip;
+    // keep it consistent with the visible clip decision above.
     renderer
         .background_effect
-        .update_render_elements(region.radius, effect, region.flags.blur);
+        .update_render_elements(visible_radius, effect, region.flags.blur);
 
     if renderer.background_effect.is_visible() {
-        let params = RenderParams {
-            geometry: sample_geometry,
-            alpha: material_alpha,
-            subregion: None,
-            clip: region.flags.clip.then_some((geometry, region.radius)),
-            scale,
-            draw_clip,
-        };
         let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
         renderer
             .background_effect
@@ -370,9 +383,262 @@ fn glass_sample_padding(
     padding.clamp(2.0, 64.0)
 }
 
+/// Build `RenderParams` that keep sample and visible geometry separated.
+///
+/// - `sample_geometry` expands capture for blur/refraction padding.
+/// - Draw clip is **always** `Some(visible_geometry, …)`. Omitting clip lets
+///   `FramebufferEffect` / xray fall back to `params.geometry` and paints the
+///   padding as a visible halo when `clip=false`.
+/// - The protocol `clip` flag only chooses rounded (`radius`) vs rectangular
+///   (`CornerRadius::default`) material inside the visible bound — it must not
+///   opt out of clipping sample padding away from the drawable region.
+fn glass_region_render_params(
+    visible_geometry: Rectangle<f64, Logical>,
+    sample_geometry: Rectangle<f64, Logical>,
+    clip: bool,
+    radius: CornerRadius,
+    alpha: f32,
+    scale: f64,
+    draw_clip: Option<Rectangle<i32, Physical>>,
+) -> RenderParams {
+    let corner = if clip {
+        radius
+    } else {
+        CornerRadius::default()
+    };
+    RenderParams {
+        geometry: sample_geometry,
+        alpha,
+        subregion: None,
+        clip: Some((visible_geometry, corner)),
+        scale,
+        draw_clip,
+    }
+}
+
 fn expand_rect(rect: Rectangle<f64, Logical>, padding: f64) -> Rectangle<f64, Logical> {
     Rectangle::new(
         Point::new(rect.loc.x - padding, rect.loc.y - padding),
         Size::new(rect.size.w + padding * 2.0, rect.size.h + padding * 2.0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::utils::{Point, Size};
+
+    fn visible_rect() -> Rectangle<f64, Logical> {
+        Rectangle::new(Point::from((100.0, 50.0)), Size::from((200.0, 80.0)))
+    }
+
+    fn rounded_radius() -> CornerRadius {
+        CornerRadius {
+            top_left: 12.0,
+            top_right: 12.0,
+            bottom_right: 12.0,
+            bottom_left: 12.0,
+        }
+    }
+
+    /// Old broken wiring: `clip` only when the protocol flag is set. When the
+    /// flag is false this yields `clip=None`, and FramebufferEffect falls back
+    /// to sample geometry — the Task 16 halo regression.
+    fn legacy_then_some_params(
+        visible: Rectangle<f64, Logical>,
+        sample: Rectangle<f64, Logical>,
+        clip: bool,
+        radius: CornerRadius,
+        alpha: f32,
+        scale: f64,
+        draw_clip: Option<Rectangle<i32, Physical>>,
+    ) -> RenderParams {
+        RenderParams {
+            geometry: sample,
+            alpha,
+            subregion: None,
+            clip: clip.then_some((visible, radius)),
+            scale,
+            draw_clip,
+        }
+    }
+
+    #[test]
+    fn sample_geometry_expands_by_padding_while_visible_stays_put() {
+        let visible = visible_rect();
+        let padding = 24.0;
+        let sample = expand_rect(visible, padding);
+
+        assert_eq!(
+            sample,
+            Rectangle::new(Point::from((76.0, 26.0)), Size::from((248.0, 128.0)))
+        );
+        // Visible geometry is never expanded — padding is sample-only.
+        assert_eq!(visible.size, Size::from((200.0, 80.0)));
+        assert!(sample.size.w > visible.size.w);
+        assert!(sample.size.h > visible.size.h);
+    }
+
+    #[test]
+    fn clip_false_params_always_clip_to_visible_not_sample() {
+        // Regression: clip=false used to leave clip=None, so FramebufferEffect
+        // fell back to sample_geometry and painted the blur/refraction padding
+        // as a visible halo outside the protocol region.
+        let visible = visible_rect();
+        let radius = rounded_radius();
+        let padding = 32.0;
+        let sample = expand_rect(visible, padding);
+        let draw_clip = Some(Rectangle::new(
+            Point::from((90, 40)),
+            Size::from((220, 100)),
+        ));
+        let params = glass_region_render_params(
+            visible, sample, false, radius, 0.85, 1.25, draw_clip,
+        );
+
+        assert_eq!(params.geometry, sample, "capture stays on expanded sample");
+        let (clip_geo, clip_radius) = params
+            .clip
+            .expect("clip must always be Some so padding is never drawn");
+        assert_eq!(
+            clip_geo, visible,
+            "draw clip must stay on the protocol region"
+        );
+        assert_ne!(
+            clip_geo, sample,
+            "draw clip must not include sample padding"
+        );
+        assert_eq!(
+            clip_radius,
+            CornerRadius::default(),
+            "clip=false is rectangular material, not rounded"
+        );
+        assert_eq!(params.alpha, 0.85);
+        assert_eq!(params.scale, 1.25);
+        assert_eq!(params.draw_clip, draw_clip);
+        // Sample padding is still present for capture quality.
+        assert!(sample.size.w - visible.size.w >= padding * 2.0 - f64::EPSILON);
+    }
+
+    #[test]
+    fn clip_true_params_use_region_radius_on_visible_geometry() {
+        let visible = visible_rect();
+        let radius = CornerRadius {
+            top_left: 16.0,
+            top_right: 8.0,
+            bottom_right: 4.0,
+            bottom_left: 2.0,
+        };
+        let sample = expand_rect(visible, 16.0);
+        let params =
+            glass_region_render_params(visible, sample, true, radius, 1.0, 1.0, None);
+
+        assert_eq!(params.geometry, sample);
+        let (clip_geo, clip_radius) = params.clip.expect("clip always Some");
+        assert_eq!(clip_geo, visible);
+        assert_eq!(clip_radius, radius);
+    }
+
+    #[test]
+    fn legacy_then_some_wiring_would_omit_clip_when_flag_false() {
+        // Old call site contract that must stay red: only Some when flag true.
+        let visible = visible_rect();
+        let sample = expand_rect(visible, 24.0);
+        let legacy = legacy_then_some_params(
+            visible,
+            sample,
+            false,
+            rounded_radius(),
+            1.0,
+            1.0,
+            None,
+        );
+        assert!(
+            legacy.clip.is_none(),
+            "documents the pre-fix wiring that painted sample padding"
+        );
+
+        let fixed = glass_region_render_params(
+            visible,
+            sample,
+            false,
+            rounded_radius(),
+            1.0,
+            1.0,
+            None,
+        );
+        assert!(
+            fixed.clip.is_some(),
+            "fixed wiring must always supply a visible clip"
+        );
+        assert_ne!(
+            fixed.clip.as_ref().map(|(g, _)| *g),
+            Some(sample),
+            "fixed clip must not equal sample geometry"
+        );
+    }
+
+    #[test]
+    fn sample_padding_is_never_zeroed_for_blur_quality() {
+        // Task forbids zeroing sample padding / disabling blur to hide the halo.
+        // Minimum padding stays at least 2.0 even with blur off and no refraction.
+        use crate::protocols::tahoe_glass::{TahoeGlassFlags, TahoeGlassRegion};
+
+        let region = TahoeGlassRegion {
+            id: 1,
+            rect: Rectangle::new(Point::from((0, 0)), Size::from((100, 40))),
+            radius: CornerRadius::default(),
+            material: "panel".into(),
+            flags: TahoeGlassFlags {
+                blur: false,
+                shadow: false,
+                clip: false,
+            },
+            interaction: 0.0,
+            material_alpha: 1.0,
+        };
+        let padding = glass_sample_padding(
+            &region,
+            niri_config::BackgroundEffect::default(),
+            niri_config::Blur::default(),
+        );
+        assert!(
+            padding >= 2.0,
+            "sample padding must remain available for quality, got {padding}"
+        );
+        assert!(padding <= 64.0);
+    }
+
+    #[test]
+    fn edge_region_sample_expands_outside_visible_bounds() {
+        // A region sitting on the edge of a surface still samples outside its
+        // visible rect; drawing must remain clipped to that rect.
+        let visible = Rectangle::new(Point::from((0.0, 0.0)), Size::from((120.0, 32.0)));
+        let padding = 16.0;
+        let sample = expand_rect(visible, padding);
+        let params =
+            glass_region_render_params(visible, sample, false, CornerRadius::from(8.0), 1.0, 1.0, None);
+
+        assert_eq!(params.geometry, sample);
+        let (clip_geo, _) = params.clip.unwrap();
+        assert_eq!(clip_geo.loc, Point::from((0.0, 0.0)));
+        assert_eq!(clip_geo.size, Size::from((120.0, 32.0)));
+        assert_eq!(sample.loc, Point::from((-16.0, -16.0)));
+        assert_eq!(sample.size, Size::from((152.0, 64.0)));
+    }
+
+    #[test]
+    fn edge_reveal_draw_clip_is_passed_through_unchanged() {
+        let visible = visible_rect();
+        let sample = expand_rect(visible, 20.0);
+        let draw_clip = Some(Rectangle::new(
+            Point::from((100, 100)),
+            Size::from((200, 100)),
+        ));
+        let params =
+            glass_region_render_params(visible, sample, true, rounded_radius(), 1.0, 2.0, draw_clip);
+        assert_eq!(params.draw_clip, draw_clip);
+        assert_eq!(params.scale, 2.0);
+        assert!(params.clip.is_some());
+    }
 }
