@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use niri_config::CornerRadius;
@@ -116,8 +118,8 @@ impl TahoeGlassSurfaceInner {
     ///
     /// Returns:
     /// - `Some(true)` when pending changed;
-    /// - `Some(false)` when ownership matched but nothing changed, or when the
-    ///   controller is stale (stale writes are silent no-ops);
+    /// - `Some(false)` when ownership matched but nothing changed, or when the controller is stale
+    ///   (stale writes are silent no-ops);
     /// - `None` when the mutation itself rejects the request (e.g. region limit).
     fn with_pending_if_owner<R>(
         &mut self,
@@ -278,7 +280,71 @@ fn clear_surface_data_if_owner(states: &SurfaceData, generation: u64) -> bool {
 
     crate::render_helpers::tahoe_glass::damage_surface_regions(states, old.as_ref(), &[]);
     crate::render_helpers::tahoe_glass::damage_surface(states);
+    #[cfg(test)]
+    {
+        // Record the old committed geometry that production damage was asked to
+        // cover so integration tests can prove clear damages the prior area.
+        TEST_DAMAGE_OLD_REGION_COUNT.fetch_add(old.len(), AtomicOrdering::SeqCst);
+        let mut rects = TEST_LAST_DAMAGED_OLD_RECTS.lock().unwrap();
+        rects.clear();
+        for region in old.iter() {
+            let r = region.rect;
+            rects.push((r.loc.x, r.loc.y, r.size.w, r.size.h));
+        }
+    }
     true
+}
+
+/// Test-only counters for [`TahoeGlassHandler::queue_redraw_for_tahoe_glass_surface`]
+/// and the clear-path damage call. Production builds omit these symbols entirely.
+#[cfg(test)]
+static TEST_TARGETED_REDRAW: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_FALLBACK_REDRAW_ALL: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_DAMAGE_OLD_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_LAST_DAMAGED_OLD_RECTS: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
+
+/// Reset redraw/damage counters between tests.
+#[cfg(test)]
+pub fn test_reset_redraw_counters() {
+    TEST_TARGETED_REDRAW.store(0, AtomicOrdering::SeqCst);
+    TEST_FALLBACK_REDRAW_ALL.store(0, AtomicOrdering::SeqCst);
+    TEST_DAMAGE_OLD_REGION_COUNT.store(0, AtomicOrdering::SeqCst);
+    TEST_LAST_DAMAGED_OLD_RECTS.lock().unwrap().clear();
+}
+
+/// Note a targeted (output_for_root hit) redraw from the production handler.
+#[cfg(test)]
+pub fn test_note_targeted_redraw() {
+    TEST_TARGETED_REDRAW.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+/// Note a fallback queue_redraw_all from the production handler.
+#[cfg(test)]
+pub fn test_note_fallback_redraw_all() {
+    TEST_FALLBACK_REDRAW_ALL.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+#[cfg(test)]
+pub fn test_targeted_redraw_count() -> usize {
+    TEST_TARGETED_REDRAW.load(AtomicOrdering::SeqCst)
+}
+
+#[cfg(test)]
+pub fn test_fallback_redraw_all_count() -> usize {
+    TEST_FALLBACK_REDRAW_ALL.load(AtomicOrdering::SeqCst)
+}
+
+#[cfg(test)]
+pub fn test_damage_old_region_count() -> usize {
+    TEST_DAMAGE_OLD_REGION_COUNT.load(AtomicOrdering::SeqCst)
+}
+
+#[cfg(test)]
+pub fn test_last_damaged_old_rects() -> Vec<(i32, i32, i32, i32)> {
+    TEST_LAST_DAMAGED_OLD_RECTS.lock().unwrap().clone()
 }
 
 /// Clear pending/committed glass state owned by `generation` on a still-alive

@@ -989,8 +989,12 @@ delegate_mutter_x11_interop!(State);
 impl TahoeGlassHandler for State {
     fn queue_redraw_for_tahoe_glass_surface(&mut self, surface: &WlSurface) {
         if let Some(output) = self.niri.output_for_root(surface).cloned() {
+            #[cfg(test)]
+            crate::protocols::tahoe_glass::test_note_targeted_redraw();
             self.niri.queue_redraw(&output);
         } else {
+            #[cfg(test)]
+            crate::protocols::tahoe_glass::test_note_fallback_redraw_all();
             self.niri.queue_redraw_all();
         }
     }

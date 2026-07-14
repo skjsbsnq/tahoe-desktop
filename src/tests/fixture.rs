@@ -124,6 +124,27 @@ impl Fixture {
         self.state.client(id)
     }
 
+    /// Drop a test client without a clean protocol teardown.
+    ///
+    /// Closes the client-side socket so the compositor sees an abnormal
+    /// disconnect and destroys remaining client objects (including any
+    /// still-alive `tahoe_glass_surface_v1`). Used by Tahoe glass lifecycle
+    /// coverage; not a general production API.
+    pub fn disconnect_client(&mut self, id: ClientId) {
+        let pos = self
+            .state
+            .clients
+            .iter()
+            .position(|c| c.id == id)
+            .expect("disconnect_client: unknown ClientId");
+        let client = self.state.clients.remove(pos);
+        drop(client);
+        // Drain compositor cleanup for the closed socket.
+        for _ in 0..8 {
+            self.dispatch();
+        }
+    }
+
     pub fn roundtrip(&mut self, id: ClientId) {
         let client = self.state.client(id);
         let data = client.send_sync();
