@@ -4790,8 +4790,10 @@ impl Niri {
                 continue;
             }
 
-            let elem = closing.animation.render(view_rect, scale, ctx.target);
-            push(elem.into());
+            // Complete edge-reveal miss returns None: do not push uncropped content.
+            if let Some(elem) = closing.animation.render(view_rect, scale, ctx.target) {
+                push(elem.into());
+            }
 
             if let Some(mapped) = &closing.live_close_effects {
                 let loc = closing.animation.position();

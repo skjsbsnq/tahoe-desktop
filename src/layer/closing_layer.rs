@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Context as _;
 use niri_config::BlockOutFrom;
 use smithay::backend::allocator::Fourcc;
@@ -9,7 +11,6 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::Texture;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shell::wlr_layer::Anchor;
-use std::time::Duration;
 
 use crate::animation::Animation;
 use crate::niri_render_elements;
@@ -194,12 +195,17 @@ impl ClosingLayer {
         }
     }
 
+    /// Render the closing snapshot for this frame.
+    ///
+    /// Returns `None` when edge-reveal crop is active and the transformed snapshot
+    /// is completely outside the reveal viewport. That means "do not draw", not
+    /// "fall through to the uncropped element".
     pub fn render(
         &self,
         view_rect: Rectangle<f64, Logical>,
         scale: Scale<f64>,
         target: RenderTarget,
-    ) -> ClosingLayerRenderElement {
+    ) -> Option<ClosingLayerRenderElement> {
         let (buffer, offset) = if target.should_block_out(self.block_out_from) {
             let (buffer, offset) = self
                 .blocked_out
@@ -261,17 +267,21 @@ impl ClosingLayer {
         let mut crop_location = self.pos;
         crop_location.x -= view_rect.loc.x;
         if let Some(crop_rect) = state.edge_reveal_crop_rect(crop_location, self.geo_size, scale) {
+            // Edge-reveal: partial intersection → crop; complete miss → drop.
+            // Never fall through to the uncropped element (would flash full surface).
             let intersects = elem
                 .geometry(scale)
                 .intersection(crop_rect)
                 .is_some_and(|rect| !rect.is_empty());
-            if intersects {
-                let elem = CropRenderElement::from_element(elem, scale, crop_rect).unwrap();
-                return elem.into();
+            if !intersects {
+                return None;
             }
+            let elem = CropRenderElement::from_element(elem, scale, crop_rect).unwrap();
+            return Some(elem.into());
         }
 
-        elem.into()
+        // No edge-reveal crop (fade/slide/pop styles): draw the transformed element.
+        Some(elem.into())
     }
 
     pub fn render_state(&self) -> CloseAnimationRenderState {
@@ -353,5 +363,147 @@ fn anchor_axis_origin(size: f64, anchored_min: bool, anchored_max: bool) -> f64 
         (true, false) => 0.,
         (false, true) => size,
         _ => size / 2.,
+    }
+}
+
+/// Pure geometry policy for closing edge-reveal crop decisions.
+///
+/// Mirrors [`ClosingLayer::render`]: no crop → draw; partial → crop geo;
+/// complete miss → drop (None). Used by unit tests without a GPU texture.
+#[cfg(test)]
+pub(crate) fn closing_edge_reveal_draw_geo(
+    elem_geo: Rectangle<i32, Physical>,
+    crop_rect: Option<Rectangle<i32, Physical>>,
+) -> Option<Rectangle<i32, Physical>> {
+    let Some(crop_rect) = crop_rect else {
+        return Some(elem_geo);
+    };
+    elem_geo.intersection(crop_rect).filter(|r| !r.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use niri_config::animations::{LayerAnimationOrigin, LayerCloseAnimationStyle};
+    use smithay::utils::{Point, Rectangle, Scale, Size};
+
+    use super::*;
+
+    fn edge_reveal_state(offset: Point<f64, Logical>) -> CloseAnimationRenderState {
+        CloseAnimationRenderState {
+            alpha: 1.,
+            scale: 1.,
+            offset,
+            origin: LayerAnimationOrigin::Center,
+            style: LayerCloseAnimationStyle::EdgeReveal,
+        }
+    }
+
+    fn fade_state() -> CloseAnimationRenderState {
+        CloseAnimationRenderState {
+            alpha: 1.,
+            scale: 1.,
+            offset: Point::from((0., 0.)),
+            origin: LayerAnimationOrigin::Center,
+            style: LayerCloseAnimationStyle::Fade,
+        }
+    }
+
+    #[test]
+    fn no_edge_reveal_keeps_uncropped_draw() {
+        let geo = Rectangle::new(Point::from((10, 10)), Size::from((100, 50)));
+        assert_eq!(
+            closing_edge_reveal_draw_geo(geo, None),
+            Some(geo),
+            "non-edge-reveal styles must keep drawing"
+        );
+        assert!(fade_state()
+            .edge_reveal_crop_rect(
+                Point::from((0., 0.)),
+                Size::from((100., 50.)),
+                Scale::from(1.),
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn partial_intersection_returns_cropped_geo() {
+        let crop = Rectangle::new(Point::from((0, 0)), Size::from((100, 100)));
+        let elem = Rectangle::new(Point::from((50, 50)), Size::from((100, 100)));
+        let drawn = closing_edge_reveal_draw_geo(elem, Some(crop)).expect("partial must draw");
+        assert_eq!(
+            drawn,
+            Rectangle::new(Point::from((50, 50)), Size::from((50, 50)))
+        );
+    }
+
+    #[test]
+    fn complete_miss_returns_none() {
+        let crop = Rectangle::new(Point::from((0, 0)), Size::from((100, 100)));
+        // Fully below the reveal viewport.
+        let elem = Rectangle::new(Point::from((0, 200)), Size::from((100, 50)));
+        assert_eq!(
+            closing_edge_reveal_draw_geo(elem, Some(crop)),
+            None,
+            "complete miss must not fall through to uncropped draw"
+        );
+    }
+
+    #[test]
+    fn complete_miss_after_edge_offset_returns_none() {
+        // Snap at rest size 200x80, crop is rest viewport; after full bottom
+        // retract the relocated geo sits entirely below the crop.
+        let scale = Scale::from(1.);
+        let geo_size = Size::from((200., 80.));
+        let pos = Point::from((10., 20.));
+        let state = edge_reveal_state(Point::from((0., 80.))); // full height offset
+        let crop = state
+            .edge_reveal_crop_rect(pos, geo_size, scale)
+            .expect("edge-reveal must produce crop");
+        let relocated = Rectangle::new(
+            Point::from(((pos.x).round() as i32, (pos.y + 80.).round() as i32)),
+            Size::from((200, 80)),
+        );
+        assert_eq!(closing_edge_reveal_draw_geo(relocated, Some(crop)), None);
+    }
+
+    #[test]
+    fn fractional_scale_partial_intersection() {
+        let scale = Scale::from(1.25);
+        let geo_size = Size::from((160., 64.));
+        let pos = Point::from((8., 12.));
+        let state = edge_reveal_state(Point::from((0., 20.)));
+        let crop = state
+            .edge_reveal_crop_rect(pos, geo_size, scale)
+            .expect("crop");
+        // Relocated element still overlaps crop after partial offset.
+        let relocated_loc = (pos + Point::from((0., 20.))).to_physical_precise_round(scale);
+        let relocated_size = geo_size.to_physical_precise_round(scale);
+        let elem = Rectangle::new(relocated_loc, relocated_size);
+        let drawn = closing_edge_reveal_draw_geo(elem, Some(crop)).expect("partial");
+        assert!(!drawn.is_empty());
+        assert!(drawn.intersection(crop).is_some());
+    }
+
+    #[test]
+    fn inherited_non_one_scale_still_drops_complete_miss() {
+        // Non-1.0 animation scale (interrupted open→close) does not change
+        // the complete-miss drop policy once geometries are computed.
+        let crop = Rectangle::new(Point::from((0, 0)), Size::from((200, 100)));
+        // After rescale, geometry is outside crop entirely.
+        let post_scale_geo = Rectangle::new(Point::from((400, 0)), Size::from((100, 80)));
+        assert_eq!(
+            closing_edge_reveal_draw_geo(post_scale_geo, Some(crop)),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_intersection_is_miss() {
+        // Touching only on a zero-area edge counts as miss.
+        let crop = Rectangle::new(Point::from((0, 0)), Size::from((100, 100)));
+        let elem = Rectangle::new(Point::from((100, 0)), Size::from((50, 50)));
+        let inter = elem.intersection(crop);
+        assert!(inter.is_none() || inter.is_some_and(|r| r.is_empty()));
+        assert_eq!(closing_edge_reveal_draw_geo(elem, Some(crop)), None);
     }
 }
