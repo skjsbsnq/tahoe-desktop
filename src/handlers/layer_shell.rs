@@ -5,15 +5,15 @@ use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Rectangle, Scale};
-use smithay::wayland::compositor::{add_pre_commit_hook, get_parent, with_states, HookId};
-use smithay::wayland::compositor::{BufferAssignment, SurfaceAttributes};
+use smithay::wayland::compositor::{
+    add_pre_commit_hook, get_parent, with_states, BufferAssignment, HookId, SurfaceAttributes,
+};
 use smithay::wayland::shell::wlr_layer::{
     self, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceCachedState, LayerSurfaceData,
     WlrLayerShellHandler, WlrLayerShellState,
 };
 use smithay::wayland::shell::xdg::PopupSurface;
 
-use crate::animation::Animation;
 use crate::layer::closing_layer::ClosingLayer;
 use crate::layer::opening_layer::OpenAnimationStartState;
 use crate::layer::{MappedLayer, ResolvedLayerRules};
@@ -325,17 +325,13 @@ impl State {
                 return;
             }
 
-            let transform_anim =
-                Animation::new(clock.clone(), 0., 1., 0., anim_config.transform_anim);
-            let opacity_anim = Animation::new(clock, 0., 1., 0., anim_config.opacity_anim);
             match ClosingLayer::new(
                 renderer,
                 snapshot,
                 scale,
                 geo.size.to_f64(),
                 geo.loc.to_f64(),
-                transform_anim,
-                opacity_anim,
+                clock,
                 anim_config,
                 unmap_snapshot.close_start,
                 layer.cached_state().anchor,

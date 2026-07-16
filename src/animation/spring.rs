@@ -47,6 +47,7 @@ impl Spring {
     /// Computes and returns the duration until the spring is at rest.
     pub fn duration(&self) -> Duration {
         const DELTA: f64 = 0.001;
+        const MAX_ITERATIONS: usize = 1000;
 
         let beta = self.params.damping / (2. * self.params.mass);
 
@@ -71,39 +72,95 @@ impl Spring {
             return Duration::from_secs_f64(x0);
         }
 
+        let fallback_guess = x0;
+        let fallback = || self.overdamped_duration_fallback(beta, omega0, fallback_guess);
+
         // Since the overdamped solution decays way slower than the envelope
         // we need to use the value of the oscillation itself.
         // Newton's root finding method is a good candidate in this particular case:
         // https://en.wikipedia.org/wiki/Newton%27s_method
         let mut y0 = self.oscillate(x0);
         let m = (self.oscillate(x0 + DELTA) - y0) / DELTA;
+        if !m.is_finite() || m.abs() <= f64::EPSILON {
+            return fallback();
+        }
 
         let mut x1 = (self.to - y0 + m * x0) / m;
+        if !x1.is_finite() || x1 < 0. {
+            return fallback();
+        }
         let mut y1 = self.oscillate(x1);
+        if !y1.is_finite() {
+            return fallback();
+        }
 
-        let mut i = 0;
+        let mut iterations = 0;
         while (self.to - y1).abs() > self.params.epsilon {
-            if i > 1000 {
-                return Duration::ZERO;
+            if iterations >= MAX_ITERATIONS {
+                return fallback();
             }
 
             x0 = x1;
             y0 = y1;
 
             let m = (self.oscillate(x0 + DELTA) - y0) / DELTA;
-
-            x1 = (self.to - y0 + m * x0) / m;
-            y1 = self.oscillate(x1);
-
-            // Overdamped springs have some numerical stability issues...
-            if !y1.is_finite() {
-                return Duration::from_secs_f64(x0);
+            if !m.is_finite() || m.abs() <= f64::EPSILON {
+                return fallback();
             }
 
-            i += 1;
+            x1 = (self.to - y0 + m * x0) / m;
+            if !x1.is_finite() || x1 < 0. {
+                return fallback();
+            }
+            y1 = self.oscillate(x1);
+
+            if !y1.is_finite() {
+                return fallback();
+            }
+
+            iterations += 1;
         }
 
         Duration::from_secs_f64(x1)
+    }
+
+    fn overdamped_duration_fallback(&self, beta: f64, omega0: f64, initial_guess: f64) -> Duration {
+        let omega2 = ((beta * beta) - (omega0 * omega0)).sqrt();
+        let slow_rate = -beta + omega2;
+        let fast_rate = -beta - omega2;
+        let displacement = self.from - self.to;
+        let denominator = slow_rate - fast_rate;
+        let slow_coefficient = (self.initial_velocity - fast_rate * displacement) / denominator;
+        let fast_coefficient = displacement - slow_coefficient;
+        let bound = |time: f64| {
+            slow_coefficient.abs() * (slow_rate * time).exp()
+                + fast_coefficient.abs() * (fast_rate * time).exp()
+        };
+
+        let mut upper = initial_guess.max(0.001);
+        for _ in 0..128 {
+            let error_bound = bound(upper);
+            if error_bound.is_finite() && error_bound <= self.params.epsilon {
+                let mut lower = 0.;
+                for _ in 0..64 {
+                    let middle = (lower + upper) / 2.;
+                    if bound(middle) <= self.params.epsilon {
+                        upper = middle;
+                    } else {
+                        lower = middle;
+                    }
+                }
+
+                return Duration::from_secs_f64(upper).max(Duration::from_millis(1));
+            }
+
+            upper *= 2.;
+            if !upper.is_finite() {
+                return Duration::MAX;
+            }
+        }
+
+        Duration::MAX
     }
 
     /// Computes and returns the duration until the spring reaches its target position.
@@ -205,5 +262,33 @@ mod tests {
         let _ = spring.duration();
         let _ = spring.clamped_duration();
         let _ = spring.value_at(Duration::ZERO);
+    }
+
+    #[test]
+    fn overdamped_solver_failure_does_not_collapse_duration() {
+        let spring = Spring {
+            from: 0.,
+            to: 1.,
+            initial_velocity: -184_171.825_578_530_55,
+            params: SpringParams::new(9.370_388_960_701_666, 8381., 0.099_378_578_335_566_65),
+        };
+
+        let duration = spring.duration();
+        assert!(duration >= Duration::from_millis(1));
+        assert_ne!(duration, Duration::MAX);
+    }
+
+    #[test]
+    fn overdamped_non_finite_newton_step_uses_finite_fallback() {
+        let spring = Spring {
+            from: 0.,
+            to: 1.,
+            initial_velocity: 10.,
+            params: SpringParams::new(3., 1., 0.1),
+        };
+
+        let duration = spring.duration();
+        assert!(duration >= Duration::from_millis(1));
+        assert_ne!(duration, Duration::MAX);
     }
 }

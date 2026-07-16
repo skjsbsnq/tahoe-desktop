@@ -129,7 +129,7 @@ impl Animation {
                 let spring = Spring {
                     from,
                     to,
-                    initial_velocity: self.initial_velocity,
+                    initial_velocity,
                     params: spring.params,
                 };
                 Self::spring(self.clock.clone(), spring)
@@ -447,5 +447,33 @@ mod tests {
             animation.clamped_value_with_delay(Duration::from_millis(1)),
             1.
         );
+    }
+
+    #[test]
+    fn restarted_spring_uses_new_initial_velocity() {
+        let clock = Clock::with_time(Duration::ZERO);
+        let animation = Animation::spring(
+            clock,
+            Spring {
+                from: 0.,
+                to: 1.,
+                initial_velocity: 3.,
+                params: SpringParams::new(0.8, 500., 0.001),
+            },
+        );
+
+        let restarted = animation.restarted(0.4, 0., -7.);
+
+        assert_eq!(restarted.initial_velocity, -7.);
+        let Kind::Spring(spring) = restarted.kind else {
+            panic!("restarted spring changed animation kind");
+        };
+        assert_eq!(spring.initial_velocity, -7.);
+
+        let sample_time = Duration::from_micros(100);
+        let sampled_velocity = (restarted.value_at(sample_time)
+            - restarted.value_at(Duration::ZERO))
+            / sample_time.as_secs_f64();
+        assert!((sampled_velocity - -7.).abs() < 0.1);
     }
 }

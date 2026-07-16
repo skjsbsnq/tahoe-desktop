@@ -12,7 +12,7 @@ use smithay::backend::renderer::Texture;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shell::wlr_layer::Anchor;
 
-use crate::animation::Animation;
+use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
@@ -100,8 +100,7 @@ impl ClosingLayer {
         scale: Scale<f64>,
         mut geo_size: Size<f64, Logical>,
         pos: Point<f64, Logical>,
-        transform_anim: Animation,
-        opacity_anim: Animation,
+        mut clock: Clock,
         config: niri_config::animations::LayerCloseAnim,
         start: CloseAnimationStartState,
         anchor: Anchor,
@@ -153,6 +152,11 @@ impl ClosingLayer {
                 (tex_size.h / scale.y).max(1.),
             );
         }
+
+        // Snapshot rendering may block; do not charge that time to the close animation.
+        clock.clear();
+        let transform_anim = Animation::new(clock.clone(), 0., 1., 0., config.transform_anim);
+        let opacity_anim = Animation::new(clock, 0., 1., 0., config.opacity_anim);
 
         Ok(Self {
             buffer,

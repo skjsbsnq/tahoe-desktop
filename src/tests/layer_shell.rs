@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use insta::assert_snapshot;
 use niri_config::animations::{
     Animation, Curve, EasingParams, Kind, LayerAnimationEdge, LayerAnimationOrigin, LayerCloseAnim,
@@ -9,7 +11,6 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
     Anchor, KeyboardInteractivity,
 };
 use smithay::utils::{Point, Size};
-use std::time::Duration;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
@@ -432,6 +433,7 @@ fn layer_close_animation_uses_snapshot_and_cleans_up() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "animated-layer");
     assert!(f.niri().closing_layers.is_empty());
@@ -496,6 +498,7 @@ fn tahoe_layer_close_keeps_fallback_blur_live() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "tahoe-control-center");
     unmap_layer(&mut f, id, &surface);
@@ -531,6 +534,7 @@ fn layer_close_animation_opacity_delay_extends_lifetime() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "animated-layer");
     unmap_layer(&mut f, id, &surface);
@@ -565,6 +569,7 @@ fn layer_close_animation_is_cancelled_on_reopen() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "animated-layer");
     unmap_layer(&mut f, id, &surface);
@@ -615,8 +620,8 @@ fn layer_close_animation_reopen_starts_from_current_visual_state() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
-
     freeze_layer_animation_clock(&mut f);
+
     let surface = map_layer(&mut f, id, "animated-layer");
     advance_layer_animations(&mut f, Duration::from_millis(1100));
 
@@ -681,8 +686,8 @@ fn layer_animation_fast_toggle_settles_without_residual_snapshots() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
-
     freeze_layer_animation_clock(&mut f);
+
     let surface = map_layer(&mut f, id, "animated-layer");
     let (layer_open, layer_close, _) = resolved_layer_animation_rules(&mut f, "animated-layer");
     assert_eq!(
@@ -759,8 +764,8 @@ fn layer_close_snapshot_releases_one_frame_after_duration() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
-
     freeze_layer_animation_clock(&mut f);
+
     let surface = map_layer(&mut f, id, "animated-layer");
     freeze_layer_animation_clock(&mut f);
     unmap_layer(&mut f, id, &surface);
@@ -802,6 +807,7 @@ fn layer_close_animation_interrupted_open_starts_from_current_visual_state() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "animated-layer");
     advance_layer_animations(&mut f, Duration::from_millis(250));
@@ -850,6 +856,7 @@ fn layer_close_animation_interrupted_open_uses_opacity_delay() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "animated-layer");
     advance_layer_animations(&mut f, Duration::from_millis(250));
@@ -897,6 +904,7 @@ fn layer_close_animation_interrupted_slide_open_starts_from_current_offset() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "animated-layer");
     advance_layer_animations(&mut f, Duration::from_millis(250));
@@ -949,6 +957,7 @@ fn layer_close_animation_interrupted_edge_reveal_open_starts_from_current_offset
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "animated-layer");
     advance_layer_animations(&mut f, Duration::from_millis(250));
@@ -989,6 +998,7 @@ fn layer_close_edge_reveal_moves_full_surface_extent() {
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
+    freeze_layer_animation_clock(&mut f);
 
     let surface = map_layer(&mut f, id, "animated-layer");
     unmap_layer(&mut f, id, &surface);
