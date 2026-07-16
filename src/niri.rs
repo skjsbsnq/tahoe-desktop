@@ -127,7 +127,7 @@ use crate::dbus::freedesktop_login1::Login1ToNiri;
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospect};
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
-use crate::frame_clock::FrameClock;
+use crate::frame_clock::{FrameClock, FrameOutcome, FrameTelemetry, RedrawSources};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
@@ -466,6 +466,7 @@ pub struct DndIcon {
 pub struct OutputState {
     pub global: GlobalId,
     pub frame_clock: FrameClock,
+    pub frame_telemetry: Option<FrameTelemetry>,
     pub redraw_state: RedrawState,
     pub on_demand_vrr_enabled: bool,
     // After the last redraw, some ongoing animations still remain.
@@ -3072,6 +3073,7 @@ impl Niri {
             on_demand_vrr_enabled: false,
             unfinished_animations_remain: false,
             frame_clock: FrameClock::new(refresh_interval, vrr),
+            frame_telemetry: FrameTelemetry::for_output(&output),
             last_drm_sequence: None,
             vblank_throttle: VBlankThrottle::new(self.event_loop.clone(), name.connector.clone()),
             frame_callback_sequence: 0,
@@ -4839,6 +4841,7 @@ impl Niri {
         ));
 
         let target_presentation_time = state.frame_clock.next_presentation_time();
+        let telemetry_started = state.frame_telemetry.as_ref().map(|_| Instant::now());
 
         // Freeze the clock at the target time.
         self.clock.set_unadjusted(target_presentation_time);
@@ -4846,37 +4849,59 @@ impl Niri {
         self.update_render_elements(Some(output));
 
         let mut res = RenderResult::Skipped;
+        let mut redraw_sources = RedrawSources::default();
         if self.monitors_active {
             let state = self.output_state.get_mut(output).unwrap();
-            state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
-            state.unfinished_animations_remain |=
+            let collect_all_sources = state.frame_telemetry.is_some();
+
+            redraw_sources.layout = self.layout.are_animations_ongoing(Some(output));
+            redraw_sources.config_error_ui =
                 self.config_error_notification.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
-            state.unfinished_animations_remain |= state.screen_transition.is_some();
+            redraw_sources.exit_confirm_ui = self.exit_confirm_dialog.are_animations_ongoing();
+            redraw_sources.screenshot_ui = self.screenshot_ui.are_animations_ongoing();
+            redraw_sources.window_mru_ui = self.window_mru_ui.are_animations_ongoing();
+            redraw_sources.screen_transition = state.screen_transition.is_some();
 
             // Also keep redrawing if the current cursor is animated.
-            state.unfinished_animations_remain |= self
+            redraw_sources.cursor = self
                 .cursor_manager
                 .is_current_cursor_animated(output.current_scale().integer_scale());
 
             // Also check layer surfaces.
-            if !state.unfinished_animations_remain {
-                state.unfinished_animations_remain |= layer_map_for_output(output)
+            let mut unfinished_animations_remain = redraw_sources.any();
+            if collect_all_sources || !unfinished_animations_remain {
+                redraw_sources.layer = layer_map_for_output(output)
                     .layers()
                     .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
                     .any(|mapped| mapped.are_animations_ongoing());
+                unfinished_animations_remain |= redraw_sources.layer;
             }
-            if !state.unfinished_animations_remain {
-                state.unfinished_animations_remain |= self
+            if collect_all_sources || !unfinished_animations_remain {
+                redraw_sources.closing_layer = self
                     .closing_layers
                     .iter()
                     .any(|closing| closing.output == *output);
+                unfinished_animations_remain |= redraw_sources.closing_layer;
             }
+            state.unfinished_animations_remain = unfinished_animations_remain;
 
             // Render.
             res = backend.render(self, output, target_presentation_time);
+        }
+
+        if let Some(started) = telemetry_started {
+            let outcome = match &res {
+                RenderResult::Submitted => FrameOutcome::Submitted,
+                RenderResult::NoDamage => FrameOutcome::NoDamage,
+                RenderResult::Skipped => FrameOutcome::Skipped,
+            };
+            self.output_state
+                .get_mut(output)
+                .unwrap()
+                .frame_telemetry
+                .as_mut()
+                .unwrap()
+                .record_redraw(redraw_sources, outcome, started.elapsed());
         }
 
         let is_locked = self.is_locked();
