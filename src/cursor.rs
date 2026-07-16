@@ -4,6 +4,7 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use smithay::backend::allocator::Fourcc;
@@ -93,14 +94,15 @@ impl CursorManager {
             })
     }
 
-    pub fn is_current_cursor_animated(&self, scale: i32) -> bool {
+    /// Return the deadline of the next frame for the current named cursor.
+    pub fn next_frame_deadline(&self, scale: i32, now: Duration) -> Option<Duration> {
         match &self.current_cursor {
-            CursorImageStatus::Hidden => false,
-            CursorImageStatus::Surface(_) => false,
+            CursorImageStatus::Hidden => None,
+            CursorImageStatus::Surface(_) => None,
             CursorImageStatus::Named(icon) => self
                 .get_cursor_with_name(*icon, scale)
                 .unwrap_or_else(|| self.get_default_cursor(scale))
-                .is_animated_cursor(),
+                .next_frame_deadline(now),
         }
     }
 
@@ -282,23 +284,38 @@ impl XCursor {
     ///
     /// Time will wrap, so if for instance the cursor has an animation lasting 100ms,
     /// then calling this function with 5ms and 105ms as input gives the same output.
-    pub fn frame(&self, mut millis: u32) -> (usize, &Image) {
+    pub fn frame(&self, now: Duration) -> (usize, &Image) {
+        let (idx, image, _) = self.frame_and_deadline(now);
+        (idx, image)
+    }
+
+    /// Return the deadline of the next frame, if this cursor is animated.
+    pub fn next_frame_deadline(&self, now: Duration) -> Option<Duration> {
+        let (_, _, deadline) = self.frame_and_deadline(now);
+        deadline.filter(|_| self.images.len() > 1)
+    }
+
+    fn frame_and_deadline(&self, now: Duration) -> (usize, &Image, Option<Duration>) {
         if self.animation_duration == 0 {
-            return (0, &self.images[0]);
+            return (0, &self.images[0], None);
         }
 
-        millis %= self.animation_duration;
+        let animation_duration = u128::from(self.animation_duration);
+        let elapsed_millis = now.as_millis();
+        let cycle_start = elapsed_millis - elapsed_millis % animation_duration;
+        let millis = elapsed_millis % animation_duration;
 
-        let mut res = 0;
+        let mut frame_end = 0;
         for (i, img) in self.images.iter().enumerate() {
-            if millis < img.delay {
-                res = i;
-                break;
+            frame_end += u128::from(img.delay);
+            if millis < frame_end {
+                let deadline_millis = cycle_start + frame_end;
+                let deadline_millis = u64::try_from(deadline_millis).unwrap_or(u64::MAX);
+                return (i, img, Some(Duration::from_millis(deadline_millis)));
             }
-            millis -= img.delay;
         }
 
-        (res, &self.images[res])
+        unreachable!("cursor frame delays must add up to animation_duration")
     }
 
     /// Get the frames for the given `XCursor`.
@@ -306,13 +323,63 @@ impl XCursor {
         &self.images
     }
 
-    /// Check whether the cursor is animated.
-    pub fn is_animated_cursor(&self) -> bool {
-        self.images.len() > 1
-    }
-
     /// Get hotspot for the given `image`.
     pub fn hotspot(image: &Image) -> Point<i32, Physical> {
         (image.xhot as i32, image.yhot as i32).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn image(delay: u32) -> Image {
+        Image {
+            size: 24,
+            width: 1,
+            height: 1,
+            xhot: 0,
+            yhot: 0,
+            delay,
+            pixels_rgba: vec![0; 4],
+            pixels_argb: vec![],
+        }
+    }
+
+    #[test]
+    fn animated_cursor_deadline_tracks_frame_delays() {
+        let cursor = XCursor {
+            images: vec![image(40), image(60)],
+            animation_duration: 100,
+        };
+
+        assert_eq!(
+            cursor.next_frame_deadline(Duration::ZERO),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            cursor.next_frame_deadline(Duration::from_millis(39)),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            cursor.next_frame_deadline(Duration::from_millis(40)),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            cursor.next_frame_deadline(Duration::from_millis(100)),
+            Some(Duration::from_millis(140))
+        );
+    }
+
+    #[test]
+    fn static_cursor_has_no_frame_deadline() {
+        let cursor = XCursor {
+            images: vec![image(0)],
+            animation_duration: 0,
+        };
+
+        assert_eq!(cursor.next_frame_deadline(Duration::ZERO), None);
     }
 }

@@ -181,9 +181,9 @@ use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
-    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
-    logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland,
+    baba_is_float_next_frame_deadline, center, center_f64, expand_home, get_monotonic_time,
+    ipc_transform_to_smithay, is_mapped, logical_output, make_screenshot_path, output_matches_name,
+    output_size, panel_orientation, send_scale_transform, write_png_rgba8, xwayland,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -471,6 +471,7 @@ pub struct OutputState {
     pub on_demand_vrr_enabled: bool,
     // After the last redraw, some ongoing animations still remain.
     pub unfinished_animations_remain: bool,
+    animation_redraw_timer: Option<AnimationRedrawTimer>,
     /// Last sequence received in a vblank event.
     pub last_drm_sequence: Option<u32>,
     pub vblank_throttle: VBlankThrottle,
@@ -504,6 +505,11 @@ pub struct OutputState {
     screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+}
+
+struct AnimationRedrawTimer {
+    deadline: Instant,
+    token: RegistrationToken,
 }
 
 #[derive(Debug, Default)]
@@ -3072,6 +3078,7 @@ impl Niri {
             redraw_state: RedrawState::Idle,
             on_demand_vrr_enabled: false,
             unfinished_animations_remain: false,
+            animation_redraw_timer: None,
             frame_clock: FrameClock::new(refresh_interval, vrr),
             frame_telemetry: FrameTelemetry::for_output(&output),
             last_drm_sequence: None,
@@ -3124,6 +3131,9 @@ impl Niri {
             RedrawState::WaitingForVBlank { .. } => (),
             RedrawState::WaitingForEstimatedVBlank(token) => self.event_loop.remove(token),
             RedrawState::WaitingForEstimatedVBlankAndQueued(token) => self.event_loop.remove(token),
+        }
+        if let Some(timer) = state.animation_redraw_timer {
+            self.event_loop.remove(timer.token);
         }
 
         self.stop_casts_for_target(CastTarget::output(output));
@@ -3236,6 +3246,15 @@ impl Niri {
         }
 
         self.monitors_active = false;
+        let tokens: Vec<_> = self
+            .output_state
+            .values_mut()
+            .filter_map(|state| state.animation_redraw_timer.take())
+            .map(|timer| timer.token)
+            .collect();
+        for token in tokens {
+            self.event_loop.remove(token);
+        }
         backend.set_monitors_active(false);
     }
 
@@ -3877,6 +3896,57 @@ impl Niri {
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
     }
 
+    fn schedule_animation_redraw(&mut self, output: &Output, deadline: Option<Instant>) {
+        let current = self
+            .output_state
+            .get_mut(output)
+            .unwrap()
+            .animation_redraw_timer
+            .take();
+
+        if let Some(current) = current {
+            if Some(current.deadline) == deadline {
+                self.output_state
+                    .get_mut(output)
+                    .unwrap()
+                    .animation_redraw_timer = Some(current);
+                return;
+            }
+            self.event_loop.remove(current.token);
+        }
+
+        let Some(deadline) = deadline else {
+            return;
+        };
+
+        let output = output.clone();
+        let timer_output = output.clone();
+        let token = self
+            .event_loop
+            .insert_source(Timer::from_deadline(deadline), move |_, _, state| {
+                let Some(output_state) = state.niri.output_state.get_mut(&timer_output) else {
+                    return TimeoutAction::Drop;
+                };
+
+                output_state.animation_redraw_timer = None;
+                state.niri.queue_redraw(&timer_output);
+                TimeoutAction::Drop
+            })
+            .unwrap();
+
+        self.output_state
+            .get_mut(&output)
+            .unwrap()
+            .animation_redraw_timer = Some(AnimationRedrawTimer { deadline, token });
+    }
+
+    #[cfg(test)]
+    pub fn animation_redraw_is_scheduled(&self, output: &Output) -> bool {
+        self.output_state
+            .get(output)
+            .is_some_and(|state| state.animation_redraw_timer.is_some())
+    }
+
     pub fn redraw_queued_outputs(&mut self, backend: &mut Backend) {
         let _span = tracy_client::span!("Niri::redraw_queued_outputs");
 
@@ -3935,7 +4005,7 @@ impl Niri {
                 scale,
                 cursor,
             } => {
-                let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
+                let (idx, frame) = cursor.frame(self.start_time.elapsed());
                 let hotspot = XCursor::hotspot(frame).to_logical(scale);
                 let pointer_pos =
                     (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
@@ -4850,31 +4920,65 @@ impl Niri {
 
         let mut res = RenderResult::Skipped;
         let mut redraw_sources = RedrawSources::default();
+        let mut animation_redraw_deadline = None;
         if self.monitors_active {
-            let state = self.output_state.get_mut(output).unwrap();
+            let state = self.output_state.get(output).unwrap();
             let collect_all_sources = state.frame_telemetry.is_some();
+            let screen_transition_ongoing = state.screen_transition.is_some();
 
-            redraw_sources.layout = self.layout.are_animations_ongoing(Some(output));
+            let layout_animations_ongoing = self.layout.are_animations_ongoing(Some(output));
+            let layout_baba_is_float = self
+                .layout
+                .windows_for_output(output)
+                .any(|mapped| mapped.rules().baba_is_float == Some(true));
+
+            redraw_sources.layout = layout_animations_ongoing || layout_baba_is_float;
             redraw_sources.config_error_ui =
                 self.config_error_notification.are_animations_ongoing();
             redraw_sources.exit_confirm_ui = self.exit_confirm_dialog.are_animations_ongoing();
             redraw_sources.screenshot_ui = self.screenshot_ui.are_animations_ongoing();
             redraw_sources.window_mru_ui = self.window_mru_ui.are_animations_ongoing();
-            redraw_sources.screen_transition = state.screen_transition.is_some();
+            redraw_sources.screen_transition = screen_transition_ongoing;
 
-            // Also keep redrawing if the current cursor is animated.
-            redraw_sources.cursor = self
-                .cursor_manager
-                .is_current_cursor_animated(output.current_scale().integer_scale());
+            let pointer_pos = self
+                .tablet_cursor_location
+                .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+            let cursor_is_on_output = self.pointer_visibility.is_visible()
+                && self
+                    .global_space
+                    .output_under(pointer_pos)
+                    .any(|under| under == output);
+            let cursor_now = self.start_time.elapsed();
+            let cursor_deadline = cursor_is_on_output
+                .then(|| {
+                    self.cursor_manager
+                        .next_frame_deadline(output.current_scale().integer_scale(), cursor_now)
+                })
+                .flatten();
+            redraw_sources.cursor = cursor_deadline.is_some();
 
             // Also check layer surfaces.
-            let mut unfinished_animations_remain = redraw_sources.any();
+            let mut unfinished_animations_remain = layout_animations_ongoing
+                || redraw_sources.config_error_ui
+                || redraw_sources.exit_confirm_ui
+                || redraw_sources.screenshot_ui
+                || redraw_sources.window_mru_ui
+                || redraw_sources.screen_transition;
+            let mut layer_baba_is_float = false;
             if collect_all_sources || !unfinished_animations_remain {
-                redraw_sources.layer = layer_map_for_output(output)
+                let mut layer_animations_ongoing = false;
+                for mapped in layer_map_for_output(output)
                     .layers()
                     .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
-                    .any(|mapped| mapped.are_animations_ongoing());
-                unfinished_animations_remain |= redraw_sources.layer;
+                {
+                    layer_animations_ongoing |= mapped.are_animations_ongoing();
+                    layer_baba_is_float |= mapped.rules().baba_is_float;
+                    if layer_animations_ongoing && layer_baba_is_float {
+                        break;
+                    }
+                }
+                redraw_sources.layer = layer_animations_ongoing || layer_baba_is_float;
+                unfinished_animations_remain |= layer_animations_ongoing;
             }
             if collect_all_sources || !unfinished_animations_remain {
                 redraw_sources.closing_layer = self
@@ -4883,11 +4987,34 @@ impl Niri {
                     .any(|closing| closing.output == *output);
                 unfinished_animations_remain |= redraw_sources.closing_layer;
             }
-            state.unfinished_animations_remain = unfinished_animations_remain;
+            self.output_state
+                .get_mut(output)
+                .unwrap()
+                .unfinished_animations_remain = unfinished_animations_remain;
+
+            if !unfinished_animations_remain {
+                let timer_now = Instant::now();
+                if let Some(deadline) = cursor_deadline {
+                    animation_redraw_deadline = self.start_time.checked_add(deadline);
+                }
+
+                if layout_baba_is_float || layer_baba_is_float {
+                    let baba_now = get_monotonic_time();
+                    let deadline = baba_is_float_next_frame_deadline(baba_now);
+                    if let Some(deadline) = timer_now.checked_add(deadline.saturating_sub(baba_now))
+                    {
+                        animation_redraw_deadline = Some(
+                            animation_redraw_deadline
+                                .map_or(deadline, |current| current.min(deadline)),
+                        );
+                    }
+                }
+            }
 
             // Render.
             res = backend.render(self, output, target_presentation_time);
         }
+        self.schedule_animation_redraw(output, animation_redraw_deadline);
 
         if let Some(started) = telemetry_started {
             let outcome = match &res {

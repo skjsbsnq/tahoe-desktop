@@ -114,6 +114,35 @@ fn layer_rule_animations_resolve_by_namespace_and_merge() {
 }
 
 #[test]
+fn baba_is_float_layer_does_not_report_continuous_animation() {
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^floating-layer$"
+            baba-is-float true
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    map_layer(&mut f, id, "floating-layer");
+    f.niri_complete_animations();
+
+    let mapped = f
+        .niri()
+        .mapped_layer_surfaces
+        .values()
+        .find(|mapped| mapped.surface().namespace() == "floating-layer")
+        .unwrap();
+    assert!(mapped.rules().baba_is_float);
+    assert!(!mapped.are_animations_ongoing());
+}
+
+#[test]
 fn layer_rule_animations_select_style_by_namespace() {
     let config = Config::parse_mem(
         r#"

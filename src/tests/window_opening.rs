@@ -66,6 +66,47 @@ fn simple() {
 }
 
 #[test]
+fn baba_is_float_window_does_not_report_continuous_animation() {
+    let config = Config::parse_mem(
+        r#"
+        window-rule {
+            baba-is-float true
+        }
+        "#,
+    )
+    .unwrap();
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    {
+        let niri = f.niri();
+        assert!(niri
+            .layout
+            .windows_for_output(&output)
+            .any(|mapped| mapped.rules().baba_is_float == Some(true)));
+        assert!(!niri.layout.are_animations_ongoing(Some(&output)));
+        niri.queue_redraw(&output);
+    }
+    f.niri_state().refresh_and_flush_clients();
+    let niri = f.niri();
+    assert!(!niri.output_state[&output].unfinished_animations_remain);
+    assert!(niri.animation_redraw_is_scheduled(&output));
+}
+
+#[test]
 #[should_panic(expected = "Protocol error 3 on object xdg_surface")]
 fn dont_ack_initial_configure() {
     let mut f = Fixture::new();

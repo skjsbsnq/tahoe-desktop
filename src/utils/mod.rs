@@ -534,6 +534,16 @@ pub fn center_preferring_top_left_in_area(
     area.loc + offset
 }
 
+pub const BABA_IS_FLOAT_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+pub fn baba_is_float_next_frame_deadline(now: Duration) -> Duration {
+    let interval_nanos = BABA_IS_FLOAT_FRAME_INTERVAL.as_nanos();
+    let elapsed_in_interval = now.as_nanos() % interval_nanos;
+    let remaining = interval_nanos - elapsed_in_interval;
+    let remaining = Duration::from_nanos(u64::try_from(remaining).unwrap());
+    now.saturating_add(remaining)
+}
+
 pub fn baba_is_float_offset(now: Duration, view_height: f64) -> f64 {
     let now = now.as_secs_f64();
     let amplitude = view_height / 96.;
@@ -602,6 +612,18 @@ pub fn cause_panic() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baba_is_float_deadline_runs_at_explicit_low_frequency() {
+        let interval = BABA_IS_FLOAT_FRAME_INTERVAL;
+
+        assert_eq!(baba_is_float_next_frame_deadline(Duration::ZERO), interval);
+        assert_eq!(
+            baba_is_float_next_frame_deadline(interval - Duration::from_nanos(1)),
+            interval
+        );
+        assert_eq!(baba_is_float_next_frame_deadline(interval), interval * 2);
+    }
 
     #[test]
     fn test_clamp_preferring_top_left() {

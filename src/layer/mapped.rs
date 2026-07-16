@@ -188,11 +188,9 @@ impl MappedLayer {
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.rules.baba_is_float
-            || self
-                .open_animation
-                .as_ref()
-                .is_some_and(|open| !open.is_done())
+        self.open_animation
+            .as_ref()
+            .is_some_and(|open| !open.is_done())
     }
 
     pub fn should_animate_close(&self) -> bool {
