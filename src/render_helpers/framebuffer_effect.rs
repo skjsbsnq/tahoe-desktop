@@ -8,7 +8,9 @@ use smithay::backend::renderer::gles::{
     ffi, GlesError, GlesFrame, GlesRenderer, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::utils::CommitCounter;
-use smithay::backend::renderer::{Frame as _, FrameContext, Offscreen, Texture as _};
+use smithay::backend::renderer::{
+    ContextId, Frame as _, FrameContext, Offscreen, Renderer as _, Texture as _,
+};
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
@@ -16,7 +18,9 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::{GlassOptions, RenderParams};
 use crate::render_helpers::blur::{Blur, BlurOptions};
-use crate::render_helpers::renderer::AsGlesFrame as _;
+use crate::render_helpers::renderer::{
+    texture_cache_matches, AsGlesFrame as _, ScratchFramebuffer,
+};
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::utils::region::TransformedRegion;
 
@@ -45,6 +49,7 @@ pub struct FramebufferEffectElement {
 
 #[derive(Debug)]
 struct Inner {
+    renderer_context_id: ContextId<GlesTexture>,
     framebuffer: Option<GlesTexture>,
     blur: Option<Blur>,
     intermediate: Option<GlesTexture>,
@@ -185,10 +190,16 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
 
             let mut guard = frame.renderer();
 
-            let inner = cache
-                .get_or_insert::<RefCell<Inner>, _>(|| RefCell::new(Inner::new(guard.as_mut())));
+            let renderer = guard.as_mut();
+            let renderer_context_id = renderer.context_id();
+            let inner =
+                cache.get_or_insert::<RefCell<Inner>, _>(|| RefCell::new(Inner::new(renderer)));
             let mut inner = inner.borrow_mut();
             let inner = &mut *inner;
+            if inner.renderer_context_id != renderer_context_id {
+                debug!("recreating framebuffer effect resources: renderer context changed");
+                *inner = Inner::new(renderer);
+            }
 
             inner.intermediate = None;
 
@@ -232,18 +243,15 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             let size = size.to_logical(1).to_buffer(1, Transform::Normal);
 
             // Recreate framebuffer if needed.
-            if inner
-                .framebuffer
-                .as_ref()
-                .is_some_and(|fb| fb.size() != size)
-            {
+            if inner.framebuffer.as_ref().is_some_and(|fb| {
+                !texture_cache_matches(fb.size(), fb.format(), size, Fourcc::Abgr8888)
+            }) {
                 inner.framebuffer = None;
             }
             let framebuffer = if let Some(fb) = &inner.framebuffer {
                 fb
             } else {
                 trace!("creating framebuffer texture sized {} × {}", size.w, size.h);
-                let renderer = guard.as_mut();
                 let texture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
                 inner.framebuffer.insert(texture)
             };
@@ -251,7 +259,6 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             // Prepare blur textures.
             let mut blur = Option::zip(inner.blur.as_mut(), self.blur_options);
             if let Some((b, options)) = &mut blur {
-                let renderer = guard.as_mut();
                 if let Err(err) = b.prepare_textures(
                     |fourcc, size| renderer.create_buffer(fourcc, size),
                     framebuffer,
@@ -264,6 +271,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
 
             // We can't use renderer.with_context() as that will reset the GlesFrame binding that we
             // want to blit from.
+            let scratch_framebuffer = ScratchFramebuffer::for_renderer(renderer);
             drop(guard);
 
             // Blit the framebuffer contents.
@@ -276,8 +284,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 // BlitFramebuffer is affected by the scissor test, we don't want that.
                 gl.Disable(ffi::SCISSOR_TEST);
 
-                let mut fbo = 0;
-                gl.GenFramebuffers(1, &mut fbo as *mut _);
+                let fbo = scratch_framebuffer.get_or_create(gl);
                 gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
 
                 gl.FramebufferTexture2D(
@@ -301,11 +308,17 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     ffi::LINEAR,
                 );
 
+                gl.FramebufferTexture2D(
+                    ffi::DRAW_FRAMEBUFFER,
+                    ffi::COLOR_ATTACHMENT0,
+                    ffi::TEXTURE_2D,
+                    0,
+                    0,
+                );
+
                 // Restore state set by GlesFrame that we just modified.
                 gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
                 gl.Enable(ffi::SCISSOR_TEST);
-
-                gl.DeleteFramebuffers(1, &mut fbo as *mut _);
 
                 if gl.GetError() != ffi::NO_ERROR {
                     Err(GlesError::BlitError)
@@ -665,6 +678,7 @@ mod tests {
 impl Inner {
     fn new(renderer: &mut GlesRenderer) -> Self {
         Inner {
+            renderer_context_id: renderer.context_id(),
             framebuffer: None,
             blur: Blur::new(renderer),
             intermediate: None,

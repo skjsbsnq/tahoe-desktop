@@ -1,5 +1,5 @@
 use std::cmp::max;
-use std::iter::{once, zip};
+use std::iter::{once, successors, zip};
 use std::rc::Rc;
 
 use anyhow::{ensure, Context as _};
@@ -9,6 +9,7 @@ use smithay::backend::renderer::{ContextId, Renderer as _, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::{Buffer, Size};
 
+use crate::render_helpers::renderer::{texture_cache_matches, ScratchFramebuffer};
 use crate::render_helpers::shaders::Shaders;
 
 #[derive(Debug)]
@@ -35,6 +36,13 @@ impl From<niri_config::Blur> for BlurOptions {
             offset: config.offset,
         }
     }
+}
+
+fn texture_sizes(size: Size<i32, Buffer>, passes: u8) -> impl Iterator<Item = Size<i32, Buffer>> {
+    successors(Some(size), |size| {
+        Some(Size::new(max(1, size.w / 2), max(1, size.h / 2)))
+    })
+    .take(passes.clamp(1, 31) as usize + 1)
 }
 
 #[derive(Debug, Clone)]
@@ -118,47 +126,37 @@ impl Blur {
         let passes = options.passes.clamp(1, 31) as usize;
         let size = source.size();
 
-        if let Some(output) = self.textures.first_mut() {
-            let old_size = output.size();
-            if old_size != size {
-                trace!(
-                    "recreating textures: output size changed from {} × {} to {} × {}",
-                    old_size.w,
-                    old_size.h,
-                    size.w,
-                    size.h
-                );
-                self.textures.clear();
-            } else if !output.is_unique_reference() {
-                debug!("recreating textures: not unique",);
-                // We only need to recreate the output texture here, but this case shouldn't really
-                // happen anyway, and this is simpler.
-                self.textures.clear();
-            }
-        }
-
-        // Create any missing textures.
-        let mut w = size.w;
-        let mut h = size.h;
-        for i in 0..=passes {
-            let size = Size::new(w, h);
-            w = max(1, w / 2);
-            h = max(1, h / 2);
-
-            if self.textures.len() > i {
-                // This texture already exists.
-                continue;
+        // Reuse the complete texture pyramid while size, format and pass count stay compatible.
+        for (i, size) in texture_sizes(size, options.passes).enumerate() {
+            if let Some(texture) = self.textures.get_mut(i) {
+                let actual_size = texture.size();
+                let actual_format = texture.format();
+                let size_changed = actual_size != size;
+                let format_changed = actual_format != Some(Fourcc::Abgr8888);
+                let output_is_shared = i == 0 && !texture.is_unique_reference();
+                let texture_matches =
+                    texture_cache_matches(actual_size, actual_format, size, Fourcc::Abgr8888);
+                if !texture_matches || output_is_shared {
+                    debug!(
+                        step = i,
+                        size_changed,
+                        format_changed,
+                        output_is_shared,
+                        "recreating incompatible blur textures"
+                    );
+                    self.textures.truncate(i);
+                }
             }
 
-            // debug!("creating texture for step {i} sized {w} × {h}");
-
-            let texture: GlesTexture =
-                create_texture(Fourcc::Abgr8888, size).context("error creating texture")?;
-            self.textures.push(texture);
+            if self.textures.len() == i {
+                let texture: GlesTexture =
+                    create_texture(Fourcc::Abgr8888, size).context("error creating texture")?;
+                self.textures.push(texture);
+            }
         }
 
         // Drop any no longer needed textures.
-        self.textures.drain(passes + 1..);
+        self.textures.truncate(passes + 1);
 
         Ok(())
     }
@@ -199,6 +197,7 @@ impl Blur {
             "output texture has a non-unique reference"
         );
 
+        let scratch_framebuffer = ScratchFramebuffer::for_renderer(renderer);
         renderer.with_profiled_context(gpu_span_location!("Blur::render"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
 
@@ -207,9 +206,8 @@ impl Blur {
 
             gl.ActiveTexture(ffi::TEXTURE0);
 
-            let mut fbos = [0; 2];
-            gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
-            gl.BindFramebuffer(ffi::FRAMEBUFFER, fbos[0]);
+            let framebuffer = scratch_framebuffer.get_or_create(gl);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, framebuffer);
 
             let program = &self.program.0.down;
             gl.UseProgram(program.program);
@@ -333,10 +331,48 @@ impl Blur {
 
             gl.DisableVertexAttribArray(program.attrib_vert as u32);
 
+            gl.FramebufferTexture2D(
+                ffi::FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                0,
+                0,
+            );
             gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
-            gl.DeleteFramebuffers(fbos.len() as _, fbos.as_ptr());
         })?;
 
         Ok(self.textures[0].clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::Size;
+
+    use super::texture_sizes;
+
+    #[test]
+    fn texture_pyramid_tracks_size_and_pass_count() {
+        let sizes: Vec<_> = texture_sizes(Size::from((1920, 1080)), 4).collect();
+
+        assert_eq!(
+            sizes,
+            vec![
+                Size::from((1920, 1080)),
+                Size::from((960, 540)),
+                Size::from((480, 270)),
+                Size::from((240, 135)),
+                Size::from((120, 67)),
+            ]
+        );
+    }
+
+    #[test]
+    fn texture_pyramid_clamps_passes_and_dimensions() {
+        assert_eq!(texture_sizes(Size::from((1, 1)), 0).count(), 2);
+
+        let sizes: Vec<_> = texture_sizes(Size::from((2, 3)), u8::MAX).collect();
+        assert_eq!(sizes.len(), 32);
+        assert_eq!(sizes.last(), Some(&Size::from((1, 1))));
     }
 }
