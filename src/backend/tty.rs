@@ -2283,15 +2283,20 @@ impl Tty {
     pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
         let _span = tracy_client::span!("Tty::set_output_on_demand_vrr");
 
-        let output_state = niri.output_state.get_mut(output).unwrap();
-        output_state.on_demand_vrr_enabled = enable_vrr;
-        if output_state.frame_clock.vrr() == enable_vrr {
-            return;
+        {
+            let output_state = niri.output_state.get_mut(output).unwrap();
+            output_state.on_demand_vrr_enabled = enable_vrr;
+            if output_state.frame_clock.vrr() == enable_vrr {
+                return;
+            }
         }
+
+        let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+        let mut applied_vrr = None;
         for (&node, device) in self.devices.iter_mut() {
             for (&crtc, surface) in device.surfaces.iter_mut() {
-                let tty_state: &TtyOutputState = output.user_data().get().unwrap();
                 if tty_state.node == node && tty_state.crtc == crtc {
+                    let previous_vrr = surface.compositor.vrr_enabled();
                     let word = if enable_vrr { "enabling" } else { "disabling" };
                     if let Err(err) = surface.compositor.use_vrr(enable_vrr) {
                         warn!(
@@ -2299,14 +2304,30 @@ impl Tty {
                             surface.name.connector, word
                         );
                     }
-                    output_state
-                        .frame_clock
-                        .set_vrr(surface.compositor.vrr_enabled());
-
-                    self.refresh_ipc_outputs(niri);
-                    return;
+                    applied_vrr = Some((previous_vrr, surface.compositor.vrr_enabled()));
+                    break;
                 }
             }
+            if applied_vrr.is_some() {
+                break;
+            }
+        }
+
+        let Some((previous_vrr, current_vrr)) = applied_vrr else {
+            return;
+        };
+
+        niri.output_state
+            .get_mut(output)
+            .unwrap()
+            .frame_clock
+            .set_vrr(current_vrr);
+        self.refresh_ipc_outputs(niri);
+
+        if previous_vrr != current_vrr {
+            // use_vrr() changes pending KMS state. Ensure that even a static newly mapped window
+            // gets one more frame so the on-demand transition reaches the hardware immediately.
+            niri.queue_redraw(output);
         }
     }
 
@@ -2458,14 +2479,6 @@ impl Tty {
 
                 let change_mode = surface.compositor.pending_mode() != mode;
 
-                let vrr_enabled = surface.compositor.vrr_enabled();
-                let change_always_vrr = vrr_enabled != config.is_vrr_always_on();
-                let is_on_demand_vrr = config.is_vrr_on_demand();
-
-                if !change_mode && !change_always_vrr && !is_on_demand_vrr {
-                    continue;
-                }
-
                 let output = niri
                     .global_space
                     .outputs()
@@ -2483,12 +2496,16 @@ impl Tty {
                     continue;
                 };
 
-                if (is_on_demand_vrr && vrr_enabled != output_state.on_demand_vrr_enabled)
-                    || (!is_on_demand_vrr && change_always_vrr)
-                {
-                    let vrr = !vrr_enabled;
-                    let word = if vrr { "enabling" } else { "disabling" };
-                    if let Err(err) = surface.compositor.use_vrr(vrr) {
+                let desired_vrr = desired_vrr(&config, output_state.on_demand_vrr_enabled);
+                let vrr_enabled = surface.compositor.vrr_enabled();
+
+                if !change_mode && vrr_enabled == desired_vrr {
+                    continue;
+                }
+
+                if vrr_enabled != desired_vrr {
+                    let word = if desired_vrr { "enabling" } else { "disabling" };
+                    if let Err(err) = surface.compositor.use_vrr(desired_vrr) {
                         warn!(
                             "output {:?}: error {} VRR: {err:?}",
                             surface.name.connector, word
@@ -2946,6 +2963,14 @@ fn refresh_interval(mode: DrmMode) -> Duration {
 
     let refresh_interval = (numerator + denominator / 2) / denominator;
     Duration::from_nanos(refresh_interval)
+}
+
+fn desired_vrr(config: &niri_config::Output, on_demand_enabled: bool) -> bool {
+    if config.is_vrr_on_demand() {
+        on_demand_enabled
+    } else {
+        config.is_vrr_always_on()
+    }
 }
 
 #[cfg(feature = "dbus")]
@@ -3531,9 +3556,25 @@ unsafe fn init_libinput_plugin_system(libinput: &Libinput) {
 mod tests {
     use insta::assert_debug_snapshot;
     use niri_config::output::Modeline;
+    use niri_config::{Output, Vrr};
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
 
-    use crate::backend::tty::{calculate_drm_mode_from_modeline, calculate_mode_cvt};
+    use crate::backend::tty::{calculate_drm_mode_from_modeline, calculate_mode_cvt, desired_vrr};
+
+    #[test]
+    fn vrr_policy_resolves_always_on_and_on_demand_explicitly() {
+        let mut output = Output::default();
+        assert!(!desired_vrr(&output, false));
+        assert!(!desired_vrr(&output, true));
+
+        output.variable_refresh_rate = Some(Vrr { on_demand: false });
+        assert!(desired_vrr(&output, false));
+        assert!(desired_vrr(&output, true));
+
+        output.variable_refresh_rate = Some(Vrr { on_demand: true });
+        assert!(!desired_vrr(&output, false));
+        assert!(desired_vrr(&output, true));
+    }
 
     #[test]
     fn test_calculate_drmmode_from_modeline() {
