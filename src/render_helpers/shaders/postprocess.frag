@@ -113,15 +113,26 @@ float glass_light_strength(vec2 coords_geo) {
     vec2 coords = clamp(coords_geo, vec2(0.0), vec2(1.0));
     vec2 size = max(geo_size, vec2(1.0));
     float detail = glass_surface_detail();
+    float rim = glass_rim(coords);
+    float top_light = 1.0 - smoothstep(0.0, min(size.y * 0.42, 150.0), coords.y * size.y);
+    float left_light = 1.0 - smoothstep(0.0, min(size.x * 0.34, 140.0), coords.x * size.x);
+
+    // Long or very large regions retain a directional rim without paying for
+    // height-field normals, three value-noise samples, caustics and specular pow.
+    if (detail <= 0.0) {
+        float directional = clamp((1.0 - coords.x) * 0.55 + (1.0 - coords.y) * 0.72, 0.0, 1.0);
+        return clamp(
+            rim * (0.34 + directional * 0.16) + top_light * 0.08 + left_light * 0.04,
+            0.0,
+            1.0
+        );
+    }
+
     vec3 normal = glass_normal(coords);
     vec3 light_dir = normalize(vec3(-0.55, -0.72, 0.86));
     vec3 half_dir = normalize(light_dir + vec3(0.0, 0.0, 1.0));
-
-    float rim = glass_rim(coords);
     float diffuse = max(dot(normal, light_dir), 0.0);
     float specular = pow(max(dot(normal, half_dir), 0.0), 42.0);
-    float top_light = 1.0 - smoothstep(0.0, min(size.y * 0.42, 150.0), coords.y * size.y);
-    float left_light = 1.0 - smoothstep(0.0, min(size.x * 0.34, 140.0), coords.x * size.x);
     float caustic = smoothstep(
         0.48,
         1.0,
@@ -143,6 +154,10 @@ float glass_light_strength(vec2 coords_geo) {
 vec2 niri_refraction_offset(vec2 coords_geo);
 
 vec2 niri_refraction_sample_coords(vec2 input_coords, vec2 coords_geo) {
+    if (refraction <= 0.0 && lens_depth <= 0.0) {
+        return input_coords;
+    }
+
     vec2 offset_geo = niri_refraction_offset(coords_geo);
     if (dot(offset_geo, offset_geo) <= 0.0) {
         return input_coords;
@@ -182,17 +197,29 @@ vec2 niri_refraction_offset(vec2 coords_geo) {
     }
 
     vec2 coords = clamp(coords_geo, vec2(0.0), vec2(1.0));
-    vec3 normal = glass_normal(coords);
-    float rim = glass_rim(coords);
     vec2 p = coords * max(geo_size, vec2(1.0));
-    vec2 turbulence = vec2(
-        value_noise(p * 0.044 + vec2(3.1, 9.7)) - 0.5,
-        value_noise(p * 0.044 + vec2(21.4, 6.2)) - 0.5
-    );
-    float amount_scale = glass_large_surface_fade() * glass_small_surface_boost();
+    vec2 offset = vec2(0.0);
 
-    vec2 offset = (normal.xy * (0.55 + rim * 1.45) + turbulence * (0.18 + rim * 0.26))
-        * amount * amount_scale;
+    if (amount > 0.0) {
+        float rim = glass_rim(coords);
+        float detail = glass_surface_detail();
+        vec2 normal_xy;
+        vec2 turbulence = vec2(0.0);
+
+        if (detail <= 0.0) {
+            normal_xy = niri_sd_rounded_rect_grad(p, geo_size, corner_radius) * rim;
+        } else {
+            normal_xy = glass_normal(coords).xy;
+            turbulence = vec2(
+                value_noise(p * 0.044 + vec2(3.1, 9.7)) - 0.5,
+                value_noise(p * 0.044 + vec2(21.4, 6.2)) - 0.5
+            );
+        }
+
+        float amount_scale = glass_large_surface_fade() * glass_small_surface_boost();
+        offset = (normal_xy * (0.55 + rim * 1.45) + turbulence * (0.18 + rim * 0.26))
+            * amount * amount_scale;
+    }
 
     // Center radial lensing: a gentle bulge toward the middle, strongest away
     // from the edges. `lens_depth` drives it; it fades out on large surfaces.
@@ -231,15 +258,17 @@ vec4 postprocess(vec4 color, vec2 coords_geo) {
         color.rgb = apply_contrast(color.rgb, contrast_amount, color.a);
     }
 
-    float highlight = glass_light_strength(coords_geo) * clamp(edge_highlight, 0.0, 2.0)
-        * (0.38 + glass_surface_detail() * 0.62) * glass_small_surface_boost();
-    if (highlight > 0.0) {
+    float highlight_amount = clamp(edge_highlight, 0.0, 2.0);
+    if (highlight_amount > 0.0) {
+        float highlight = glass_light_strength(coords_geo) * highlight_amount
+            * (0.38 + glass_surface_detail() * 0.62) * glass_small_surface_boost();
         color.rgb += vec3(highlight * color.a * 0.28);
     }
 
-    float inner = glass_inner_shadow(coords_geo) * clamp(inner_shadow, 0.0, 0.5)
-        * (0.55 + glass_surface_detail() * 0.45);
-    if (inner > 0.0) {
+    float inner_amount = clamp(inner_shadow, 0.0, 0.5);
+    if (inner_amount > 0.0) {
+        float inner = glass_inner_shadow(coords_geo) * inner_amount
+            * (0.55 + glass_surface_detail() * 0.45);
         color.rgb *= 1.0 - inner * 0.5;
     }
 

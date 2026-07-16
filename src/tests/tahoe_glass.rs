@@ -21,7 +21,33 @@ use crate::protocols::tahoe_glass::{
     get_committed_regions, test_damage_old_region_count, test_fallback_redraw_all_count,
     test_last_damaged_old_rects, test_reset_redraw_counters, test_targeted_redraw_count,
 };
+use crate::render_helpers::shaders::Shaders;
 use crate::tests::client::LayerConfigureProps;
+
+#[test]
+fn postprocess_shader_compiles_and_invalid_source_is_rejected() {
+    let mut f = Fixture::new();
+    f.niri_state().backend.headless().add_renderer().unwrap();
+
+    f.niri_state()
+        .backend
+        .with_primary_renderer(|renderer| {
+            assert!(
+                Shaders::get(renderer).postprocess_and_clip.is_some(),
+                "the production postprocess shader must compile"
+            );
+
+            let invalid = renderer.compile_custom_texture_shader(
+                "#version 100\nprecision highp float;\nvoid main() { invalid shader; }",
+                &[],
+            );
+            assert!(
+                invalid.is_err(),
+                "invalid shader source must report failure"
+            );
+        })
+        .unwrap();
+}
 
 fn create_mapped_layer(f: &mut Fixture, id: client::ClientId) -> WlSurface {
     let layer = f

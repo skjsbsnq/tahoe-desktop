@@ -24,6 +24,13 @@ pub struct Shaders {
     pub custom_open: RefCell<Option<ShaderProgram>>,
 }
 
+const POSTPROCESS_SHADER: &str = concat!(
+    include_str!("clipped_surface.frag"),
+    include_str!("rounding_alpha.frag"),
+    include_str!("rounded_rect_sdf.frag"),
+    include_str!("postprocess.frag"),
+);
+
 #[derive(Debug, Clone, Copy)]
 pub enum ProgramType {
     Border,
@@ -109,12 +116,7 @@ impl Shaders {
 
         let postprocess_and_clip = renderer
             .compile_custom_texture_shader(
-                concat!(
-                    include_str!("clipped_surface.frag"),
-                    include_str!("rounding_alpha.frag"),
-                    include_str!("rounded_rect_sdf.frag"),
-                    include_str!("postprocess.frag"),
-                ),
+                POSTPROCESS_SHADER,
                 &[
                     UniformName::new("niri_scale", UniformType::_1f),
                     UniformName::new("geo_size", UniformType::_2f),
@@ -406,4 +408,46 @@ pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {
             transpose: false,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::POSTPROCESS_SHADER;
+
+    #[test]
+    fn disabled_glass_features_guard_expensive_shader_paths() {
+        let refraction_guard = POSTPROCESS_SHADER
+            .find("if (refraction <= 0.0 && lens_depth <= 0.0)")
+            .unwrap();
+        let refraction_call = POSTPROCESS_SHADER
+            .find("vec2 offset_geo = niri_refraction_offset(coords_geo)")
+            .unwrap();
+        assert!(refraction_guard < refraction_call);
+
+        let highlight_guard = POSTPROCESS_SHADER
+            .find("if (highlight_amount > 0.0)")
+            .unwrap();
+        let highlight_call = POSTPROCESS_SHADER
+            .find("float highlight = glass_light_strength(coords_geo)")
+            .unwrap();
+        assert!(highlight_guard < highlight_call);
+
+        let inner_guard = POSTPROCESS_SHADER.find("if (inner_amount > 0.0)").unwrap();
+        let inner_call = POSTPROCESS_SHADER
+            .find("float inner = glass_inner_shadow(coords_geo)")
+            .unwrap();
+        assert!(inner_guard < inner_call);
+    }
+
+    #[test]
+    fn large_surfaces_guard_height_noise_and_specular_work() {
+        let guard = POSTPROCESS_SHADER.find("if (detail <= 0.0)").unwrap();
+        let normal = POSTPROCESS_SHADER
+            .find("vec3 normal = glass_normal(coords)")
+            .unwrap();
+        let specular = POSTPROCESS_SHADER.find("float specular = pow").unwrap();
+
+        assert!(guard < normal);
+        assert!(guard < specular);
+    }
 }
