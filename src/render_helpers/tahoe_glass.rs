@@ -56,18 +56,18 @@ impl TahoeGlassRenderer {
         }
     }
 
-    fn damage(&mut self) {
-        self.damage.damage_all();
-        for region in self.regions.values_mut() {
-            region.background_effect.damage();
-            region.shadow.update_shaders();
-        }
-    }
-
     fn damage_regions(&mut self, old: &[TahoeGlassRegion], new: &[TahoeGlassRegion]) {
-        self.damage.damage_all();
-        self.damaged_regions
-            .extend(old.iter().chain(new).map(|region| region.rect));
+        let damage = changed_region_damage(old, new);
+        let mut added = false;
+        for rect in damage {
+            let uncovered = rect.subtract_rects(self.damaged_regions.iter().copied());
+            added |= !uncovered.is_empty();
+            self.damaged_regions.extend(uncovered);
+        }
+
+        if added {
+            self.damage.damage_all();
+        }
     }
 }
 
@@ -80,12 +80,6 @@ impl TahoeGlassRegionRenderer {
     }
 }
 
-pub fn damage_surface(states: &SurfaceData) {
-    if let Some(renderer) = states.data_map.get::<SurfaceTahoeGlassRenderer>() {
-        renderer.0.lock().unwrap().damage();
-    }
-}
-
 pub fn damage_surface_regions(
     states: &SurfaceData,
     old: &[TahoeGlassRegion],
@@ -94,6 +88,31 @@ pub fn damage_surface_regions(
     if let Some(renderer) = states.data_map.get::<SurfaceTahoeGlassRenderer>() {
         renderer.0.lock().unwrap().damage_regions(old, new);
     }
+}
+
+fn changed_region_damage(
+    old: &[TahoeGlassRegion],
+    new: &[TahoeGlassRegion],
+) -> Vec<Rectangle<i32, Logical>> {
+    let mut changed = Vec::new();
+
+    for region in old {
+        if new.iter().find(|candidate| candidate.id == region.id) != Some(region) {
+            changed.push(region.rect);
+        }
+    }
+    for region in new {
+        if old.iter().find(|candidate| candidate.id == region.id) != Some(region) {
+            changed.push(region.rect);
+        }
+    }
+
+    let mut union = Vec::new();
+    for rect in changed {
+        let uncovered = rect.subtract_rects(union.iter().copied());
+        union.extend(uncovered);
+    }
+    union
 }
 
 pub fn surface_has_regions(surface: &WlSurface) -> bool {
@@ -386,12 +405,12 @@ fn glass_sample_padding(
 /// Build `RenderParams` that keep sample and visible geometry separated.
 ///
 /// - `sample_geometry` expands capture for blur/refraction padding.
-/// - Draw clip is **always** `Some(visible_geometry, …)`. Omitting clip lets
-///   `FramebufferEffect` / xray fall back to `params.geometry` and paints the
-///   padding as a visible halo when `clip=false`.
+/// - Draw clip is **always** `Some(visible_geometry, …)`. Omitting clip lets `FramebufferEffect` /
+///   xray fall back to `params.geometry` and paints the padding as a visible halo when
+///   `clip=false`.
 /// - The protocol `clip` flag only chooses rounded (`radius`) vs rectangular
-///   (`CornerRadius::default`) material inside the visible bound — it must not
-///   opt out of clipping sample padding away from the drawable region.
+///   (`CornerRadius::default`) material inside the visible bound — it must not opt out of clipping
+///   sample padding away from the drawable region.
 fn glass_region_render_params(
     visible_geometry: Rectangle<f64, Logical>,
     sample_geometry: Rectangle<f64, Logical>,
@@ -425,8 +444,9 @@ fn expand_rect(rect: Rectangle<f64, Logical>, padding: f64) -> Rectangle<f64, Lo
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use smithay::utils::{Point, Size};
+
+    use super::*;
 
     fn visible_rect() -> Rectangle<f64, Logical> {
         Rectangle::new(Point::from((100.0, 50.0)), Size::from((200.0, 80.0)))
@@ -439,6 +459,106 @@ mod tests {
             bottom_right: 12.0,
             bottom_left: 12.0,
         }
+    }
+
+    fn test_region(id: u32, rect: Rectangle<i32, Logical>) -> TahoeGlassRegion {
+        TahoeGlassRegion {
+            id,
+            rect,
+            radius: CornerRadius::default(),
+            material: "panel".into(),
+            flags: crate::protocols::tahoe_glass::TahoeGlassFlags {
+                blur: true,
+                shadow: true,
+                clip: true,
+            },
+            interaction: 0.0,
+            material_alpha: 1.0,
+        }
+    }
+
+    fn damage_area(rects: &[Rectangle<i32, Logical>]) -> i64 {
+        rects
+            .iter()
+            .map(|rect| i64::from(rect.size.w) * i64::from(rect.size.h))
+            .sum()
+    }
+
+    #[test]
+    fn changed_region_damage_ignores_unchanged_ids_and_deduplicates_overlap() {
+        let unchanged = test_region(
+            1,
+            Rectangle::new(Point::from((600, 20)), Size::from((80, 30))),
+        );
+        let old = test_region(
+            7,
+            Rectangle::new(Point::from((100, 4)), Size::from((200, 80))),
+        );
+        let mut new = old.clone();
+        new.rect.loc.x += 20;
+
+        let damage = changed_region_damage(&[unchanged.clone(), old], &[unchanged, new]);
+        assert_eq!(damage_area(&damage), 17_600);
+        for (index, rect) in damage.iter().enumerate() {
+            assert!(
+                damage[index + 1..]
+                    .iter()
+                    .all(|other| rect.intersection(*other).is_none()),
+                "damage union must not contain overlapping rectangles: {damage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn material_only_change_damages_region_once() {
+        let old = test_region(
+            7,
+            Rectangle::new(Point::from((100, 4)), Size::from((200, 80))),
+        );
+        let mut new = old.clone();
+        new.material_alpha = 0.5;
+
+        let damage = changed_region_damage(&[old], &[new]);
+        assert_eq!(damage_area(&damage), 16_000);
+    }
+
+    #[test]
+    fn pending_damage_stays_a_union_across_multiple_commits() {
+        let old = test_region(
+            7,
+            Rectangle::new(Point::from((1168, 4)), Size::from((224, 40))),
+        );
+        let mut middle = old.clone();
+        middle.rect = Rectangle::new(Point::from((1120, 4)), Size::from((320, 120)));
+        let mut new = middle.clone();
+        new.rect = Rectangle::new(Point::from((1060, 4)), Size::from((440, 220)));
+
+        let mut renderer = TahoeGlassRenderer::new();
+        renderer.damage_regions(&[old], &[middle.clone()]);
+        renderer.damage_regions(&[middle], &[new]);
+
+        assert_eq!(damage_area(&renderer.damaged_regions), 96_800);
+        for (index, rect) in renderer.damaged_regions.iter().enumerate() {
+            assert!(renderer.damaged_regions[index + 1..]
+                .iter()
+                .all(|other| rect.intersection(*other).is_none()));
+        }
+    }
+
+    #[test]
+    fn maximum_dynamic_island_union_stays_below_output_budget() {
+        let compact = test_region(
+            7,
+            Rectangle::new(Point::from((1168, 4)), Size::from((224, 40))),
+        );
+        let expanded = test_region(
+            7,
+            Rectangle::new(Point::from((1060, 4)), Size::from((440, 220))),
+        );
+
+        let damage = changed_region_damage(&[compact], &[expanded]);
+        let output_area = 2560_i64 * 1600_i64;
+        assert!(damage_area(&damage) * 100 < output_area * 15);
     }
 
     /// Old broken wiring: `clip` only when the protocol flag is set. When the
@@ -492,9 +612,8 @@ mod tests {
             Point::from((90, 40)),
             Size::from((220, 100)),
         ));
-        let params = glass_region_render_params(
-            visible, sample, false, radius, 0.85, 1.25, draw_clip,
-        );
+        let params =
+            glass_region_render_params(visible, sample, false, radius, 0.85, 1.25, draw_clip);
 
         assert_eq!(params.geometry, sample, "capture stays on expanded sample");
         let (clip_geo, clip_radius) = params
@@ -530,8 +649,7 @@ mod tests {
             bottom_left: 2.0,
         };
         let sample = expand_rect(visible, 16.0);
-        let params =
-            glass_region_render_params(visible, sample, true, radius, 1.0, 1.0, None);
+        let params = glass_region_render_params(visible, sample, true, radius, 1.0, 1.0, None);
 
         assert_eq!(params.geometry, sample);
         let (clip_geo, clip_radius) = params.clip.expect("clip always Some");
@@ -544,29 +662,15 @@ mod tests {
         // Old call site contract that must stay red: only Some when flag true.
         let visible = visible_rect();
         let sample = expand_rect(visible, 24.0);
-        let legacy = legacy_then_some_params(
-            visible,
-            sample,
-            false,
-            rounded_radius(),
-            1.0,
-            1.0,
-            None,
-        );
+        let legacy =
+            legacy_then_some_params(visible, sample, false, rounded_radius(), 1.0, 1.0, None);
         assert!(
             legacy.clip.is_none(),
             "documents the pre-fix wiring that painted sample padding"
         );
 
-        let fixed = glass_region_render_params(
-            visible,
-            sample,
-            false,
-            rounded_radius(),
-            1.0,
-            1.0,
-            None,
-        );
+        let fixed =
+            glass_region_render_params(visible, sample, false, rounded_radius(), 1.0, 1.0, None);
         assert!(
             fixed.clip.is_some(),
             "fixed wiring must always supply a visible clip"
@@ -616,8 +720,15 @@ mod tests {
         let visible = Rectangle::new(Point::from((0.0, 0.0)), Size::from((120.0, 32.0)));
         let padding = 16.0;
         let sample = expand_rect(visible, padding);
-        let params =
-            glass_region_render_params(visible, sample, false, CornerRadius::from(8.0), 1.0, 1.0, None);
+        let params = glass_region_render_params(
+            visible,
+            sample,
+            false,
+            CornerRadius::from(8.0),
+            1.0,
+            1.0,
+            None,
+        );
 
         assert_eq!(params.geometry, sample);
         let (clip_geo, _) = params.clip.unwrap();
@@ -635,8 +746,15 @@ mod tests {
             Point::from((100, 100)),
             Size::from((200, 100)),
         ));
-        let params =
-            glass_region_render_params(visible, sample, true, rounded_radius(), 1.0, 2.0, draw_clip);
+        let params = glass_region_render_params(
+            visible,
+            sample,
+            true,
+            rounded_radius(),
+            1.0,
+            2.0,
+            draw_clip,
+        );
         assert_eq!(params.draw_clip, draw_clip);
         assert_eq!(params.scale, 2.0);
         assert!(params.clip.is_some());

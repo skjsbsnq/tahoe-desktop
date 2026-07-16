@@ -235,7 +235,6 @@ fn mark_pending_dirty(surface: &WlSurface) {
                     &committed,
                 );
                 guard.committed = Arc::new(committed);
-                crate::render_helpers::tahoe_glass::damage_surface(states);
                 true
             });
 
@@ -279,7 +278,6 @@ fn clear_surface_data_if_owner(states: &SurfaceData, generation: u64) -> bool {
     );
 
     crate::render_helpers::tahoe_glass::damage_surface_regions(states, old.as_ref(), &[]);
-    crate::render_helpers::tahoe_glass::damage_surface(states);
     #[cfg(test)]
     {
         // Record the old committed geometry that production damage was asked to
@@ -536,7 +534,6 @@ where
                             old.as_ref(),
                             &[],
                         );
-                        crate::render_helpers::tahoe_glass::damage_surface(states);
                     }
                     (generation, had_visible)
                 });
