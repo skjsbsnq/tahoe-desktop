@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
-use std::path::{Component, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -169,6 +169,7 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
+use crate::thumbnail::{ThumbnailCapture, ThumbnailPublisher, ThumbnailReply};
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
@@ -403,6 +404,7 @@ pub struct Niri {
 
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
+    thumbnail_publisher: ThumbnailPublisher,
 
     pub debug_draw_opaque_regions: bool,
     pub debug_draw_damage: bool,
@@ -2059,20 +2061,34 @@ impl State {
         path: String,
         max_width: u32,
         max_height: u32,
-    ) -> anyhow::Result<niri_ipc::WindowThumbnail> {
+        reply: async_channel::Sender<ThumbnailReply>,
+    ) {
         let mut windows = self.niri.layout.windows();
         let window = windows.find(|(_, mapped)| mapped.id().get() == id);
         let Some((Some(monitor), mapped)) = window else {
-            bail!("window not found or not on an output: {id}");
+            let _ = reply.try_send(Err(format!("window not found or not on an output: {id}")));
+            return;
         };
 
         let output = monitor.output();
-        self.backend
+        let capture = self
+            .backend
             .with_primary_renderer(|renderer| {
                 self.niri
                     .window_thumbnail(renderer, output, mapped, path, max_width, max_height)
             })
-            .context("primary renderer unavailable")?
+            .context("primary renderer unavailable")
+            .and_then(|result| result);
+        match capture {
+            Ok(capture) => self.niri.thumbnail_publisher.publish(capture, reply),
+            Err(err) => {
+                let _ = reply.try_send(Err(err.to_string()));
+            }
+        }
+    }
+
+    pub fn cancel_window_thumbnail(&mut self, id: u64) {
+        self.niri.thumbnail_publisher.cancel_window(id);
     }
 
     pub fn confirm_screenshot(&mut self, write_to_disk: bool) {
@@ -2819,6 +2835,7 @@ impl Niri {
 
             pick_window: None,
             pick_color: None,
+            thumbnail_publisher: ThumbnailPublisher::new(),
 
             debug_draw_opaque_regions: false,
             debug_draw_damage: false,
@@ -6051,7 +6068,7 @@ impl Niri {
             .context("error saving screenshot")
     }
 
-    pub fn window_thumbnail(
+    fn window_thumbnail(
         &self,
         renderer: &mut GlesRenderer,
         output: &Output,
@@ -6059,7 +6076,7 @@ impl Niri {
         path: String,
         max_width: u32,
         max_height: u32,
-    ) -> anyhow::Result<niri_ipc::WindowThumbnail> {
+    ) -> anyhow::Result<ThumbnailCapture> {
         let _span = tracy_client::span!("Niri::window_thumbnail");
 
         ensure!(max_width > 0 && max_height > 0);
@@ -6119,52 +6136,13 @@ impl Niri {
             elements,
         )?;
 
-        self.save_window_thumbnail(PathBuf::from(&path), size, pixels)?;
-        Ok(niri_ipc::WindowThumbnail {
-            path,
+        Ok(ThumbnailCapture {
+            window_id: mapped.id().get(),
+            path: PathBuf::from(path),
             width: size.w as u32,
             height: size.h as u32,
+            pixels,
         })
-    }
-
-    fn save_window_thumbnail(
-        &self,
-        path: PathBuf,
-        size: Size<i32, Physical>,
-        pixels: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        ensure!(path.is_absolute(), "thumbnail path must be absolute");
-        ensure!(
-            !path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir)),
-            "thumbnail path must not contain '..'"
-        );
-
-        let runtime_dir = env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
-        let thumbnail_dir = PathBuf::from(runtime_dir)
-            .join("tahoe")
-            .join("window-thumbnails");
-        ensure!(
-            path.parent() == Some(thumbnail_dir.as_path()),
-            "thumbnail path must be inside {}",
-            thumbnail_dir.display()
-        );
-
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("error creating thumbnail directory {parent:?}"))?;
-            }
-        }
-
-        let file = std::fs::File::create(&path)
-            .with_context(|| format!("error creating thumbnail file {path:?}"))?;
-        let writer = std::io::BufWriter::new(file);
-        write_png_rgba8(writer, size.w as u32, size.h as u32, &pixels)
-            .with_context(|| format!("error encoding thumbnail PNG {path:?}"))?;
-
-        Ok(())
     }
 
     pub fn save_screenshot(

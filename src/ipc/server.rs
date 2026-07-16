@@ -472,10 +472,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 
             let (tx, rx) = async_channel::bounded(1);
             ctx.event_loop.insert_idle(move |state| {
-                let result = state
-                    .window_thumbnail(id, path, max_width, max_height)
-                    .map_err(|err| err.to_string());
-                let _ = tx.send_blocking(result);
+                state.window_thumbnail(id, path, max_width, max_height, tx);
             });
             let result = rx
                 .recv()
