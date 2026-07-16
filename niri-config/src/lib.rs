@@ -2312,7 +2312,7 @@ mod tests {
                     "backdrop": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
                             xray: Some(
-                                false,
+                                true,
                             ),
                             blur: Some(
                                 true,
@@ -2378,7 +2378,7 @@ mod tests {
                     "dock": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
                             xray: Some(
-                                false,
+                                true,
                             ),
                             blur: Some(
                                 true,
@@ -2444,7 +2444,7 @@ mod tests {
                     "launcher": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
                             xray: Some(
-                                false,
+                                true,
                             ),
                             blur: Some(
                                 true,
@@ -2576,7 +2576,7 @@ mod tests {
                     "panel": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
                             xray: Some(
-                                false,
+                                true,
                             ),
                             blur: Some(
                                 true,
