@@ -87,7 +87,7 @@ impl Default for TahoeGlass {
         );
         materials.insert(
             "pill".to_owned(),
-            live_material_profile(0.005, 1.12, 1.05, 0.052, 0.32, 0.013, 0.07, 0., 0.010),
+            material_profile(0.005, 1.12, 1.05, 0.052, 0.32, 0.013, 0.07, 0., 0.010),
         );
         materials.insert(
             "launcher".to_owned(),
@@ -99,11 +99,11 @@ impl Default for TahoeGlass {
         );
         materials.insert(
             "menu".to_owned(),
-            live_material_profile(0.004, 1.08, 1.11, 0.110, 0.26, 0.004, 0.10, 0., 0.),
+            material_profile(0.004, 1.08, 1.11, 0.110, 0.26, 0.004, 0.10, 0., 0.),
         );
         materials.insert(
             "toast".to_owned(),
-            live_material_profile(0.005, 1.09, 1.10, 0.100, 0.24, 0.005, 0.09, 0., 0.),
+            material_profile(0.005, 1.09, 1.10, 0.100, 0.24, 0.005, 0.09, 0., 0.),
         );
 
         let mut backdrop = material_profile(0.003, 1.04, 1.03, 0.070, 0.05, 0.002, 0., 0., 0.);
@@ -141,37 +141,11 @@ fn material_profile(
     material
 }
 
-fn live_material_profile(
-    noise: f64,
-    saturation: f64,
-    contrast: f64,
-    tint_amount: f64,
-    edge_highlight: f64,
-    refraction: f64,
-    inner_shadow: f64,
-    chromatic: f64,
-    lens_depth: f64,
-) -> TahoeGlassMaterial {
-    let mut material = material_profile(
-        noise,
-        saturation,
-        contrast,
-        tint_amount,
-        edge_highlight,
-        refraction,
-        inner_shadow,
-        chromatic,
-        lens_depth,
-    );
-    material.background_effect.xray = Some(false);
-    material
-}
-
 impl Default for TahoeGlassMaterial {
     fn default() -> Self {
         Self {
             background_effect: BackgroundEffect {
-                xray: Some(true),
+                xray: Some(false),
                 blur: Some(true),
                 noise: Some(0.006),
                 saturation: Some(1.16),
@@ -263,18 +237,13 @@ mod tests {
         );
         assert!(!config.material("backdrop").shadow.on);
 
-        for material in ["panel", "launcher", "dock", "backdrop"] {
-            assert_eq!(
-                config.material(material).background_effect.xray,
-                Some(true),
-                "{material} should use the shared xray backdrop"
-            );
-        }
-        for material in ["pill", "menu", "toast"] {
+        for material in [
+            "panel", "pill", "launcher", "dock", "menu", "toast", "backdrop",
+        ] {
             assert_eq!(
                 config.material(material).background_effect.xray,
                 Some(false),
-                "{material} should retain live framebuffer sampling"
+                "{material} should sample the live composed framebuffer"
             );
         }
     }
@@ -313,7 +282,7 @@ mod tests {
         .unwrap();
 
         let material = config.tahoe_glass.material("panel");
-        assert_eq!(material.background_effect.xray, Some(true));
+        assert_eq!(material.background_effect.xray, Some(false));
         assert_eq!(material.background_effect.blur, Some(true));
         assert_eq!(material.background_effect.noise, Some(0.006));
         assert_eq!(material.background_effect.contrast, Some(1.08));
