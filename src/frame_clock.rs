@@ -54,6 +54,8 @@ struct TelemetryWindow {
     no_damage: u64,
     skipped: u64,
     presented: u64,
+    direct_scanout_frames: u64,
+    composited_frames: u64,
     source_layout: u64,
     source_cursor: u64,
     source_layer: u64,
@@ -106,6 +108,14 @@ impl TelemetryWindow {
         }
     }
 
+    fn record_direct_scanout(&mut self, direct_scanout: bool) {
+        if direct_scanout {
+            self.direct_scanout_frames += 1;
+        } else {
+            self.composited_frames += 1;
+        }
+    }
+
     fn report(&mut self, elapsed: Duration, output_pixels: u64) -> TelemetryReport {
         self.render_times_ns.sort_unstable();
         self.frame_times_ns.sort_unstable();
@@ -126,6 +136,12 @@ impl TelemetryWindow {
         } else {
             damage_avg_pixels * 100. / output_pixels as f64
         };
+        let scanout_samples = self.direct_scanout_frames + self.composited_frames;
+        let direct_scanout_percent = if scanout_samples == 0 {
+            0.
+        } else {
+            self.direct_scanout_frames as f64 * 100. / scanout_samples as f64
+        };
 
         TelemetryReport {
             elapsed_s,
@@ -136,6 +152,9 @@ impl TelemetryWindow {
             submitted: self.submitted,
             no_damage: self.no_damage,
             skipped: self.skipped,
+            direct_scanout_frames: self.direct_scanout_frames,
+            composited_frames: self.composited_frames,
+            direct_scanout_percent,
             render_p95_ms: ns_to_ms(percentile(&self.render_times_ns, 95)),
             render_p99_ms: ns_to_ms(percentile(&self.render_times_ns, 99)),
             frame_p95_ms: ns_to_ms(percentile(&self.frame_times_ns, 95)),
@@ -164,6 +183,8 @@ impl TelemetryWindow {
         self.no_damage = 0;
         self.skipped = 0;
         self.presented = 0;
+        self.direct_scanout_frames = 0;
+        self.composited_frames = 0;
         self.source_layout = 0;
         self.source_cursor = 0;
         self.source_layer = 0;
@@ -190,6 +211,9 @@ struct TelemetryReport {
     submitted: u64,
     no_damage: u64,
     skipped: u64,
+    direct_scanout_frames: u64,
+    composited_frames: u64,
+    direct_scanout_percent: f64,
     render_p95_ms: f64,
     render_p99_ms: f64,
     frame_p95_ms: f64,
@@ -268,6 +292,10 @@ impl FrameTelemetry {
         self.window.record_presented(frame_time);
     }
 
+    pub fn record_direct_scanout(&mut self, direct_scanout: bool) {
+        self.window.record_direct_scanout(direct_scanout);
+    }
+
     pub fn record_redraw(
         &mut self,
         sources: RedrawSources,
@@ -291,6 +319,9 @@ impl FrameTelemetry {
             submitted = report.submitted,
             no_damage = report.no_damage,
             skipped = report.skipped,
+            direct_scanout_frames = report.direct_scanout_frames,
+            composited_frames = report.composited_frames,
+            direct_scanout_percent = report.direct_scanout_percent,
             submitted_fps = report.submitted_fps,
             presented_fps = report.presented_fps,
             render_p95_ms = report.render_p95_ms,
@@ -469,6 +500,8 @@ mod tests {
         window.damage_pixels.extend([10, 20, 30, 40]);
         window.record_presented(None);
         window.record_presented(Some(Duration::from_millis(5)));
+        window.record_direct_scanout(true);
+        window.record_direct_scanout(false);
         window.record_redraw(
             RedrawSources {
                 layout: true,
@@ -505,6 +538,9 @@ mod tests {
         assert_eq!(report.submitted, 1);
         assert_eq!(report.no_damage, 1);
         assert_eq!(report.skipped, 1);
+        assert_eq!(report.direct_scanout_frames, 1);
+        assert_eq!(report.composited_frames, 1);
+        assert_eq!(report.direct_scanout_percent, 50.);
         assert_eq!(report.source_layout, 1);
         assert_eq!(report.source_cursor, 1);
         assert_eq!(report.source_layer, 1);

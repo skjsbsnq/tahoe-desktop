@@ -1948,6 +1948,16 @@ impl Tty {
         let drm_compositor = &mut surface.compositor;
         match drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags) {
             Ok(res) => {
+                if let Some(telemetry) = niri
+                    .output_state
+                    .get_mut(output)
+                    .and_then(|state| state.frame_telemetry.as_mut())
+                {
+                    telemetry.record_direct_scanout(matches!(
+                        &res.primary_element,
+                        PrimaryPlaneElement::Element(_)
+                    ));
+                }
                 let needs_sync = res.needs_sync()
                     || self
                         .config
