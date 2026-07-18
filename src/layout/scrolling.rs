@@ -3308,12 +3308,26 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return false;
         }
 
-        if !self.view_offset.is_static() {
+        let column = &self.columns[self.active_column_idx];
+        let mode = column.sizing_mode();
+        if !mode.is_fullscreen() && !mode.is_maximized() {
             return false;
         }
 
-        let mode = self.columns[self.active_column_idx].sizing_mode();
-        mode.is_fullscreen() || mode.is_maximized()
+        match &self.view_offset {
+            ViewOffset::Static(_) => true,
+            // Maximizing can animate the view offset in sync with the window resize. Keep the
+            // window above floating windows for that transition, but not for regular navigation.
+            ViewOffset::Animation(_) => {
+                mode.is_maximized()
+                    && column.is_pending_maximized()
+                    && column
+                        .tiles
+                        .iter()
+                        .any(|tile| tile.resize_animation().is_some())
+            }
+            ViewOffset::Gesture(_) => false,
+        }
     }
 
     pub fn render<R: NiriRenderer>(

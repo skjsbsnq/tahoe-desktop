@@ -3761,6 +3761,13 @@ fn move_column_to_workspace_focus_false_on_floating_window() {
 
 #[test]
 fn active_maximized_window_covers_floating_layer() {
+    let mut options = Options::default();
+    options.animations.window_resize.anim.kind =
+        niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+            duration_ms: 1000,
+            curve: niri_config::animations::Curve::Linear,
+        });
+
     let ops = [
         Op::AddOutput(1),
         Op::AddWindow {
@@ -3778,12 +3785,9 @@ fn active_maximized_window_covers_floating_layer() {
             y: PositionChange::SetFixed(0.),
             animate: false,
         },
-        Op::MaximizeWindowToEdges { id: Some(1) },
-        Op::Communicate(1),
-        Op::CompleteAnimations,
     ];
 
-    let mut layout = check_ops(ops);
+    let mut layout = check_ops_with_options(options, ops);
     let output = layout.outputs().next().unwrap().clone();
     let pos = Point::from((50., 50.));
 
@@ -3791,11 +3795,71 @@ fn active_maximized_window_covers_floating_layer() {
     assert_eq!(*win.id(), 2);
 
     layout.activate_window(&1);
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::MaximizeWindowToEdges { id: Some(1) },
+            Op::Communicate(1),
+        ],
+    );
+
+    // The maximized window must cover the floating layer during its resize animation.
+    assert!(!layout.active_workspace().unwrap().is_floating_visible());
+    let (win, _) = layout.window_under(&output, pos).unwrap();
+    assert_eq!(*win.id(), 1);
+
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert!(!layout.active_workspace().unwrap().is_floating_visible());
+    let (win, _) = layout.window_under(&output, pos).unwrap();
+    assert_eq!(*win.id(), 1);
+
+    Op::CompleteAnimations.apply(&mut layout);
     layout.verify_invariants();
 
     assert!(!layout.active_workspace().unwrap().is_floating_visible());
     let (win, _) = layout.window_under(&output, pos).unwrap();
     assert_eq!(*win.id(), 1);
+}
+
+#[test]
+fn navigating_to_maximized_window_does_not_cover_floating_layer() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams {
+                is_floating: true,
+                ..TestWindowParams::new(3)
+            },
+        },
+        Op::MoveFloatingWindow {
+            id: Some(3),
+            x: PositionChange::SetFixed(0.),
+            y: PositionChange::SetFixed(0.),
+            animate: false,
+        },
+        Op::FocusTiling,
+        Op::FocusColumnLeft,
+        Op::MaximizeWindowToEdges { id: Some(1) },
+        Op::Communicate(1),
+        Op::CompleteAnimations,
+        Op::FocusColumnRight,
+        Op::CompleteAnimations,
+        Op::FocusColumnLeft,
+    ];
+
+    let layout = check_ops(ops);
+    let output = layout.outputs().next().unwrap().clone();
+    let pos = Point::from((50., 50.));
+
+    assert!(layout.active_workspace().unwrap().is_floating_visible());
+    let (win, _) = layout.window_under(&output, pos).unwrap();
+    assert_eq!(*win.id(), 3);
 }
 
 #[test]
