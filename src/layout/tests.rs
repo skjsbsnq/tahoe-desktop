@@ -3769,6 +3769,15 @@ fn linear_resize_options() -> Options {
     options
 }
 
+fn tile_visibility(layout: &Layout<TestWindow>) -> Vec<(usize, bool)> {
+    layout
+        .active_workspace()
+        .unwrap()
+        .tiles_with_render_positions()
+        .map(|(tile, _, visible)| (*tile.window().id(), visible))
+        .collect()
+}
+
 #[test]
 fn active_maximized_window_covers_floating_layer() {
     let options = linear_resize_options();
@@ -3838,27 +3847,200 @@ fn maximizing_window_hides_other_scrolling_columns() {
         },
         Op::FocusColumnLeft,
         Op::MaximizeWindowToEdges { id: Some(1) },
-        Op::Communicate(1),
     ];
 
     let mut layout = check_ops_with_options(linear_resize_options(), ops);
-    let visible_tiles = |layout: &Layout<TestWindow>| {
-        layout
-            .active_workspace()
-            .unwrap()
-            .tiles_with_render_positions()
-            .map(|(tile, _, visible)| (*tile.window().id(), visible))
-            .collect::<Vec<_>>()
-    };
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
 
-    assert_eq!(visible_tiles(&layout), [(1, true), (2, false)]);
+    Op::Communicate(1).apply(&mut layout);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
 
     Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
-    assert_eq!(visible_tiles(&layout), [(1, true), (2, false)]);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
 
     Op::CompleteAnimations.apply(&mut layout);
     layout.verify_invariants();
-    assert_eq!(visible_tiles(&layout), [(1, true), (2, true)]);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, true)]);
+}
+
+#[test]
+fn maximizing_inactive_window_prioritizes_target_column() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::MaximizeWindowToEdges { id: Some(1) },
+    ];
+
+    let mut layout = check_ops_with_options(linear_resize_options(), ops);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
+
+    Op::Communicate(1).apply(&mut layout);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
+
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
+
+    Op::CompleteAnimations.apply(&mut layout);
+    layout.verify_invariants();
+    assert_eq!(tile_visibility(&layout), [(2, true), (1, true)]);
+}
+
+#[test]
+fn maximizing_window_hides_active_floating_layer() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams {
+                is_floating: true,
+                ..TestWindowParams::new(2)
+            },
+        },
+        Op::MaximizeWindowToEdges { id: Some(1) },
+    ];
+
+    let mut layout = check_ops_with_options(linear_resize_options(), ops);
+    assert!(!layout.active_workspace().unwrap().is_floating_visible());
+    assert_eq!(tile_visibility(&layout), [(2, false), (1, true)]);
+
+    Op::Communicate(1).apply(&mut layout);
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert!(!layout.active_workspace().unwrap().is_floating_visible());
+    assert_eq!(tile_visibility(&layout), [(2, false), (1, true)]);
+
+    Op::CompleteAnimations.apply(&mut layout);
+    layout.verify_invariants();
+    assert!(layout.active_workspace().unwrap().is_floating_visible());
+    assert_eq!(tile_visibility(&layout), [(2, true), (1, true)]);
+}
+
+#[test]
+fn cancelling_maximize_releases_target_priority() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusColumnLeft,
+        Op::MaximizeWindowToEdges { id: Some(1) },
+    ];
+
+    let mut layout = check_ops(ops);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
+
+    Op::MaximizeWindowToEdges { id: Some(1) }.apply(&mut layout);
+    layout.verify_invariants();
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, true)]);
+}
+
+#[test]
+fn maximize_transition_times_out_and_restarts_on_late_commit() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusColumnLeft,
+        Op::MaximizeWindowToEdges { id: Some(1) },
+    ];
+
+    let mut layout = check_ops_with_options(linear_resize_options(), ops);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
+
+    Op::AdvanceAnimations { msec_delta: 1001 }.apply(&mut layout);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, true)]);
+
+    Op::Communicate(1).apply(&mut layout);
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
+
+    Op::CompleteAnimations.apply(&mut layout);
+    layout.verify_invariants();
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, true)]);
+}
+
+#[test]
+fn maximizing_inactive_tab_prioritizes_target_tile() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusColumnLeft,
+        Op::ConsumeWindowIntoColumn,
+        Op::SetColumnDisplay(ColumnDisplay::Tabbed),
+        Op::FocusWindow(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::MaximizeWindowToEdges { id: Some(2) },
+    ];
+
+    let mut layout = check_ops_with_options(linear_resize_options(), ops);
+    assert_eq!(
+        tile_visibility(&layout),
+        [(2, true), (1, false), (3, false)]
+    );
+
+    Op::Communicate(2).apply(&mut layout);
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert_eq!(
+        tile_visibility(&layout),
+        [(2, true), (1, false), (3, false)]
+    );
+
+    Op::CompleteAnimations.apply(&mut layout);
+    layout.verify_invariants();
+    assert_eq!(tile_visibility(&layout), [(3, true), (1, true), (2, false)]);
+}
+
+#[test]
+fn timed_out_maximize_ignores_late_commit_from_other_tab() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusColumnLeft,
+        Op::ConsumeWindowIntoColumn,
+        Op::SetColumnDisplay(ColumnDisplay::Tabbed),
+        Op::FocusWindow(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::MaximizeWindowToEdges { id: Some(2) },
+    ];
+
+    let mut layout = check_ops_with_options(linear_resize_options(), ops);
+    Op::AdvanceAnimations { msec_delta: 1001 }.apply(&mut layout);
+    assert_eq!(tile_visibility(&layout), [(3, true), (1, true), (2, false)]);
+
+    Op::Communicate(1).apply(&mut layout);
+    assert_eq!(tile_visibility(&layout), [(3, true), (1, true), (2, false)]);
+
+    Op::Communicate(2).apply(&mut layout);
+    assert_eq!(
+        tile_visibility(&layout),
+        [(2, true), (1, false), (3, false)]
+    );
 }
 
 #[test]

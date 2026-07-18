@@ -36,6 +36,9 @@ use crate::window::ResolvedWindowRules;
 /// Amount of touchpad movement to scroll the view for the width of one working area.
 const VIEW_GESTURE_WORKING_AREA_MOVEMENT: f64 = 1200.;
 
+/// Do not let an unresponsive client hide the rest of the workspace indefinitely.
+const MAXIMIZE_PENDING_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// A scrollable-tiling space for windows.
 #[derive(Debug)]
 pub struct ScrollingSpace<W: LayoutElement> {
@@ -72,6 +75,9 @@ pub struct ScrollingSpace<W: LayoutElement> {
 
     /// View offset to restore after unfullscreening or unmaximizing.
     view_offset_to_restore: Option<f64>,
+
+    /// Window that temporarily owns rendering while entering the maximized state.
+    maximize_transition: Option<MaximizeTransition<W::Id>>,
 
     /// Windows in the closing animation.
     closing_windows: Vec<ClosingWindow>,
@@ -295,6 +301,14 @@ struct MoveAnimation {
     from: f64,
 }
 
+#[derive(Debug)]
+struct MaximizeTransition<Id> {
+    window: Id,
+    started_at: Duration,
+    committed: bool,
+    timed_out: bool,
+}
+
 impl<W: LayoutElement> ScrollingSpace<W> {
     pub fn new(
         view_size: Size<f64, Logical>,
@@ -313,6 +327,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             view_offset: ViewOffset::Static(0.),
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
+            maximize_transition: None,
             closing_windows: Vec::new(),
             minimize_animations: Vec::new(),
             restore_animations: Vec::new(),
@@ -427,6 +442,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         for col in &mut self.columns {
             col.advance_animations();
         }
+
+        self.finish_maximize_transition_if_settled();
 
         self.closing_windows.retain_mut(|closing| {
             closing.advance_animations();
@@ -1146,6 +1163,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .window()
             .id()
             .clone();
+        if self
+            .maximize_transition
+            .as_ref()
+            .is_some_and(|transition| transition.window == id)
+        {
+            self.maximize_transition = None;
+        }
         self.clear_minimize_restore_animations(&id);
 
         // If this is the only tile in the column, remove the whole column.
@@ -1256,6 +1280,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         column_idx: usize,
         anim_config: Option<niri_config::Animation>,
     ) -> Column<W> {
+        let removes_maximizing_window = self
+            .maximize_transition
+            .as_ref()
+            .is_some_and(|transition| self.columns[column_idx].contains(&transition.window));
+        if removes_maximizing_window {
+            self.maximize_transition = None;
+        }
+
         // Animate movement of the other columns.
         let movement_config = anim_config.unwrap_or(self.options.animations.window_movement.0);
         let offset = self.column_x(column_idx + 1) - self.column_x(column_idx);
@@ -1353,7 +1385,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .enumerate()
             .find(|(_, tile)| tile.window().id() == window)
             .unwrap();
-
         let resize = tile.window_mut().interactive_resize_data();
 
         // Do this before calling update_window() so it can get up-to-date info.
@@ -1366,6 +1397,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         column.update_window(window);
         self.data[col_idx].update(column);
         column.update_tile_sizes(false);
+        let committed_maximize = column.is_pending_maximized()
+            && !column.is_pending_fullscreen()
+            && column.tiles[tile_idx].sizing_mode().is_maximized();
 
         let offset = prev_width - self.data[col_idx].width;
 
@@ -1495,6 +1529,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 // FIXME: we will want to skip the animation in some cases here to make continuously
                 // resizing windows not look janky.
                 self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
+            }
+        }
+
+        if committed_maximize {
+            if let Some(transition) = &mut self.maximize_transition {
+                if &transition.window == window {
+                    transition.committed = true;
+                    transition.timed_out = false;
+                }
             }
         }
     }
@@ -2727,14 +2770,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     fn column_xs_in_render_order(
         &self,
         data: impl Iterator<Item = ColumnData>,
+        priority_idx: usize,
     ) -> impl Iterator<Item = f64> {
-        let active_idx = self.active_column_idx;
-        let active_pos = self.column_x(active_idx);
+        let priority_pos = self.column_x(priority_idx);
         let offsets = self
             .column_xs(data)
             .enumerate()
-            .filter_map(move |(idx, pos)| (idx != active_idx).then_some(pos));
-        iter::once(active_pos).chain(offsets)
+            .filter_map(move |(idx, pos)| (idx != priority_idx).then_some(pos));
+        iter::once(priority_pos).chain(offsets)
     }
 
     pub fn columns(&self) -> impl Iterator<Item = &Column<W>> {
@@ -2746,23 +2789,38 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         zip(&mut self.columns, offsets)
     }
 
-    fn columns_in_render_order(&self) -> impl Iterator<Item = (&Column<W>, f64)> + '_ {
-        let offsets = self.column_xs_in_render_order(self.data.iter().copied());
+    fn columns_in_render_order_from(
+        &self,
+        priority_idx: usize,
+    ) -> impl Iterator<Item = (&Column<W>, f64)> + '_ {
+        let offsets = self.column_xs_in_render_order(self.data.iter().copied(), priority_idx);
 
-        let (first, active, rest) = if self.columns.is_empty() {
+        let (first, priority, rest) = if self.columns.is_empty() {
             (&[][..], &[][..], &[][..])
         } else {
-            let (first, rest) = self.columns.split_at(self.active_column_idx);
-            let (active, rest) = rest.split_at(1);
-            (first, active, rest)
+            let (first, rest) = self.columns.split_at(priority_idx);
+            let (priority, rest) = rest.split_at(1);
+            (first, priority, rest)
         };
 
-        let columns = active.iter().chain(first).chain(rest);
+        let columns = priority.iter().chain(first).chain(rest);
         zip(columns, offsets)
     }
 
+    fn columns_in_display_order(&self) -> impl Iterator<Item = (&Column<W>, f64)> + '_ {
+        let maximizing_idx = self.maximizing_column_idx();
+        let priority_idx = maximizing_idx.unwrap_or(self.active_column_idx);
+        let count = if maximizing_idx.is_some() {
+            1
+        } else {
+            usize::MAX
+        };
+        self.columns_in_render_order_from(priority_idx).take(count)
+    }
+
     fn columns_in_render_order_mut(&mut self) -> impl Iterator<Item = (&mut Column<W>, f64)> + '_ {
-        let offsets = self.column_xs_in_render_order(self.data.iter().copied());
+        let offsets =
+            self.column_xs_in_render_order(self.data.iter().copied(), self.active_column_idx);
 
         let (first, active, rest) = if self.columns.is_empty() {
             (&mut [][..], &mut [][..], &mut [][..])
@@ -2781,22 +2839,32 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>, bool)> {
         let scale = self.scale;
         let view_off = Point::from((-self.view_pos(), 0.));
-        let only_active_column = self.active_maximized_window_is_resizing();
-        self.columns_in_render_order().enumerate().flat_map(
-            move |(column_order_idx, (col, col_x))| {
+        let maximizing_location = self.maximizing_window_location();
+        let maximizing_idx = maximizing_location.map(|(column_idx, _)| column_idx);
+        let maximizing_tile_idx = maximizing_location.map(|(_, tile_idx)| tile_idx);
+        let priority_idx = maximizing_idx.unwrap_or(self.active_column_idx);
+        self.columns_in_render_order_from(priority_idx)
+            .enumerate()
+            .flat_map(move |(column_order_idx, (col, col_x))| {
                 let col_off = Point::from((col_x, 0.));
                 let col_render_off = col.render_offset();
-                let column_visible = !only_active_column || column_order_idx == 0;
-                col.tiles_in_render_order()
-                    .map(move |(tile, tile_off, visible)| {
+                let column_visible = maximizing_idx.is_none() || column_order_idx == 0;
+                let priority_tile_idx = if column_order_idx == 0 {
+                    maximizing_tile_idx.unwrap_or(col.active_tile_idx)
+                } else {
+                    col.active_tile_idx
+                };
+                col.tiles_in_render_order_from(priority_tile_idx)
+                    .enumerate()
+                    .map(move |(tile_order_idx, (tile, tile_off, visible))| {
                         let pos =
                             view_off + col_off + col_render_off + tile_off + tile.render_offset();
                         // Round to physical pixels.
                         let pos = pos.to_physical_precise_round(scale).to_logical(scale);
-                        (tile, pos, visible && column_visible)
+                        let tile_visible = maximizing_idx.is_none() || tile_order_idx == 0;
+                        (tile, pos, visible && column_visible && tile_visible)
                     })
-            },
-        )
+            })
     }
 
     pub fn tiles_with_render_positions_mut(
@@ -3236,8 +3304,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .position(|col| col.contains(window))
             .unwrap();
 
+        let cancels_maximize_transition = self
+            .maximize_transition
+            .as_ref()
+            .is_some_and(|transition| &transition.window == window);
+        if is_fullscreen && cancels_maximize_transition {
+            self.maximize_transition = None;
+        }
+
         if is_fullscreen == self.columns[col_idx].is_pending_fullscreen {
             return false;
+        }
+
+        if cancels_maximize_transition {
+            self.maximize_transition = None;
         }
 
         let mut col = &mut self.columns[col_idx];
@@ -3283,10 +3363,31 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             col = &mut self.columns[col_idx];
         }
 
+        let tile_idx = col.position(window).unwrap();
+        if maximize {
+            col.tiles[tile_idx].ensure_alpha_animates_to_1();
+        }
+
         col.set_maximized(maximize);
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+
+        if maximize {
+            let committed = col.tiles[tile_idx].sizing_mode().is_maximized();
+            self.maximize_transition = Some(MaximizeTransition {
+                window: window.clone(),
+                started_at: self.clock.now_unadjusted(),
+                committed,
+                timed_out: false,
+            });
+        } else if self
+            .maximize_transition
+            .as_ref()
+            .is_some_and(|transition| &transition.window == window)
+        {
+            self.maximize_transition = None;
+        }
 
         true
     }
@@ -3311,35 +3412,79 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return false;
         }
 
-        let column = &self.columns[self.active_column_idx];
-        let mode = column.sizing_mode();
-        if !mode.is_fullscreen() && !mode.is_maximized() {
+        if !self.view_offset.is_static() {
             return false;
         }
 
-        match &self.view_offset {
-            ViewOffset::Static(_) => true,
-            // Maximizing can animate the view offset in sync with the window resize. Keep the
-            // window above floating windows for that transition, but not for regular navigation.
-            ViewOffset::Animation(_) | ViewOffset::Gesture(_) => {
-                self.active_maximized_window_is_resizing()
-            }
-        }
+        let mode = self.columns[self.active_column_idx].sizing_mode();
+        mode.is_fullscreen() || mode.is_maximized()
     }
 
-    fn active_maximized_window_is_resizing(&self) -> bool {
-        let Some(column) = self.columns.get(self.active_column_idx) else {
-            return false;
+    fn maximizing_window_location(&self) -> Option<(usize, usize)> {
+        let transition = self.maximize_transition.as_ref()?;
+        if transition.timed_out {
+            return None;
+        }
+
+        let window = &transition.window;
+        self.columns
+            .iter()
+            .enumerate()
+            .find_map(|(column_idx, column)| {
+                column
+                    .position(window)
+                    .map(|tile_idx| (column_idx, tile_idx))
+            })
+    }
+
+    fn maximizing_column_idx(&self) -> Option<usize> {
+        self.maximizing_window_location()
+            .map(|(column_idx, _)| column_idx)
+    }
+
+    pub(super) fn maximize_transition_is_ongoing(&self) -> bool {
+        self.maximizing_window_location().is_some()
+    }
+
+    fn finish_maximize_transition_if_settled(&mut self) {
+        let now = self.clock.now_unadjusted();
+        let Some(transition) = self.maximize_transition.as_ref() else {
+            return;
         };
 
-        // The resize shader may have transparent pixels, and repeated client commits can restart
-        // the tile resize without restarting neighboring column movement. In both cases, windows
-        // from other columns can flash through the active tile, so keep them out of this transition.
-        column.sizing_mode().is_maximized()
-            && column.is_pending_maximized()
-            && column.tiles[column.active_tile_idx]
-                .resize_animation()
-                .is_some()
+        let Some((column_idx, tile_idx)) =
+            self.columns
+                .iter()
+                .enumerate()
+                .find_map(|(column_idx, column)| {
+                    column
+                        .position(&transition.window)
+                        .map(|tile_idx| (column_idx, tile_idx))
+                })
+        else {
+            self.maximize_transition = None;
+            return;
+        };
+
+        let column = &self.columns[column_idx];
+        let tile = &column.tiles[tile_idx];
+        let cancelled = !column.is_pending_maximized() || column.is_pending_fullscreen();
+        let timed_out = !transition.committed
+            && now.saturating_sub(transition.started_at) >= MAXIMIZE_PENDING_TIMEOUT;
+        let settled = transition.committed
+            && tile.sizing_mode().is_maximized()
+            && !tile.are_transitions_ongoing()
+            && self.view_offset.is_static()
+            && self
+                .columns
+                .iter()
+                .all(|column| column.move_animation.is_none());
+
+        if cancelled || settled {
+            self.maximize_transition = None;
+        } else if timed_out {
+            self.maximize_transition.as_mut().unwrap().timed_out = true;
+        }
     }
 
     pub fn render<R: NiriRenderer>(
@@ -3350,38 +3495,43 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
+        let maximize_transition = self.maximize_transition_is_ongoing();
 
-        // Draw the closing windows on top of the other windows.
         let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
-        for closing in self.closing_windows.iter().rev() {
-            let elem = closing.render(ctx.as_gles(), view_rect, scale);
-            push(elem.into());
-        }
+        if !maximize_transition {
+            // Draw the closing windows on top of the other windows.
+            for closing in self.closing_windows.iter().rev() {
+                let elem = closing.render(ctx.as_gles(), view_rect, scale);
+                push(elem.into());
+            }
 
-        for (_, minimize) in self.minimize_animations.iter().rev() {
-            let elem = minimize.render(ctx.as_gles(), view_rect, scale);
-            push(elem.into());
-        }
+            for (_, minimize) in self.minimize_animations.iter().rev() {
+                let elem = minimize.render(ctx.as_gles(), view_rect, scale);
+                push(elem.into());
+            }
 
-        for (_, restore) in self.restore_animations.iter().rev() {
-            let elem = restore.render(ctx.as_gles(), view_rect, scale);
-            push(elem.into());
+            for (_, restore) in self.restore_animations.iter().rev() {
+                let elem = restore.render(ctx.as_gles(), view_rect, scale);
+                push(elem.into());
+            }
         }
 
         if self.columns.is_empty() {
             return;
         }
 
+        let maximizing_location = self.maximizing_window_location();
+        let maximizing_tile_idx = maximizing_location.map(|(_, tile_idx)| tile_idx);
         let mut first = true;
+        let focus_ring = focus_ring
+            && maximizing_location.is_none_or(|(column_idx, tile_idx)| {
+                column_idx == self.active_column_idx
+                    && tile_idx == self.columns[column_idx].active_tile_idx
+            });
 
         // This matches self.tiles_in_render_order().
         let view_off = Point::from((-self.view_pos(), 0.));
-        let only_active_column = self.active_maximized_window_is_resizing();
-        for (column_order_idx, (col, col_x)) in self.columns_in_render_order().enumerate() {
-            if only_active_column && column_order_idx > 0 {
-                break;
-            }
-
+        for (col, col_x) in self.columns_in_display_order() {
             let col_off = Point::from((col_x, 0.));
             let col_render_off = col.render_offset();
 
@@ -3393,7 +3543,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     .render(ctx.renderer, pos, &mut |elem| push(elem.into()));
             }
 
-            for (tile, tile_off, visible) in col.tiles_in_render_order() {
+            for (tile, tile_off, visible) in col.tiles_in_display_order(maximizing_tile_idx) {
                 if tile.window().is_minimized() && !tile.should_render_minimized_animation() {
                     continue;
                 }
@@ -3434,17 +3584,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // This matches self.tiles_with_render_positions().
         let scale = self.scale;
         let view_off = Point::from((-self.view_pos(), 0.));
-        let only_active_column = self.active_maximized_window_is_resizing();
-        for (column_order_idx, (col, col_x)) in self.columns_in_render_order().enumerate() {
-            if only_active_column && column_order_idx > 0 {
-                break;
-            }
-
+        let maximizing_tile_idx = self
+            .maximizing_window_location()
+            .map(|(_, tile_idx)| tile_idx);
+        for (col, col_x) in self.columns_in_display_order() {
             let col_off = Point::from((col_x, 0.));
             let col_render_off = col.render_offset();
 
             // Hit the tab indicator.
-            if col.display_mode == ColumnDisplay::Tabbed && col.sizing_mode().is_normal() {
+            if maximizing_tile_idx.is_none()
+                && col.display_mode == ColumnDisplay::Tabbed
+                && col.sizing_mode().is_normal()
+            {
                 let col_pos = view_off + col_off + col_render_off;
                 let col_pos = col_pos.to_physical_precise_round(scale).to_logical(scale);
 
@@ -3464,7 +3615,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 }
             }
 
-            for (tile, tile_off, visible) in col.tiles_in_render_order() {
+            for (tile, tile_off, visible) in col.tiles_in_display_order(maximizing_tile_idx) {
                 if tile.window().is_minimized() {
                     continue;
                 }
@@ -4266,6 +4417,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     .flat_map(|col| &col.tiles)
                     .any(|tile| tile.window().id() == &resize.window),
                 "interactive resize window must be present in the layout"
+            );
+        }
+
+        if let Some(transition) = &self.maximize_transition {
+            assert!(
+                self.columns
+                    .iter()
+                    .any(|column| column.contains(&transition.window)),
+                "maximizing window must be present in the layout"
             );
         }
     }
@@ -5745,14 +5905,14 @@ impl<W: LayoutElement> Column<W> {
     fn tile_offsets_in_render_order(
         &self,
         data: impl Iterator<Item = TileData>,
+        priority_idx: usize,
     ) -> impl Iterator<Item = Point<f64, Logical>> {
-        let active_idx = self.active_tile_idx;
-        let active_pos = self.tile_offset(active_idx);
+        let priority_pos = self.tile_offset(priority_idx);
         let offsets = self
             .tile_offsets_iter(data)
             .enumerate()
-            .filter_map(move |(idx, pos)| (idx != active_idx).then_some(pos));
-        iter::once(active_pos).chain(offsets)
+            .filter_map(move |(idx, pos)| (idx != priority_idx).then_some(pos));
+        iter::once(priority_pos).chain(offsets)
     }
 
     pub fn tiles(&self) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>)> + '_ {
@@ -5765,28 +5925,43 @@ impl<W: LayoutElement> Column<W> {
         zip(&mut self.tiles, offsets)
     }
 
-    fn tiles_in_render_order(
+    fn tiles_in_render_order_from(
         &self,
+        priority_idx: usize,
     ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>, bool)> + '_ {
-        let offsets = self.tile_offsets_in_render_order(self.data.iter().copied());
+        let offsets = self.tile_offsets_in_render_order(self.data.iter().copied(), priority_idx);
 
-        let (first, rest) = self.tiles.split_at(self.active_tile_idx);
-        let (active, rest) = rest.split_at(1);
+        let (first, rest) = self.tiles.split_at(priority_idx);
+        let (priority, rest) = rest.split_at(1);
 
-        let active = active.iter().map(|tile| (tile, true));
+        let priority = priority.iter().map(|tile| (tile, true));
 
         let rest_visible = self.display_mode != ColumnDisplay::Tabbed;
         let rest = first.iter().chain(rest);
         let rest = rest.map(move |tile| (tile, rest_visible));
 
-        let tiles = active.chain(rest);
+        let tiles = priority.chain(rest);
         zip(tiles, offsets).map(|((tile, visible), pos)| (tile, pos, visible))
+    }
+
+    fn tiles_in_display_order(
+        &self,
+        priority_idx: Option<usize>,
+    ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>, bool)> + '_ {
+        let count = if priority_idx.is_some() {
+            1
+        } else {
+            usize::MAX
+        };
+        self.tiles_in_render_order_from(priority_idx.unwrap_or(self.active_tile_idx))
+            .take(count)
     }
 
     fn tiles_in_render_order_mut(
         &mut self,
     ) -> impl Iterator<Item = (&mut Tile<W>, Point<f64, Logical>)> + '_ {
-        let offsets = self.tile_offsets_in_render_order(self.data.iter().copied());
+        let offsets =
+            self.tile_offsets_in_render_order(self.data.iter().copied(), self.active_tile_idx);
 
         let (first, rest) = self.tiles.split_at_mut(self.active_tile_idx);
         let (active, rest) = rest.split_at_mut(1);

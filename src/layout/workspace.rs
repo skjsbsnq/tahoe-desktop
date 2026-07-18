@@ -1852,6 +1852,10 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn is_floating_visible(&self) -> bool {
+        if self.scrolling.maximize_transition_is_ongoing() {
+            return false;
+        }
+
         // If the focus is on a scrolling window that covers the workspace, hide floating windows.
         matches!(
             self.floating_is_active,
