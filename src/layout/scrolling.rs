@@ -2781,19 +2781,22 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>, bool)> {
         let scale = self.scale;
         let view_off = Point::from((-self.view_pos(), 0.));
-        self.columns_in_render_order()
-            .flat_map(move |(col, col_x)| {
+        let only_active_column = self.active_maximized_window_is_resizing();
+        self.columns_in_render_order().enumerate().flat_map(
+            move |(column_order_idx, (col, col_x))| {
                 let col_off = Point::from((col_x, 0.));
                 let col_render_off = col.render_offset();
+                let column_visible = !only_active_column || column_order_idx == 0;
                 col.tiles_in_render_order()
                     .map(move |(tile, tile_off, visible)| {
                         let pos =
                             view_off + col_off + col_render_off + tile_off + tile.render_offset();
                         // Round to physical pixels.
                         let pos = pos.to_physical_precise_round(scale).to_logical(scale);
-                        (tile, pos, visible)
+                        (tile, pos, visible && column_visible)
                     })
-            })
+            },
+        )
     }
 
     pub fn tiles_with_render_positions_mut(
@@ -3318,16 +3321,25 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             ViewOffset::Static(_) => true,
             // Maximizing can animate the view offset in sync with the window resize. Keep the
             // window above floating windows for that transition, but not for regular navigation.
-            ViewOffset::Animation(_) => {
-                mode.is_maximized()
-                    && column.is_pending_maximized()
-                    && column
-                        .tiles
-                        .iter()
-                        .any(|tile| tile.resize_animation().is_some())
+            ViewOffset::Animation(_) | ViewOffset::Gesture(_) => {
+                self.active_maximized_window_is_resizing()
             }
-            ViewOffset::Gesture(_) => false,
         }
+    }
+
+    fn active_maximized_window_is_resizing(&self) -> bool {
+        let Some(column) = self.columns.get(self.active_column_idx) else {
+            return false;
+        };
+
+        // The resize shader may have transparent pixels, and repeated client commits can restart
+        // the tile resize without restarting neighboring column movement. In both cases, windows
+        // from other columns can flash through the active tile, so keep them out of this transition.
+        column.sizing_mode().is_maximized()
+            && column.is_pending_maximized()
+            && column.tiles[column.active_tile_idx]
+                .resize_animation()
+                .is_some()
     }
 
     pub fn render<R: NiriRenderer>(
@@ -3364,7 +3376,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // This matches self.tiles_in_render_order().
         let view_off = Point::from((-self.view_pos(), 0.));
-        for (col, col_x) in self.columns_in_render_order() {
+        let only_active_column = self.active_maximized_window_is_resizing();
+        for (column_order_idx, (col, col_x)) in self.columns_in_render_order().enumerate() {
+            if only_active_column && column_order_idx > 0 {
+                break;
+            }
+
             let col_off = Point::from((col_x, 0.));
             let col_render_off = col.render_offset();
 
@@ -3417,7 +3434,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // This matches self.tiles_with_render_positions().
         let scale = self.scale;
         let view_off = Point::from((-self.view_pos(), 0.));
-        for (col, col_x) in self.columns_in_render_order() {
+        let only_active_column = self.active_maximized_window_is_resizing();
+        for (column_order_idx, (col, col_x)) in self.columns_in_render_order().enumerate() {
+            if only_active_column && column_order_idx > 0 {
+                break;
+            }
+
             let col_off = Point::from((col_x, 0.));
             let col_render_off = col.render_offset();
 

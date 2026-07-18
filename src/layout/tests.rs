@@ -3759,14 +3759,19 @@ fn move_column_to_workspace_focus_false_on_floating_window() {
     assert_eq!(monitors[0].active_workspace_idx, 0);
 }
 
-#[test]
-fn active_maximized_window_covers_floating_layer() {
+fn linear_resize_options() -> Options {
     let mut options = Options::default();
     options.animations.window_resize.anim.kind =
         niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
             duration_ms: 1000,
             curve: niri_config::animations::Curve::Linear,
         });
+    options
+}
+
+#[test]
+fn active_maximized_window_covers_floating_layer() {
+    let options = linear_resize_options();
 
     let ops = [
         Op::AddOutput(1),
@@ -3819,6 +3824,41 @@ fn active_maximized_window_covers_floating_layer() {
     assert!(!layout.active_workspace().unwrap().is_floating_visible());
     let (win, _) = layout.window_under(&output, pos).unwrap();
     assert_eq!(*win.id(), 1);
+}
+
+#[test]
+fn maximizing_window_hides_other_scrolling_columns() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusColumnLeft,
+        Op::MaximizeWindowToEdges { id: Some(1) },
+        Op::Communicate(1),
+    ];
+
+    let mut layout = check_ops_with_options(linear_resize_options(), ops);
+    let visible_tiles = |layout: &Layout<TestWindow>| {
+        layout
+            .active_workspace()
+            .unwrap()
+            .tiles_with_render_positions()
+            .map(|(tile, _, visible)| (*tile.window().id(), visible))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(visible_tiles(&layout), [(1, true), (2, false)]);
+
+    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
+    assert_eq!(visible_tiles(&layout), [(1, true), (2, false)]);
+
+    Op::CompleteAnimations.apply(&mut layout);
+    layout.verify_invariants();
+    assert_eq!(visible_tiles(&layout), [(1, true), (2, true)]);
 }
 
 #[test]
