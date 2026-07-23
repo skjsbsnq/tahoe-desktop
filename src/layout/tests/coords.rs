@@ -94,6 +94,6 @@ fn minimize_rect_encodes_output_local_space() {
         rect: OutputLocalRect::new(Point::from((24, 680)), Size::from((48, 48))),
     };
     assert_eq!(rect.rect.loc(), Point::from((24, 680)));
-    assert!(layout.minimize_window_with_target(&1, Some(rect.clone())));
-    assert!(layout.restore_window_with_source(&1, Some(rect)));
+    assert!(layout.apply_lifecycle(&1, true, Some(rect.clone())));
+    assert!(layout.apply_lifecycle(&1, false, Some(rect)));
 }

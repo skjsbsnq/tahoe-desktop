@@ -48,6 +48,7 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::lifecycle_command::{LifecycleAnchorInput, LifecycleCommand, LifecycleInvocationSource};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
@@ -838,7 +839,14 @@ impl State {
             Action::MinimizeWindow => {
                 let focus = self.niri.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    if self.minimize_window_with_animation(&window, None) {
+                    // IPC / binds share CachedForCurrentOutput with foreign so a dock-published
+                    // rect is consumed even when Shell falls back to the action path (F04).
+                    let result = self.execute_lifecycle_command(LifecycleCommand::minimize(
+                        window,
+                        LifecycleAnchorInput::CachedForCurrentOutput,
+                        LifecycleInvocationSource::Ipc,
+                    ));
+                    if result.changed() {
                         self.niri.layer_shell_on_demand_focus = None;
                         self.niri.queue_redraw_all();
                     }
@@ -848,7 +856,12 @@ impl State {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    if self.minimize_window_with_animation(&window, None) {
+                    let result = self.execute_lifecycle_command(LifecycleCommand::minimize(
+                        window,
+                        LifecycleAnchorInput::CachedForCurrentOutput,
+                        LifecycleInvocationSource::Ipc,
+                    ));
+                    if result.changed() {
                         self.niri.layer_shell_on_demand_focus = None;
                         self.niri.queue_redraw_all();
                     }
@@ -858,7 +871,12 @@ impl State {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    if self.restore_window_with_animation(&window, None) {
+                    let result = self.execute_lifecycle_command(LifecycleCommand::restore(
+                        window,
+                        LifecycleAnchorInput::CachedForCurrentOutput,
+                        LifecycleInvocationSource::Ipc,
+                    ));
+                    if result.changed() {
                         self.niri.layer_shell_on_demand_focus = None;
                         self.niri.queue_redraw_all();
                     }

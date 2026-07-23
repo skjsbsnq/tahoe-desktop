@@ -3742,19 +3742,141 @@ impl<W: LayoutElement> Layout<W> {
         });
     }
 
-    pub fn set_minimized(&mut self, id: &W::Id, minimized: bool) -> bool {
-        self.set_minimized_with_rect(id, minimized, None)
-    }
-
-    pub fn set_minimized_with_rect(
+    /// Model-only lifecycle transition (no snapshot capture). used when the primary renderer is
+    /// unavailable, and by layout unit tests that do not exercise Genie textures.
+    ///
+    /// Production minimize/restore **must** go through
+    /// [`crate::niri::State::execute_lifecycle_command`], which calls this as the renderer-less
+    /// fallback after the same anchor resolution policy.
+    ///
+    /// - Minimize ends an interactive move of the same window.
+    /// - Restore rejects while that window is interactively moving (no-op).
+    /// - Restore activates the window's monitor/workspace (same as the snapshot path).
+    pub fn apply_lifecycle(
         &mut self,
         id: &W::Id,
         minimized: bool,
         animation_rect: Option<MinimizeRect>,
     ) -> bool {
-        self.finish_interactive_move_if_window(id);
+        if !self.prepare_lifecycle(id, minimized, animation_rect.as_ref()) {
+            return false;
+        }
 
-        if let Some(rect) = &animation_rect {
+        if !minimized {
+            self.activate_workspace_for_window(id);
+        }
+
+        for ws in self.workspaces_mut() {
+            if ws.has_window(id) {
+                return ws.set_minimized(id, minimized, animation_rect.as_ref());
+            }
+        }
+
+        false
+    }
+
+    /// Snapshot-backed lifecycle transition. Only called from the compositor lifecycle command
+    /// after anchor resolution and xray preparation.
+    pub(crate) fn apply_lifecycle_with_snapshot(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        xray: Option<&mut Xray>,
+        xray_has_blocked_out_layers: bool,
+        id: &W::Id,
+        minimized: bool,
+        animation_rect: Option<MinimizeRect>,
+    ) -> bool {
+        if !self.prepare_lifecycle(id, minimized, animation_rect.as_ref()) {
+            return false;
+        }
+
+        if !minimized {
+            self.activate_workspace_for_window(id);
+        }
+
+        let zoom = self.overview_zoom();
+
+        match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => {
+                for mon in monitors {
+                    for (ws, geo) in mon.workspaces_with_render_geo_mut(false) {
+                        if !ws.has_window(id) {
+                            continue;
+                        }
+                        let xray_pos = XrayPos::new(geo.loc, zoom);
+                        return if minimized {
+                            ws.minimize_with_snapshot(
+                                renderer,
+                                xray,
+                                xray_has_blocked_out_layers,
+                                xray_pos,
+                                id,
+                                animation_rect.as_ref(),
+                            )
+                        } else {
+                            ws.restore_with_snapshot(
+                                renderer,
+                                xray,
+                                xray_has_blocked_out_layers,
+                                xray_pos,
+                                id,
+                                animation_rect.as_ref(),
+                            )
+                        };
+                    }
+                }
+            }
+            MonitorSet::NoOutputs { workspaces, .. } => {
+                for ws in workspaces {
+                    if !ws.has_window(id) {
+                        continue;
+                    }
+                    let xray_pos = XrayPos::default();
+                    return if minimized {
+                        ws.minimize_with_snapshot(
+                            renderer,
+                            xray,
+                            xray_has_blocked_out_layers,
+                            xray_pos,
+                            id,
+                            animation_rect.as_ref(),
+                        )
+                    } else {
+                        ws.restore_with_snapshot(
+                            renderer,
+                            xray,
+                            xray_has_blocked_out_layers,
+                            xray_pos,
+                            id,
+                            animation_rect.as_ref(),
+                        )
+                    };
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Shared preconditions for model-only and snapshot lifecycle paths.
+    ///
+    /// Returns `false` when the transition is an intentional no-op (restore while
+    /// interactively moving). Logs the resolved anchor for diagnostics.
+    fn prepare_lifecycle(
+        &mut self,
+        id: &W::Id,
+        minimized: bool,
+        animation_rect: Option<&MinimizeRect>,
+    ) -> bool {
+        if minimized {
+            self.finish_interactive_move_if_window(id);
+        } else if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == id {
+                return false;
+            }
+        }
+
+        if let Some(rect) = animation_rect {
             trace!(
                 ?id,
                 minimized,
@@ -3767,153 +3889,30 @@ impl<W: LayoutElement> Layout<W> {
             );
         }
 
-        for ws in self.workspaces_mut() {
-            if ws.has_window(id) {
-                return ws.set_minimized(id, minimized, animation_rect.as_ref());
-            }
-        }
-
-        false
+        true
     }
 
-    pub fn minimize_window_with_snapshot(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        xray: Option<&mut Xray>,
-        xray_has_blocked_out_layers: bool,
-        id: &W::Id,
-        target_rect: Option<MinimizeRect>,
-    ) -> bool {
-        self.finish_interactive_move_if_window(id);
+    /// Activate the monitor and workspace that currently hold `id` (restore focus semantics).
+    fn activate_workspace_for_window(&mut self, id: &W::Id) {
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            return;
+        };
 
-        if let Some(rect) = &target_rect {
-            trace!(
-                ?id,
-                minimized = true,
-                output = rect.output.name(),
-                x = rect.rect.loc().x,
-                y = rect.rect.loc().y,
-                width = rect.rect.size().w,
-                height = rect.rect.size().h,
-                "using minimize/restore rectangle (output-local)"
-            );
+        for monitor_idx in 0..monitors.len() {
+            let mon = &mut monitors[monitor_idx];
+            let Some(workspace_idx) = mon.workspaces.iter().position(|ws| ws.has_window(id)) else {
+                continue;
+            };
+
+            *active_monitor_idx = monitor_idx;
+            mon.switch_workspace(workspace_idx);
+            return;
         }
-
-        let zoom = self.overview_zoom();
-
-        match &mut self.monitor_set {
-            MonitorSet::Normal { monitors, .. } => {
-                for mon in monitors {
-                    for (ws, geo) in mon.workspaces_with_render_geo_mut(false) {
-                        if ws.has_window(id) {
-                            return ws.minimize_with_snapshot(
-                                renderer,
-                                xray,
-                                xray_has_blocked_out_layers,
-                                XrayPos::new(geo.loc, zoom),
-                                id,
-                                target_rect.as_ref(),
-                            );
-                        }
-                    }
-                }
-            }
-            MonitorSet::NoOutputs { workspaces, .. } => {
-                for ws in workspaces {
-                    if ws.has_window(id) {
-                        return ws.minimize_with_snapshot(
-                            renderer,
-                            xray,
-                            xray_has_blocked_out_layers,
-                            XrayPos::default(),
-                            id,
-                            target_rect.as_ref(),
-                        );
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
-    pub fn restore_window_with_snapshot(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        xray: Option<&mut Xray>,
-        xray_has_blocked_out_layers: bool,
-        id: &W::Id,
-        source_rect: Option<MinimizeRect>,
-    ) -> bool {
-        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
-            if move_.tile.window().id() == id {
-                return false;
-            }
-        }
-
-        if let Some(rect) = &source_rect {
-            trace!(
-                ?id,
-                minimized = false,
-                output = rect.output.name(),
-                x = rect.rect.loc().x,
-                y = rect.rect.loc().y,
-                width = rect.rect.size().w,
-                height = rect.rect.size().h,
-                "using minimize/restore rectangle (output-local)"
-            );
-        }
-
-        let zoom = self.overview_zoom();
-
-        match &mut self.monitor_set {
-            MonitorSet::Normal {
-                monitors,
-                active_monitor_idx,
-                ..
-            } => {
-                for monitor_idx in 0..monitors.len() {
-                    let mon = &mut monitors[monitor_idx];
-                    let Some(workspace_idx) =
-                        mon.workspaces.iter().position(|ws| ws.has_window(id))
-                    else {
-                        continue;
-                    };
-
-                    *active_monitor_idx = monitor_idx;
-                    mon.switch_workspace(workspace_idx);
-
-                    for (ws, geo) in mon.workspaces_with_render_geo_mut(false) {
-                        if ws.has_window(id) {
-                            return ws.restore_with_snapshot(
-                                renderer,
-                                xray,
-                                xray_has_blocked_out_layers,
-                                XrayPos::new(geo.loc, zoom),
-                                id,
-                                source_rect.as_ref(),
-                            );
-                        }
-                    }
-                }
-            }
-            MonitorSet::NoOutputs { workspaces, .. } => {
-                for ws in workspaces {
-                    if ws.has_window(id) {
-                        return ws.restore_with_snapshot(
-                            renderer,
-                            xray,
-                            xray_has_blocked_out_layers,
-                            XrayPos::default(),
-                            id,
-                            source_rect.as_ref(),
-                        );
-                    }
-                }
-            }
-        }
-
-        false
     }
 
     fn finish_interactive_move_if_window(&mut self, id: &W::Id) {
@@ -3930,28 +3929,14 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Layout-test helper: model-only minimize without an animation rect.
     pub fn minimize_window(&mut self, id: &W::Id) -> bool {
-        self.minimize_window_with_target(id, None)
+        self.apply_lifecycle(id, true, None)
     }
 
-    pub fn minimize_window_with_target(
-        &mut self,
-        id: &W::Id,
-        target_rect: Option<MinimizeRect>,
-    ) -> bool {
-        self.set_minimized_with_rect(id, true, target_rect)
-    }
-
+    /// Layout-test helper: model-only restore without an animation rect.
     pub fn restore_window(&mut self, id: &W::Id) -> bool {
-        self.restore_window_with_source(id, None)
-    }
-
-    pub fn restore_window_with_source(
-        &mut self,
-        id: &W::Id,
-        source_rect: Option<MinimizeRect>,
-    ) -> bool {
-        self.set_minimized_with_rect(id, false, source_rect)
+        self.apply_lifecycle(id, false, None)
     }
 
     pub fn set_maximized(&mut self, id: &W::Id, maximize: bool) {

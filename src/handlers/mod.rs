@@ -75,7 +75,8 @@ use smithay::{
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::layout::coords::SurfaceLocalRect;
 use crate::layout::workspace::WorkspaceId;
-use crate::layout::{ActivateWindow, MinimizeRect};
+use crate::layout::ActivateWindow;
+use crate::lifecycle_command::{LifecycleAnchorInput, LifecycleCommand, LifecycleInvocationSource};
 use crate::niri::{DndIcon, NewClient, State};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceHandler, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{
@@ -619,11 +620,12 @@ impl ForeignToplevelHandler for State {
     fn set_minimized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            let target_rect = mapped.foreign_toplevel_rect().map(|rect| MinimizeRect {
-                output: rect.output.clone(),
-                rect: rect.rect,
-            });
-            if self.minimize_window_with_animation(&window, target_rect) {
+            let result = self.execute_lifecycle_command(LifecycleCommand::minimize(
+                window,
+                LifecycleAnchorInput::CachedForCurrentOutput,
+                LifecycleInvocationSource::ForeignToplevel,
+            ));
+            if result.changed() {
                 self.niri.layer_shell_on_demand_focus = None;
                 self.niri.queue_redraw_all();
             }
@@ -633,11 +635,12 @@ impl ForeignToplevelHandler for State {
     fn unset_minimized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            let source_rect = mapped.foreign_toplevel_rect().map(|rect| MinimizeRect {
-                output: rect.output.clone(),
-                rect: rect.rect,
-            });
-            if self.restore_window_with_animation(&window, source_rect) {
+            let result = self.execute_lifecycle_command(LifecycleCommand::restore(
+                window,
+                LifecycleAnchorInput::CachedForCurrentOutput,
+                LifecycleInvocationSource::ForeignToplevel,
+            ));
+            if result.changed() {
                 self.niri.layer_shell_on_demand_focus = None;
                 self.niri.queue_redraw_all();
             }

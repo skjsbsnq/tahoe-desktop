@@ -15,6 +15,7 @@ pub mod input;
 pub mod ipc;
 pub mod layer;
 pub mod layout;
+pub mod lifecycle_command;
 pub mod niri;
 pub mod protocols;
 pub mod render_helpers;

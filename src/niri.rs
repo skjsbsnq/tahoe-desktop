@@ -146,6 +146,9 @@ use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MinimizeRect,
     MonitorRenderElement, SnapPreviewRenderElement,
 };
+use crate::lifecycle_command::{
+    LifecycleAnchorInput, LifecycleCommand, LifecycleCommandResult, LifecycleDirection,
+};
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
@@ -2162,148 +2165,137 @@ impl State {
         });
     }
 
-    pub fn minimize_window_with_animation(
+    /// Single compositor-internal minimize/restore strategy owner.
+    ///
+    /// Protocol adapters only parse the request into a [`LifecycleCommand`]. This method owns:
+    /// window/output lookup, cached-or-explicit anchor resolution (current-output filter),
+    /// snapshot attempt, renderer-unavailable fallback, and the unified change result.
+    pub fn execute_lifecycle_command(
         &mut self,
-        window: &Window,
-        target_rect: Option<MinimizeRect>,
-    ) -> bool {
-        let mut output = None;
+        command: LifecycleCommand,
+    ) -> LifecycleCommandResult {
+        let mut window_output: Option<Output> = None;
+        let mut cached_anchor: Option<MinimizeRect> = None;
+        let mut found = false;
+
         self.niri
             .layout
             .with_windows(|mapped, mapped_output, _, _| {
-                if &mapped.window == window {
-                    output = mapped_output.cloned();
+                if mapped.window != command.window {
+                    return;
+                }
+                found = true;
+                window_output = mapped_output.cloned();
+                if let Some(rect) = mapped.foreign_toplevel_rect() {
+                    cached_anchor = Some(MinimizeRect {
+                        output: rect.output.clone(),
+                        rect: rect.rect,
+                    });
                 }
             });
 
-        // The minimizing tile may have an xray background, in which case we will render xray
-        // elements, so they need to be updated.
-        self.niri.update_xray_render_elements(output.as_ref());
+        if !found {
+            return LifecycleCommandResult::no_op();
+        }
 
-        let target_rect_for_snapshot = target_rect.clone();
-        let changed = self.backend.with_primary_renderer(|renderer| {
-            if let Some(output) = &output {
-                let mut ctx = RenderCtx {
-                    target: RenderTarget::Output,
-                    renderer,
-                    xray: None,
-                };
-
-                self.niri.fill_xray_elements(ctx.r(), output);
-
-                // If any background layer has block_out_from, also fill the Screencast xray
-                // buffer so the minimize snapshot can render a buffer with blocked-out background.
-                let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
-                if has_blocked_out {
-                    let screencast_ctx = RenderCtx {
-                        target: RenderTarget::Screencast,
-                        ..ctx.r()
-                    };
-                    self.niri.fill_xray_elements(screencast_ctx, output);
+        let animation_rect = match command.anchor {
+            LifecycleAnchorInput::Explicit(rect) => Some(rect),
+            LifecycleAnchorInput::CachedForCurrentOutput => {
+                match (cached_anchor, window_output.as_ref()) {
+                    (Some(rect), Some(output)) if &rect.output == output => Some(rect),
+                    (Some(rect), _) => {
+                        debug!(
+                            source = ?command.source,
+                            cached_output = %rect.output.name(),
+                            window_output = %window_output
+                                .as_ref()
+                                .map(|o| o.name())
+                                .unwrap_or_else(|| String::from("<none>")),
+                            "lifecycle command: cached anchor wrong-output or missing window \
+                             output; degrading to no-anchor"
+                        );
+                        None
+                    }
+                    (None, _) => None,
                 }
-
-                let state = self.niri.output_state.get_mut(output).unwrap();
-                self.niri.layout.minimize_window_with_snapshot(
-                    renderer,
-                    Some(&mut state.xray),
-                    has_blocked_out,
-                    window,
-                    target_rect_for_snapshot,
-                )
-            } else {
-                self.niri.layout.minimize_window_with_snapshot(
-                    renderer,
-                    None,
-                    false,
-                    window,
-                    target_rect_for_snapshot,
-                )
             }
-        });
+            LifecycleAnchorInput::None => None,
+        };
 
-        let changed = changed.unwrap_or_else(|| {
-            self.niri
-                .layout
-                .minimize_window_with_target(window, target_rect)
-        });
+        // Invocation source is metadata only; strategy is identical for all adapters.
+        trace!(
+            ?command.direction,
+            ?command.source,
+            has_anchor = animation_rect.is_some(),
+            "execute lifecycle command"
+        );
 
-        if let Some(output) = &output {
-            self.niri.clear_xray_elements(output);
-        }
-
-        changed
-    }
-
-    pub fn restore_window_with_animation(
-        &mut self,
-        window: &Window,
-        source_rect: Option<MinimizeRect>,
-    ) -> bool {
-        if source_rect.is_none() {
-            return self.niri.layout.restore_window(window);
-        }
-
-        let mut output = None;
+        // The minimizing/restoring tile may have an xray background; refresh before snapshot.
         self.niri
-            .layout
-            .with_windows(|mapped, mapped_output, _, _| {
-                if &mapped.window == window {
-                    output = mapped_output.cloned();
+            .update_xray_render_elements(window_output.as_ref());
+
+        let minimized = matches!(command.direction, LifecycleDirection::Minimize);
+        let window = &command.window;
+
+        let changed = self
+            .backend
+            .with_primary_renderer(|renderer| {
+                if let Some(output) = &window_output {
+                    let mut ctx = RenderCtx {
+                        target: RenderTarget::Output,
+                        renderer,
+                        xray: None,
+                    };
+
+                    self.niri.fill_xray_elements(ctx.r(), output);
+
+                    // If any background layer has block_out_from, also fill the Screencast xray
+                    // buffer so the snapshot can render blocked-out backgrounds.
+                    let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
+                    if has_blocked_out {
+                        let screencast_ctx = RenderCtx {
+                            target: RenderTarget::Screencast,
+                            ..ctx.r()
+                        };
+                        self.niri.fill_xray_elements(screencast_ctx, output);
+                    }
+
+                    let state = self.niri.output_state.get_mut(output).unwrap();
+                    self.niri.layout.apply_lifecycle_with_snapshot(
+                        renderer,
+                        Some(&mut state.xray),
+                        has_blocked_out,
+                        window,
+                        minimized,
+                        animation_rect.clone(),
+                    )
+                } else {
+                    self.niri.layout.apply_lifecycle_with_snapshot(
+                        renderer,
+                        None,
+                        false,
+                        window,
+                        minimized,
+                        animation_rect.clone(),
+                    )
                 }
+            })
+            .unwrap_or_else(|| {
+                // Renderer unavailable is a normal fallback, not a separate API.
+                self.niri
+                    .layout
+                    .apply_lifecycle(window, minimized, animation_rect)
             });
 
-        self.niri.update_xray_render_elements(output.as_ref());
-
-        let source_rect_for_snapshot = source_rect.clone();
-        let changed = self.backend.with_primary_renderer(|renderer| {
-            if let Some(output) = &output {
-                let mut ctx = RenderCtx {
-                    target: RenderTarget::Output,
-                    renderer,
-                    xray: None,
-                };
-
-                self.niri.fill_xray_elements(ctx.r(), output);
-
-                let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
-                if has_blocked_out {
-                    let screencast_ctx = RenderCtx {
-                        target: RenderTarget::Screencast,
-                        ..ctx.r()
-                    };
-                    self.niri.fill_xray_elements(screencast_ctx, output);
-                }
-
-                let state = self.niri.output_state.get_mut(output).unwrap();
-                self.niri.layout.restore_window_with_snapshot(
-                    renderer,
-                    Some(&mut state.xray),
-                    has_blocked_out,
-                    window,
-                    source_rect_for_snapshot,
-                )
-            } else {
-                self.niri.layout.restore_window_with_snapshot(
-                    renderer,
-                    None,
-                    false,
-                    window,
-                    source_rect_for_snapshot,
-                )
-            }
-        });
-
-        let changed = changed.unwrap_or_else(|| {
-            self.niri
-                .layout
-                .restore_window_with_source(window, source_rect)
-        });
-
-        if let Some(output) = &output {
+        if let Some(output) = &window_output {
             self.niri.clear_xray_elements(output);
         }
 
-        changed
+        if changed {
+            LifecycleCommandResult::applied()
+        } else {
+            LifecycleCommandResult::no_op()
+        }
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]

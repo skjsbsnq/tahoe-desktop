@@ -18,10 +18,31 @@ use crate::layout::scrolling::{
     LifecycleOverlayAction, LifecycleOverlayKind, MaximizeTransitionObservation,
     ScrollingRenderObservation,
 };
+use crate::lifecycle_command::{LifecycleAnchorInput, LifecycleCommand, LifecycleInvocationSource};
 use crate::niri::Niri;
 use crate::utils::lifecycle_diag;
 use crate::utils::transaction::TransactionBlocker;
 use crate::window::Mapped;
+
+fn lifecycle_minimize(f: &mut Fixture, window: Window) -> bool {
+    f.niri_state()
+        .execute_lifecycle_command(LifecycleCommand::minimize(
+            window,
+            LifecycleAnchorInput::None,
+            LifecycleInvocationSource::Test,
+        ))
+        .changed()
+}
+
+fn lifecycle_restore(f: &mut Fixture, window: Window) -> bool {
+    f.niri_state()
+        .execute_lifecycle_command(LifecycleCommand::restore(
+            window,
+            LifecycleAnchorInput::None,
+            LifecycleInvocationSource::Test,
+        ))
+        .changed()
+}
 
 fn set_time(niri: &mut Niri, time: Duration) {
     let now = niri.clock.now();
@@ -410,9 +431,7 @@ fn maximize_ongoing_plus_active_minimize_overlay_is_drawn() {
 
         // Minimize non-target with real Genie snapshot (renderer present).
         let window2 = mapped_at(f.niri(), 1).window.clone();
-        let changed = f
-            .niri_state()
-            .minimize_window_with_animation(&window2, None);
+        let changed = lifecycle_minimize(&mut f, window2);
         assert!(changed, "minimize of non-target must succeed");
 
         let obs = observe_scrolling(f.niri());
@@ -470,9 +489,7 @@ fn maximize_pending_draws_minimize_restore_reverse_and_close() {
 
     // --- pending stage: minimize non-target ---
     let window2 = mapped_at(f.niri(), 1).window.clone();
-    assert!(f
-        .niri_state()
-        .minimize_window_with_animation(&window2, None));
+    assert!(lifecycle_minimize(&mut f, window2.clone()));
     let obs = observe_scrolling(f.niri());
     assert_eq!(
         obs.maximize_transition,
@@ -496,7 +513,7 @@ fn maximize_pending_draws_minimize_restore_reverse_and_close() {
         .expect("minimize mid-flight");
     assert!(minimize.progress.unwrap() > 0.0);
 
-    assert!(f.niri_state().restore_window_with_animation(&window2, None));
+    assert!(lifecycle_restore(&mut f, window2));
     let obs = observe_scrolling(f.niri());
     assert_no_invisible_progress(&obs);
     let restore = obs
@@ -612,9 +629,7 @@ fn maximize_committed_still_draws_lifecycle_overlays() {
     assert_no_invisible_progress(&obs);
 
     let window2 = mapped_at(f.niri(), 1).window.clone();
-    assert!(f
-        .niri_state()
-        .minimize_window_with_animation(&window2, None));
+    assert!(lifecycle_minimize(&mut f, window2));
     let obs = observe_scrolling(f.niri());
     assert_eq!(
         obs.maximize_transition,
@@ -673,9 +688,7 @@ fn maximize_hides_floating_live_but_draws_floating_lifecycle_policy() {
     }
 
     // Floating minimize while maximize exclusive: policy still Draw for floating overlays.
-    assert!(f
-        .niri_state()
-        .minimize_window_with_animation(&window_float, None));
+    assert!(lifecycle_minimize(&mut f, window_float));
     {
         let ws = f.niri().layout.active_workspace().unwrap();
         let policy = ws.scrolling().render_policy();

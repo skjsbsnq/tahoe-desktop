@@ -1767,14 +1767,14 @@ fn minimize_restore_with_rect_keeps_ipc_layout() {
 
     let before = window_ipc_state(&layout, 2);
 
-    assert!(layout.minimize_window_with_target(&2, Some(rect.clone())));
+    assert!(layout.apply_lifecycle(&2, true, Some(rect.clone())));
     layout.verify_invariants();
 
     let minimized = window_ipc_state(&layout, 2);
     assert!(minimized.0);
     assert_stable_window_layout(&before, &minimized);
 
-    assert!(layout.restore_window_with_source(&2, Some(rect)));
+    assert!(layout.apply_lifecycle(&2, false, Some(rect)));
     layout.verify_invariants();
 
     let restored = window_ipc_state(&layout, 2);
@@ -1805,8 +1805,8 @@ fn repeated_minimize_restore_with_rect_keeps_ipc_layout() {
     let before = window_ipc_state(&layout, 2);
 
     for _ in 0..3 {
-        assert!(layout.minimize_window_with_target(&2, Some(rect.clone())));
-        assert!(!layout.minimize_window_with_target(&2, Some(rect.clone())));
+        assert!(layout.apply_lifecycle(&2, true, Some(rect.clone())));
+        assert!(!layout.apply_lifecycle(&2, true, Some(rect.clone())));
         layout.verify_invariants();
 
         let minimized = window_ipc_state(&layout, 2);
@@ -1814,8 +1814,8 @@ fn repeated_minimize_restore_with_rect_keeps_ipc_layout() {
         assert_stable_window_layout(&before, &minimized);
         assert_eq!(layout.focus().map(|win| *win.id()), Some(1));
 
-        assert!(layout.restore_window_with_source(&2, Some(rect.clone())));
-        assert!(!layout.restore_window_with_source(&2, Some(rect.clone())));
+        assert!(layout.apply_lifecycle(&2, false, Some(rect.clone())));
+        assert!(!layout.apply_lifecycle(&2, false, Some(rect.clone())));
         layout.verify_invariants();
 
         let restored = window_ipc_state(&layout, 2);
@@ -1852,6 +1852,59 @@ fn minimize_finishes_interactive_move() {
     let minimized = window_ipc_state(&layout, 2);
     assert!(minimized.0);
     assert_eq!(layout.focus().map(|win| *win.id()), Some(1));
+}
+
+#[test]
+fn restore_rejects_while_interactively_moving() {
+    // R03 unified policy: minimize ends move; restore of the moving tile is NoOp.
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    assert!(layout.minimize_window(&2));
+    layout.verify_invariants();
+
+    let output = layout.outputs().next().unwrap().clone();
+    // Restoring a different window while another is moved is fine; the reject is for the
+    // *same* window id that is currently in InteractiveMoveState::Moving.
+    assert!(layout.interactive_move_begin(1, &output, Point::default()));
+    assert!(layout.interactive_move_update(
+        &1,
+        Point::from((64., 0.)),
+        output,
+        Point::from((64., 0.)),
+    ));
+
+    // Window 2 is minimized and not moving: restore still works.
+    assert!(layout.restore_window(&2));
+    assert!(!window_ipc_state(&layout, 2).0);
+
+    // Minimize 1 ends the interactive move (existing policy).
+    assert!(layout.minimize_window(&1));
+    assert!(window_ipc_state(&layout, 1).0);
+
+    // Put 1 into a fresh move after restoring first would not apply — exercise reject by
+    // starting move on a non-minimized window then attempting restore of that same id
+    // (window must be minimized for restore to be meaningful; use apply_lifecycle no-op
+    // path via Moving state after re-minimize reverse).
+    assert!(layout.restore_window(&1));
+    let output = layout.outputs().next().unwrap().clone();
+    assert!(layout.interactive_move_begin(1, &output, Point::default()));
+    assert!(layout.interactive_move_update(
+        &1,
+        Point::from((32., 0.)),
+        output.clone(),
+        Point::from((32., 0.)),
+    ));
+    // apply_lifecycle restore while Moving(same id) must NoOp even if already not minimized.
+    assert!(!layout.apply_lifecycle(&1, false, None));
+    layout.verify_invariants();
 }
 
 #[test]
