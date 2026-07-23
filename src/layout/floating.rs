@@ -9,6 +9,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
+use super::coords::GenieEndpointResolve;
 use super::scrolling::ColumnWidth;
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
@@ -880,7 +881,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             id.clone(),
             snapshot,
             tile_pos,
-            animation_rect.map(|rect| rect.rect.to_f64()),
+            animation_rect.map(|rect| rect.rect),
         );
 
         true
@@ -948,7 +949,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             id.clone(),
             snapshot,
             tile_pos,
-            animation_rect.map(|rect| rect.rect.to_f64()),
+            animation_rect.map(|rect| rect.rect),
         );
 
         true
@@ -1012,7 +1013,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         id: W::Id,
         snapshot: TileRenderSnapshot,
         tile_pos: Point<f64, Logical>,
-        target_rect: Option<Rectangle<f64, Logical>>,
+        target_rect: Option<super::coords::OutputLocalRect>,
     ) {
         let anim = Animation::new(
             self.clock.clone(),
@@ -1022,15 +1023,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
             self.options.animations.window_minimize_anim(),
         );
 
+        // Floating tile positions are workspace-view with origin at workspace top-left (= output-local
+        // for a full-size workspace).
+        let resolve = GenieEndpointResolve::identity();
+        let pos = resolve.window_from_view_pos(tile_pos);
+        let target = target_rect.map(|r| resolve.anchor_from_output_local(r));
+
         let scale = Scale::from(self.scale);
-        let res = MinimizeWindowAnimation::new_with_target(
-            renderer,
-            snapshot,
-            scale,
-            tile_pos,
-            anim,
-            target_rect,
-        );
+        let res =
+            MinimizeWindowAnimation::new_with_target(renderer, snapshot, scale, pos, anim, target);
         match res {
             Ok(minimize) => {
                 self.minimize_animations.push((id, minimize));
@@ -1047,7 +1048,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         id: W::Id,
         snapshot: TileRenderSnapshot,
         tile_pos: Point<f64, Logical>,
-        source_rect: Option<Rectangle<f64, Logical>>,
+        source_rect: Option<super::coords::OutputLocalRect>,
     ) {
         let anim = Animation::new(
             self.clock.clone(),
@@ -1057,15 +1058,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
             self.options.animations.window_restore_anim(),
         );
 
+        let resolve = GenieEndpointResolve::identity();
+        let pos = resolve.window_from_view_pos(tile_pos);
+        let source = source_rect.map(|r| resolve.anchor_from_output_local(r));
+
         let scale = Scale::from(self.scale);
-        let res = MinimizeWindowAnimation::new_with_source(
-            renderer,
-            snapshot,
-            scale,
-            tile_pos,
-            anim,
-            source_rect,
-        );
+        let res =
+            MinimizeWindowAnimation::new_with_source(renderer, snapshot, scale, pos, anim, source);
         match res {
             Ok(restore) => {
                 self.restore_animations.push((id, restore));

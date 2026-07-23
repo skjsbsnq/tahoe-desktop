@@ -73,6 +73,7 @@ use smithay::{
 };
 
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
+use crate::layout::coords::SurfaceLocalRect;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, MinimizeRect};
 use crate::niri::{DndIcon, NewClient, State};
@@ -670,7 +671,7 @@ impl ForeignToplevelHandler for State {
         }
 
         let source_root = self.niri.find_root_shell_surface(&source_surface);
-        let rect = Rectangle::new(Point::from((x, y)), Size::from((width, height)));
+        let surface_local = SurfaceLocalRect::new(Point::from((x, y)), Size::from((width, height)));
 
         let target = self.niri.layout.outputs().find_map(|output| {
             let layers = layer_map_for_output(output);
@@ -681,7 +682,7 @@ impl ForeignToplevelHandler for State {
             }
 
             let layer_geo = layers.layer_geometry(layer)?;
-            let rect = Rectangle::new(layer_geo.loc + rect.loc, rect.size);
+            let rect = surface_local.to_output_local(layer_geo);
 
             Some((output.clone(), rect))
         });
@@ -713,11 +714,11 @@ impl ForeignToplevelHandler for State {
             source = %source_surface.id(),
             source_root = %source_root.id(),
             output = output.name(),
-            x = rect.loc.x,
-            y = rect.loc.y,
-            width = rect.size.w,
-            height = rect.size.h,
-            "stored foreign-toplevel rectangle"
+            x = rect.loc().x,
+            y = rect.loc().y,
+            width = rect.size().w,
+            height = rect.size().h,
+            "stored foreign-toplevel rectangle (output-local)"
         );
     }
 }

@@ -83,6 +83,7 @@ use crate::utils::{
 use crate::window::ResolvedWindowRules;
 
 pub mod closing_window;
+pub mod coords;
 pub mod floating;
 pub mod focus_ring;
 pub mod insert_hint_element;
@@ -142,11 +143,12 @@ pub type LayoutElementRenderSnapshot =
 /// Rectangle supplied by a dock/taskbar for minimize or restore animations.
 ///
 /// This is intentionally independent from the foreign-toplevel protocol state: layout only needs
-/// the destination output and logical rectangle for animation decisions.
+/// the destination output and **output-local** logical rectangle for animation decisions.
+/// The rectangle field encodes its space in the type; bare `Rectangle<_, Logical>` is not accepted.
 #[derive(Debug, Clone)]
 pub struct MinimizeRect {
     pub output: Output,
-    pub rect: Rectangle<i32, Logical>,
+    pub rect: coords::OutputLocalRect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3757,11 +3759,11 @@ impl<W: LayoutElement> Layout<W> {
                 ?id,
                 minimized,
                 output = rect.output.name(),
-                x = rect.rect.loc.x,
-                y = rect.rect.loc.y,
-                width = rect.rect.size.w,
-                height = rect.rect.size.h,
-                "using minimize/restore rectangle"
+                x = rect.rect.loc().x,
+                y = rect.rect.loc().y,
+                width = rect.rect.size().w,
+                height = rect.rect.size().h,
+                "using minimize/restore rectangle (output-local)"
             );
         }
 
@@ -3789,11 +3791,11 @@ impl<W: LayoutElement> Layout<W> {
                 ?id,
                 minimized = true,
                 output = rect.output.name(),
-                x = rect.rect.loc.x,
-                y = rect.rect.loc.y,
-                width = rect.rect.size.w,
-                height = rect.rect.size.h,
-                "using minimize/restore rectangle"
+                x = rect.rect.loc().x,
+                y = rect.rect.loc().y,
+                width = rect.rect.size().w,
+                height = rect.rect.size().h,
+                "using minimize/restore rectangle (output-local)"
             );
         }
 
@@ -3854,11 +3856,11 @@ impl<W: LayoutElement> Layout<W> {
                 ?id,
                 minimized = false,
                 output = rect.output.name(),
-                x = rect.rect.loc.x,
-                y = rect.rect.loc.y,
-                width = rect.rect.size.w,
-                height = rect.rect.size.h,
-                "using minimize/restore rectangle"
+                x = rect.rect.loc().x,
+                y = rect.rect.loc().y,
+                width = rect.rect.size().w,
+                height = rect.rect.size().h,
+                "using minimize/restore rectangle (output-local)"
             );
         }
 

@@ -11,6 +11,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
+use super::coords::GenieEndpointResolve;
 use super::minimize_window_animation::{
     MinimizeWindowAnimation, MinimizeWindowAnimationRenderElement,
 };
@@ -1717,7 +1718,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 restore.reverse_to_minimize(
                     self.options.animations.window_minimize_anim(),
                     _animation_rect.map(|rect| rect.rect.to_f64()),
-                );
+                ); // OutputLocalRect → OutputLocalRectF
                 self.minimize_animations
                     .retain(|(minimize_id, _)| minimize_id != window);
                 self.minimize_animations.push((window.clone(), restore));
@@ -1809,15 +1810,16 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         let view_size = self.view_size;
-        let view_pos = self.view_pos();
-        let (snapshot, mut tile_pos) = {
+        // Tile render positions are workspace-view (already include -view_pos). Keep them there and
+        // resolve to output-local; never lift them into workspace-content via `+= view_pos`.
+        let (snapshot, tile_view_pos) = {
             let (tile, tile_pos) = self
                 .tiles_with_render_positions_mut(false)
                 .find(|(tile, _)| tile.window().id() == window)
                 .unwrap();
 
-            let tile_view_pos = Point::from((-tile_pos.x, -tile_pos.y));
-            let view_rect = Rectangle::new(tile_view_pos, view_size);
+            let tile_view_for_update = Point::from((-tile_pos.x, -tile_pos.y));
+            let view_rect = Rectangle::new(tile_view_for_update, view_size);
             tile.update_render_elements(false, view_rect);
 
             let xray_pos = xray_pos.offset(tile_pos);
@@ -1831,8 +1833,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             (snapshot, tile_pos)
         };
 
-        tile_pos.x += view_pos;
-
         if !self.set_minimized(window, true, animation_rect) {
             return false;
         }
@@ -1841,8 +1841,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             renderer,
             window.clone(),
             snapshot,
-            tile_pos,
-            animation_rect.map(|rect| rect.rect.to_f64()),
+            tile_view_pos,
+            animation_rect.map(|rect| rect.rect),
         );
 
         true
@@ -1885,15 +1885,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         let view_size = self.view_size;
-        let view_pos = self.view_pos();
-        let (snapshot, mut tile_pos) = {
+        let (snapshot, tile_view_pos) = {
             let (tile, tile_pos) = self
                 .tiles_with_render_positions_mut(false)
                 .find(|(tile, _)| tile.window().id() == window)
                 .unwrap();
 
-            let tile_view_pos = Point::from((-tile_pos.x, -tile_pos.y));
-            let view_rect = Rectangle::new(tile_view_pos, view_size);
+            let tile_view_for_update = Point::from((-tile_pos.x, -tile_pos.y));
+            let view_rect = Rectangle::new(tile_view_for_update, view_size);
             tile.update_render_elements(false, view_rect);
 
             let xray_pos = xray_pos.offset(tile_pos);
@@ -1908,14 +1907,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             (snapshot, tile_pos)
         };
 
-        tile_pos.x += view_pos;
-
         self.start_restore_animation_for_tile(
             renderer,
             window.clone(),
             snapshot,
-            tile_pos,
-            animation_rect.map(|rect| rect.rect.to_f64()),
+            tile_view_pos,
+            animation_rect.map(|rect| rect.rect),
         );
 
         true
@@ -2030,8 +2027,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         renderer: &mut GlesRenderer,
         id: W::Id,
         snapshot: TileRenderSnapshot,
-        tile_pos: Point<f64, Logical>,
-        target_rect: Option<Rectangle<f64, Logical>>,
+        tile_view_pos: Point<f64, Logical>,
+        target_rect: Option<super::coords::OutputLocalRect>,
     ) {
         let anim = Animation::new(
             self.clock.clone(),
@@ -2041,15 +2038,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             self.options.animations.window_minimize_anim(),
         );
 
+        // Full-size active workspace origin on output is (0, 0): view pos → output-local identity.
+        let resolve = GenieEndpointResolve::identity();
+        let pos = resolve.window_from_view_pos(tile_view_pos);
+        let target = target_rect.map(|r| resolve.anchor_from_output_local(r));
+
         let scale = Scale::from(self.scale);
-        let res = MinimizeWindowAnimation::new_with_target(
-            renderer,
-            snapshot,
-            scale,
-            tile_pos,
-            anim,
-            target_rect,
-        );
+        let res =
+            MinimizeWindowAnimation::new_with_target(renderer, snapshot, scale, pos, anim, target);
         match res {
             Ok(minimize) => {
                 self.minimize_animations.push((id, minimize));
@@ -2065,8 +2061,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         renderer: &mut GlesRenderer,
         id: W::Id,
         snapshot: TileRenderSnapshot,
-        tile_pos: Point<f64, Logical>,
-        source_rect: Option<Rectangle<f64, Logical>>,
+        tile_view_pos: Point<f64, Logical>,
+        source_rect: Option<super::coords::OutputLocalRect>,
     ) {
         let anim = Animation::new(
             self.clock.clone(),
@@ -2076,15 +2072,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             self.options.animations.window_restore_anim(),
         );
 
+        let resolve = GenieEndpointResolve::identity();
+        let pos = resolve.window_from_view_pos(tile_view_pos);
+        let source = source_rect.map(|r| resolve.anchor_from_output_local(r));
+
         let scale = Scale::from(self.scale);
-        let res = MinimizeWindowAnimation::new_with_source(
-            renderer,
-            snapshot,
-            scale,
-            tile_pos,
-            anim,
-            source_rect,
-        );
+        let res =
+            MinimizeWindowAnimation::new_with_source(renderer, snapshot, scale, pos, anim, source);
         match res {
             Ok(restore) => {
                 self.restore_animations.push((id, restore));
@@ -3672,24 +3666,27 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
-        let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
+        // Closing still stores workspace-content positions and subtracts current view_pos.
+        let content_view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
+        // Genie endpoints are output-local; viewport origin is zero (single output-local→render step).
+        let output_local_view_rect = Rectangle::from_size(self.view_size);
         let policy = self.render_policy();
         // Lifecycle overlays are drawn under an explicit policy action, not gated by the same
         // maximize_exclusive flag that filters ordinary live tiles.
         if policy.scrolling_lifecycle_overlays_are_rendered() {
             // Draw the closing windows on top of the other windows.
             for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.as_gles(), view_rect, scale);
+                let elem = closing.render(ctx.as_gles(), content_view_rect, scale);
                 push(elem.into());
             }
 
             for (_, minimize) in self.minimize_animations.iter().rev() {
-                let elem = minimize.render(ctx.as_gles(), view_rect, scale);
+                let elem = minimize.render(ctx.as_gles(), output_local_view_rect, scale);
                 push(elem.into());
             }
 
             for (_, restore) in self.restore_animations.iter().rev() {
-                let elem = restore.render(ctx.as_gles(), view_rect, scale);
+                let elem = restore.render(ctx.as_gles(), output_local_view_rect, scale);
                 push(elem.into());
             }
         }

@@ -14,6 +14,7 @@ use smithay::utils::Rectangle;
 use super::*;
 
 mod animations;
+mod coords;
 mod fullscreen;
 mod observe;
 
@@ -1758,7 +1759,10 @@ fn minimize_restore_with_rect_keeps_ipc_layout() {
     let output = layout.outputs().next().unwrap().clone();
     let rect = MinimizeRect {
         output,
-        rect: Rectangle::new(Point::from((24, 680)), Size::from((48, 48))),
+        rect: crate::layout::coords::OutputLocalRect::new(
+            Point::from((24, 680)),
+            Size::from((48, 48)),
+        ),
     };
 
     let before = window_ipc_state(&layout, 2);
@@ -1793,7 +1797,10 @@ fn repeated_minimize_restore_with_rect_keeps_ipc_layout() {
     let output = layout.outputs().next().unwrap().clone();
     let rect = MinimizeRect {
         output,
-        rect: Rectangle::new(Point::from((24, 680)), Size::from((48, 48))),
+        rect: crate::layout::coords::OutputLocalRect::new(
+            Point::from((24, 680)),
+            Size::from((48, 48)),
+        ),
     };
     let before = window_ipc_state(&layout, 2);
 

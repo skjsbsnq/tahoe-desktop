@@ -309,7 +309,7 @@ fn source_layer_map_unmap_remap_clears_and_restores_anchor() {
             .expect("anchor after set_rectangle");
         assert_eq!(rect.output, output2);
         assert_eq!(
-            rect.rect,
+            rect.rect.as_rect(),
             Rectangle::new(Point::from((10, 660)), Size::from((30, 40)))
         );
     }
@@ -334,7 +334,7 @@ fn source_layer_map_unmap_remap_clears_and_restores_anchor() {
             .expect("anchor restored after remap + set_rectangle");
         assert_eq!(rect.output, output2);
         assert_eq!(
-            rect.rect,
+            rect.rect.as_rect(),
             Rectangle::new(Point::from((10, 660)), Size::from((30, 40)))
         );
     }

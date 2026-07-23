@@ -58,7 +58,7 @@ fn foreign_toplevel_set_rectangle_tracks_layer_surface_rect() {
     let rect = mapped.foreign_toplevel_rect().unwrap();
     assert_eq!(rect.output, output);
     assert_eq!(
-        rect.rect,
+        rect.rect.as_rect(),
         Rectangle::new(Point::from((10, 660)), Size::from((30, 40)))
     );
     let stored_rect = rect.rect;

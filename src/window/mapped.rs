@@ -23,6 +23,7 @@ use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
 use crate::handlers::KdeDecorationsModeState;
+use crate::layout::coords::OutputLocalRect;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
     LayoutElementRenderSnapshot, SizingMode,
@@ -52,7 +53,8 @@ pub struct ForeignToplevelRect {
     pub source_surface: WlSurface,
     pub source_root_surface: WlSurface,
     pub output: Output,
-    pub rect: Rectangle<i32, Logical>,
+    /// Dock icon geometry in **output-local** logical coordinates (layer geo + surface-local).
+    pub rect: OutputLocalRect,
 }
 
 #[derive(Debug)]
