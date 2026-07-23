@@ -239,6 +239,7 @@ fn mark_pending_dirty(surface: &WlSurface) {
             });
 
             if changed {
+                crate::utils::lifecycle_diag::note_tahoe_region_commit();
                 if let Some(output) = state.niri.output_for_root(surface).cloned() {
                     state.niri.queue_redraw(&output);
                 } else {
@@ -597,6 +598,7 @@ where
                 interaction,
                 material_alpha,
             } => {
+                crate::utils::lifecycle_diag::note_tahoe_region_request();
                 let Some(region) = make_region(
                     id,
                     x,

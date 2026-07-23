@@ -13,9 +13,9 @@ use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
-use smithay::utils::Size;
+use smithay::utils::{Size, Transform};
 use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
@@ -59,6 +59,19 @@ impl Headless {
     }
 
     pub fn add_output(&mut self, niri: &mut Niri, n: u8, size: (u16, u16)) {
+        self.add_output_with_scale_transform(niri, n, size, 1., Transform::Normal);
+    }
+
+    /// Add an output whose scale and transform are already present when layout initializes.
+    /// Test fixtures use this to exercise the real output state path rather than post-hoc mocks.
+    pub fn add_output_with_scale_transform(
+        &mut self,
+        niri: &mut Niri,
+        n: u8,
+        size: (u16, u16),
+        scale: f64,
+        transform: Transform,
+    ) {
         let connector = format!("headless-{n}");
         let make = "niri".to_string();
         let model = "headless".to_string();
@@ -79,7 +92,12 @@ impl Headless {
             size: Size::from((i32::from(size.0), i32::from(size.1))),
             refresh: 60_000,
         };
-        output.change_current_state(Some(mode), None, None, None);
+        output.change_current_state(
+            Some(mode),
+            Some(transform),
+            Some(Scale::Fractional(scale)),
+            None,
+        );
         output.set_preferred(mode);
 
         output.user_data().insert_if_missing(|| OutputName {

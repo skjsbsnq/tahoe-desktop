@@ -3902,6 +3902,7 @@ impl Niri {
 
     /// Schedules an immediate redraw on all outputs if one is not already scheduled.
     pub fn queue_redraw_all(&mut self) {
+        crate::utils::lifecycle_diag::note_queue_redraw_all();
         for state in self.output_state.values_mut() {
             state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
         }
@@ -3909,6 +3910,7 @@ impl Niri {
 
     /// Schedules an immediate redraw if one is not already scheduled.
     pub fn queue_redraw(&mut self, output: &Output) {
+        crate::utils::lifecycle_diag::note_queue_redraw();
         let state = self.output_state.get_mut(output).unwrap();
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
     }

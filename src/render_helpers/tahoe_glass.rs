@@ -277,6 +277,7 @@ fn render_region(
     push: &mut dyn FnMut(TahoeGlassElement),
 ) {
     let _span = tracy_client::span!("TahoeGlass::render_region");
+    crate::utils::lifecycle_diag::note_tahoe_region_capture();
 
     let rect = region.rect.to_f64();
     let geometry = Rectangle::new(surface_location + rect.loc, rect.size);

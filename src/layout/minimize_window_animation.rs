@@ -219,6 +219,18 @@ impl MinimizeWindowAnimation {
             None
         };
 
+        // Opt-in only: default production path is a single atomic load and returns.
+        let variant_bytes = texture_variant_bytes(&buffer)
+            + buffer_with_blocked_out_bg
+                .as_ref()
+                .map(texture_variant_bytes)
+                .unwrap_or(0)
+            + blocked_out
+                .as_ref()
+                .map(|(buf, _)| texture_variant_bytes(buf))
+                .unwrap_or(0);
+        crate::utils::lifecycle_diag::note_genie_create(variant_bytes);
+
         Ok(Self {
             buffer,
             buffer_with_blocked_out_bg,
@@ -273,6 +285,13 @@ impl MinimizeWindowAnimation {
             GenieDirection::Minimize => progress,
             GenieDirection::Restore => 1. - progress,
         }
+    }
+
+    /// Exposes the production animation's normalized morph value to the in-tree regression
+    /// harness. This is compiled out of normal builds and creates no second animation clock.
+    #[cfg(test)]
+    pub(crate) fn test_morph_progress(&self) -> f64 {
+        self.morph_progress()
     }
 
     fn restart_progress(&mut self, from: f64, to: f64, config: niri_config::Animation) {
@@ -416,6 +435,14 @@ fn rect_uniform(rect: Rectangle<f64, Logical>) -> [f32; 4] {
         rect.size.w as f32,
         rect.size.h as f32,
     ]
+}
+
+fn texture_variant_bytes(buffer: &TextureBuffer<GlesTexture>) -> u64 {
+    let size = buffer.texture().size();
+    let w = u64::try_from(size.w.max(0)).unwrap_or(0);
+    let h = u64::try_from(size.h.max(0)).unwrap_or(0);
+    // Abgr8888 snapshots used by Genie creation.
+    w.saturating_mul(h).saturating_mul(4)
 }
 
 fn genie_area(

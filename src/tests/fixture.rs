@@ -7,8 +7,11 @@ use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
 use smithay::output::Output;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+use smithay::utils::Transform;
+use wayland_client::protocol::wl_surface::WlSurface;
 
-use super::client::{Client, ClientId};
+use super::client::{Client, ClientId, LayerConfigureProps};
 use super::server::Server;
 use crate::niri::{NewClient, Niri};
 
@@ -90,9 +93,95 @@ impl Fixture {
     }
 
     pub fn add_output(&mut self, n: u8, size: (u16, u16)) {
-        let state = self.niri_state();
-        let niri = &mut state.niri;
-        state.backend.headless().add_output(niri, n, size);
+        self.add_output_with_scale_transform(n, size, 1., Transform::Normal);
+    }
+
+    /// Add a headless output, then apply scale/transform through the real Output state path.
+    ///
+    /// `Niri::add_output` overwrites scale/transform from config or guessed scale, so fixtures that
+    /// need a specific scale/transform re-apply them and refresh layout size afterward.
+    pub fn add_output_with_scale_transform(
+        &mut self,
+        n: u8,
+        size: (u16, u16),
+        scale: f64,
+        transform: Transform,
+    ) {
+        {
+            let state = self.niri_state();
+            let niri = &mut state.niri;
+            state
+                .backend
+                .headless()
+                .add_output_with_scale_transform(niri, n, size, scale, transform);
+        }
+
+        let output = self.niri_output(n);
+        output.change_current_state(
+            None,
+            Some(transform),
+            Some(smithay::output::Scale::Fractional(scale)),
+            None,
+        );
+        self.niri().layout.update_output_size(&output);
+    }
+
+    /// Map a layer surface through the real layer-shell configure/ack/commit sequence.
+    pub fn map_layer(
+        &mut self,
+        id: ClientId,
+        output: Option<u8>,
+        layer_kind: Layer,
+        namespace: &str,
+        props: LayerConfigureProps,
+        buffer_size: (u16, u16),
+    ) -> WlSurface {
+        let output = output.map(|n| self.client(id).output(&format!("headless-{n}")));
+        let surface = {
+            let layer = self
+                .client(id)
+                .create_layer(output.as_ref(), layer_kind, namespace);
+            let surface = layer.surface.clone();
+            layer.set_configure_props(props);
+            layer.commit();
+            surface
+        };
+        self.roundtrip(id);
+
+        let layer = self.client(id).layer(&surface);
+        layer.attach_new_buffer();
+        layer.set_size(buffer_size.0, buffer_size.1);
+        layer.ack_last_and_commit();
+        self.double_roundtrip(id);
+        surface
+    }
+
+    /// Unmap a layer through a null-buffer commit, preserving the production lifecycle path.
+    pub fn unmap_layer(&mut self, id: ClientId, surface: &WlSurface) {
+        let layer = self.client(id).layer(surface);
+        layer.attach_null();
+        layer.commit();
+        self.double_roundtrip(id);
+    }
+
+    /// Remap a layer surface after [`Self::unmap_layer`] using its real configure/ack/commit path.
+    pub fn remap_layer(
+        &mut self,
+        id: ClientId,
+        surface: &WlSurface,
+        props: LayerConfigureProps,
+        buffer_size: (u16, u16),
+    ) {
+        let layer = self.client(id).layer(surface);
+        layer.set_configure_props(props);
+        layer.commit();
+        self.double_roundtrip(id);
+
+        let layer = self.client(id).layer(surface);
+        layer.attach_new_buffer();
+        layer.set_size(buffer_size.0, buffer_size.1);
+        layer.ack_last_and_commit();
+        self.double_roundtrip(id);
     }
 
     pub fn add_client(&mut self) -> ClientId {

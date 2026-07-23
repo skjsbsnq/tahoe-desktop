@@ -37,6 +37,7 @@ use crate::handlers::KdeDecorationsModeState;
 use crate::niri::ClientState;
 
 pub mod id;
+pub mod lifecycle_diag;
 pub mod region;
 pub mod scale;
 pub mod signals;

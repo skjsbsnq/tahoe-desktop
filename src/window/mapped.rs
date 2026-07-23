@@ -399,6 +399,22 @@ impl Mapped {
         self.is_minimized
     }
 
+    /// Test-only observation of the same configure serial queue consumed by [`Self::on_commit`].
+    ///
+    /// The fixture uses this to prove that old and latest ack/commit events exercise `Mapped`,
+    /// rather than relying on the layout test element's no-op `on_commit` implementation.
+    #[cfg(test)]
+    pub(crate) fn test_maximize_commit_state(&self) -> (bool, bool, Vec<Serial>) {
+        (
+            self.is_maximized,
+            self.is_pending_maximized,
+            self.uncommitted_maximized
+                .iter()
+                .map(|(serial, _)| *serial)
+                .collect(),
+        )
+    }
+
     pub fn foreign_toplevel_rect(&self) -> Option<&ForeignToplevelRect> {
         self.foreign_toplevel_rect.as_ref()
     }

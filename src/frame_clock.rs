@@ -157,6 +157,7 @@ impl TelemetryWindow {
             direct_scanout_percent,
             render_p95_ms: ns_to_ms(percentile(&self.render_times_ns, 95)),
             render_p99_ms: ns_to_ms(percentile(&self.render_times_ns, 99)),
+            frame_p50_ms: ns_to_ms(percentile(&self.frame_times_ns, 50)),
             frame_p95_ms: ns_to_ms(percentile(&self.frame_times_ns, 95)),
             frame_p99_ms: ns_to_ms(percentile(&self.frame_times_ns, 99)),
             damage_avg_pixels,
@@ -216,6 +217,7 @@ struct TelemetryReport {
     direct_scanout_percent: f64,
     render_p95_ms: f64,
     render_p99_ms: f64,
+    frame_p50_ms: f64,
     frame_p95_ms: f64,
     frame_p99_ms: f64,
     damage_avg_pixels: f64,
@@ -326,6 +328,7 @@ impl FrameTelemetry {
             presented_fps = report.presented_fps,
             render_p95_ms = report.render_p95_ms,
             render_p99_ms = report.render_p99_ms,
+            frame_time_p50_ms = report.frame_p50_ms,
             frame_time_p95_ms = report.frame_p95_ms,
             frame_time_p99_ms = report.frame_p99_ms,
             damage_avg_pixels = report.damage_avg_pixels,
@@ -552,6 +555,7 @@ mod tests {
         assert_eq!(report.source_screen_transition, 1);
         assert_eq!(report.source_closing_layer, 1);
         assert_eq!(report.render_p95_ms, 4.);
+        assert_eq!(report.frame_p50_ms, 5.);
         assert_eq!(report.frame_p95_ms, 5.);
         assert_eq!(report.damage_p95_pixels, 40);
         assert_eq!(report.damage_avg_percent, 25.);

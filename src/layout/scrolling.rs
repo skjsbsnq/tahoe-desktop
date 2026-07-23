@@ -309,6 +309,53 @@ struct MaximizeTransition<Id> {
     timed_out: bool,
 }
 
+/// Test-only view of the production lifecycle render decision.
+///
+/// This deliberately reports the same predicate that [`ScrollingSpace::render`] uses; it does
+/// not maintain a parallel test state machine. R01 will replace the coarse visibility predicate
+/// with an explicit render policy, while these observations remain the regression oracle for its
+/// per-frame decisions.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleOverlayKind {
+    Closing,
+    Minimize,
+    Restore,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct LifecycleOverlayObservation<Id> {
+    pub kind: LifecycleOverlayKind,
+    /// Closing snapshots no longer own a live layout element, so they have no window id here.
+    pub window: Option<Id>,
+    pub active: bool,
+    pub rendered: bool,
+    /// Genie morph progress when the overlay has one. Closing snapshots use their own animation
+    /// state and therefore report `None` rather than inventing a second progress model.
+    pub progress: Option<f64>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaximizeTransitionObservation {
+    Idle,
+    Pending,
+    Committed,
+    TimedOut,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollingRenderObservation<Id> {
+    pub maximize_transition: MaximizeTransitionObservation,
+    pub maximize_target: Option<Id>,
+    /// Production `render()` predicate: whether closing/minimize/restore overlays would be pushed.
+    /// Readable even when no lifecycle containers are currently active.
+    pub lifecycle_overlays_rendered: bool,
+    pub lifecycle_overlays: Vec<LifecycleOverlayObservation<Id>>,
+}
+
 impl<W: LayoutElement> ScrollingSpace<W> {
     pub fn new(
         view_size: Size<f64, Logical>,
@@ -3446,6 +3493,70 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.maximizing_window_location().is_some()
     }
 
+    /// The current production render decision for lifecycle snapshots.
+    ///
+    /// Keep this deliberately narrow in R00: it makes the existing decision observable without
+    /// changing it. In particular, an ongoing maximize transition still hides all lifecycle
+    /// overlays; R01 owns changing that behavior.
+    fn lifecycle_overlays_are_rendered(&self) -> bool {
+        !self.maximize_transition_is_ongoing()
+    }
+
+    #[cfg(test)]
+    pub fn render_observation(&self) -> ScrollingRenderObservation<W::Id> {
+        let rendered = self.lifecycle_overlays_are_rendered();
+        let maximize_transition = match self.maximize_transition.as_ref() {
+            None => MaximizeTransitionObservation::Idle,
+            Some(transition) if transition.timed_out => MaximizeTransitionObservation::TimedOut,
+            Some(transition) if transition.committed => MaximizeTransitionObservation::Committed,
+            Some(_) => MaximizeTransitionObservation::Pending,
+        };
+        let maximize_target = self
+            .maximizing_window_location()
+            .and_then(|(column_idx, tile_idx)| self.columns[column_idx].tiles.get(tile_idx))
+            .map(|tile| tile.window().id().clone());
+
+        let mut lifecycle_overlays = Vec::with_capacity(
+            self.closing_windows.len()
+                + self.minimize_animations.len()
+                + self.restore_animations.len(),
+        );
+        lifecycle_overlays.extend(self.closing_windows.iter().map(|_| {
+            LifecycleOverlayObservation {
+                kind: LifecycleOverlayKind::Closing,
+                window: None,
+                active: true,
+                rendered,
+                progress: None,
+            }
+        }));
+        lifecycle_overlays.extend(self.minimize_animations.iter().map(|(id, animation)| {
+            LifecycleOverlayObservation {
+                kind: LifecycleOverlayKind::Minimize,
+                window: Some(id.clone()),
+                active: animation.are_animations_ongoing(),
+                rendered,
+                progress: Some(animation.test_morph_progress()),
+            }
+        }));
+        lifecycle_overlays.extend(self.restore_animations.iter().map(|(id, animation)| {
+            LifecycleOverlayObservation {
+                kind: LifecycleOverlayKind::Restore,
+                window: Some(id.clone()),
+                active: animation.are_animations_ongoing(),
+                rendered,
+                progress: Some(animation.test_morph_progress()),
+            }
+        }));
+
+        ScrollingRenderObservation {
+            maximize_transition,
+            maximize_target,
+            lifecycle_overlays_rendered: rendered,
+            lifecycle_overlays,
+        }
+    }
+
     fn finish_maximize_transition_if_settled(&mut self) {
         let now = self.clock.now_unadjusted();
         let Some(transition) = self.maximize_transition.as_ref() else {
@@ -3495,10 +3606,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
-        let maximize_transition = self.maximize_transition_is_ongoing();
-
         let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
-        if !maximize_transition {
+        if self.lifecycle_overlays_are_rendered() {
             // Draw the closing windows on top of the other windows.
             for closing in self.closing_windows.iter().rev() {
                 let elem = closing.render(ctx.as_gles(), view_rect, scale);
