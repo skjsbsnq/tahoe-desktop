@@ -15,10 +15,12 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::{ClientId, LayerConfigureProps};
 use super::*;
 use crate::layout::scrolling::{
-    LifecycleOverlayKind, MaximizeTransitionObservation, ScrollingRenderObservation,
+    LifecycleOverlayAction, LifecycleOverlayKind, MaximizeTransitionObservation,
+    ScrollingRenderObservation,
 };
 use crate::niri::Niri;
 use crate::utils::lifecycle_diag;
+use crate::utils::transaction::TransactionBlocker;
 use crate::window::Mapped;
 
 fn set_time(niri: &mut Niri, time: Duration) {
@@ -338,20 +340,62 @@ fn source_layer_map_unmap_remap_clears_and_restores_anchor() {
     }
 }
 
-#[test]
-fn maximize_ongoing_plus_active_minimize_overlay_reports_suppressed_decision() {
+fn linear_lifecycle_config() -> Config {
     const LINEAR: Kind = Kind::Easing(EasingParams {
         duration_ms: 1000,
         curve: Curve::Linear,
     });
-
     let mut config = Config::default();
     config.layout.gaps = 0.0;
     config.animations.window_resize.anim.kind = LINEAR;
+    // Minimize/restore default to close/open animation config when unset.
     config.animations.window_close.anim.kind = LINEAR;
+    config.animations.window_open.anim.kind = LINEAR;
+    config
+}
 
+fn assert_no_invisible_progress(obs: &ScrollingRenderObservation<Window>) {
+    assert!(
+        obs.lifecycle_overlays_rendered,
+        "policy must Draw scrolling lifecycle overlays; obs={obs:?}"
+    );
+    assert_eq!(
+        obs.policy.scrolling_lifecycle_overlays,
+        LifecycleOverlayAction::Draw
+    );
+    for overlay in &obs.lifecycle_overlays {
+        if overlay.active {
+            assert!(
+                overlay.rendered,
+                "active overlay must not advance while unrendered: {overlay:?}"
+            );
+        }
+    }
+}
+
+fn start_maximize_pending(f: &mut Fixture) -> Window {
+    set_time(f.niri(), Duration::ZERO);
+    f.niri_complete_animations();
+    let window1 = mapped_at(f.niri(), 0).window.clone();
+    f.niri().layout.activate_window(&window1);
+    f.niri().layout.set_maximized(&window1, true);
+    // Avoid dispatch/advance_animations: fixture roundtrips advance the real clock and can
+    // settle or time out maximize transitions before we observe them.
+    let obs = observe_scrolling(f.niri());
+    assert_ne!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::Idle,
+        "maximize transition must be ongoing before client commit; obs={obs:?}"
+    );
+    assert!(obs.policy.maximize_exclusive);
+    assert_no_invisible_progress(&obs);
+    window1
+}
+
+#[test]
+fn maximize_ongoing_plus_active_minimize_overlay_is_drawn() {
     lifecycle_diag::with_enabled_for_test(|| {
-        let mut f = Fixture::with_config(config);
+        let mut f = Fixture::with_config(linear_lifecycle_config());
         f.niri_state().backend.headless().add_renderer().unwrap();
         f.add_output(1, (1920, 1080));
 
@@ -362,26 +406,7 @@ fn maximize_ongoing_plus_active_minimize_overlay_reports_suppressed_decision() {
         let _ = f.client(id).window(&surface1).recent_configures();
         let _ = f.client(id).window(&surface2).recent_configures();
 
-        set_time(f.niri(), Duration::ZERO);
-        f.niri_complete_animations();
-
-        // Focus left window (idx 0) and start maximize transition without committing client size yet.
-        let window1 = mapped_at(f.niri(), 0).window.clone();
-        f.niri().layout.activate_window(&window1);
-        f.niri().layout.set_maximized(&window1, true);
-        // Avoid dispatch/advance_animations: fixture roundtrips advance the real clock and can
-        // settle or time out maximize transitions before we observe them.
-
-        let obs = observe_scrolling(f.niri());
-        assert_ne!(
-            obs.maximize_transition,
-            MaximizeTransitionObservation::Idle,
-            "maximize transition must be ongoing before client commit; obs={obs:?}"
-        );
-        assert!(
-            !obs.lifecycle_overlays_rendered,
-            "lifecycle overlays suppressed while maximize ongoing; obs={obs:?}"
-        );
+        let _window1 = start_maximize_pending(&mut f);
 
         // Minimize non-target with real Genie snapshot (renderer present).
         let window2 = mapped_at(f.niri(), 1).window.clone();
@@ -391,38 +416,31 @@ fn maximize_ongoing_plus_active_minimize_overlay_reports_suppressed_decision() {
         assert!(changed, "minimize of non-target must succeed");
 
         let obs = observe_scrolling(f.niri());
-        assert!(
-            !obs.lifecycle_overlays_rendered,
-            "F01 baseline: maximize ongoing must suppress overlay render decision"
-        );
+        assert_no_invisible_progress(&obs);
+        assert!(obs.policy.maximize_exclusive);
         let minimize = obs
             .lifecycle_overlays
             .iter()
             .find(|o| o.kind == LifecycleOverlayKind::Minimize)
             .expect("active minimize overlay must be observed from production containers");
         assert!(minimize.active);
-        assert!(
-            !minimize.rendered,
-            "overlay entry exists and advances, but production decision keeps it unrendered"
-        );
+        assert!(minimize.rendered);
         assert!(minimize.progress.is_some());
 
-        // Advance clock: progress must still grow even while suppressed (F01 risk captured).
+        // Advance clock: progress grows while still rendered (F01 fixed).
         let p0 = minimize.progress.unwrap();
         set_time(f.niri(), Duration::from_millis(250));
         f.niri().advance_animations();
         let obs = observe_scrolling(f.niri());
+        assert_no_invisible_progress(&obs);
         let minimize = obs
             .lifecycle_overlays
             .iter()
             .find(|o| o.kind == LifecycleOverlayKind::Minimize)
             .expect("minimize still active after partial advance");
         let p1 = minimize.progress.unwrap();
-        assert!(
-            p1 > p0 || !obs.lifecycle_overlays_rendered,
-            "progress observed under suppressed decision (p0={p0}, p1={p1})"
-        );
-        assert!(!obs.lifecycle_overlays_rendered);
+        assert!(p1 > p0, "progress must grow while drawn (p0={p0}, p1={p1})");
+        assert!(minimize.rendered);
 
         let diag = lifecycle_diag::snapshot();
         assert!(
@@ -431,6 +449,241 @@ fn maximize_ongoing_plus_active_minimize_overlay_reports_suppressed_decision() {
         );
         assert!(diag.snapshot_peak_bytes > 0);
     });
+}
+
+#[test]
+fn maximize_pending_draws_minimize_restore_reverse_and_close() {
+    let mut f = Fixture::with_config(linear_lifecycle_config());
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface1 = create_window(&mut f, id, 200, 200);
+    let surface2 = create_window(&mut f, id, 200, 200);
+    let surface3 = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface1).recent_configures();
+    let _ = f.client(id).window(&surface2).recent_configures();
+    let _ = f.client(id).window(&surface3).recent_configures();
+
+    let window1 = start_maximize_pending(&mut f);
+
+    // --- pending stage: minimize non-target ---
+    let window2 = mapped_at(f.niri(), 1).window.clone();
+    assert!(f
+        .niri_state()
+        .minimize_window_with_animation(&window2, None));
+    let obs = observe_scrolling(f.niri());
+    assert_eq!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::Pending
+    );
+    assert_no_invisible_progress(&obs);
+    assert!(obs
+        .lifecycle_overlays
+        .iter()
+        .any(|o| o.kind == LifecycleOverlayKind::Minimize && o.rendered));
+
+    // Advance minimize partway, then reverse to restore while maximize still exclusive.
+    set_time(f.niri(), Duration::from_millis(300));
+    f.niri().advance_animations();
+    let obs = observe_scrolling(f.niri());
+    assert_no_invisible_progress(&obs);
+    let minimize = obs
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Minimize)
+        .expect("minimize mid-flight");
+    assert!(minimize.progress.unwrap() > 0.0);
+
+    assert!(f.niri_state().restore_window_with_animation(&window2, None));
+    let obs = observe_scrolling(f.niri());
+    assert_no_invisible_progress(&obs);
+    let restore = obs
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Restore)
+        .expect("restore after reverse");
+    assert!(restore.active && restore.rendered);
+    // Restore morph is "how minimized": decreases as the window expands back.
+    let p0 = restore.progress.unwrap();
+    set_time(f.niri(), Duration::from_millis(550));
+    f.niri().advance_animations();
+    let obs = observe_scrolling(f.niri());
+    assert!(obs.policy.maximize_exclusive);
+    assert_no_invisible_progress(&obs);
+    let restore = obs
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Restore)
+        .expect("restore still active");
+    assert!(
+        restore.progress.unwrap() < p0,
+        "restore morph must decrease while drawn (p0={p0}, p1={})",
+        restore.progress.unwrap()
+    );
+
+    // Close a different non-target with unmap snapshot while maximize exclusive.
+    let window3 = mapped_at(f.niri(), 2).window.clone();
+    assert_ne!(&window3, &window1);
+    f.niri_state().store_unmap_snapshot(&window3, None);
+    {
+        let state = f.niri_state();
+        state.backend.with_primary_renderer(|renderer| {
+            state.niri.layout.start_close_animation_for_window(
+                renderer,
+                &window3,
+                TransactionBlocker::completed(),
+            );
+        });
+    }
+    let obs = observe_scrolling(f.niri());
+    assert!(obs.policy.maximize_exclusive);
+    assert_no_invisible_progress(&obs);
+    assert!(
+        obs.lifecycle_overlays
+            .iter()
+            .any(|o| o.kind == LifecycleOverlayKind::Closing && o.rendered),
+        "closing overlay must be drawn during maximize: {obs:?}"
+    );
+
+    // Live non-target tiles stay exclusive-filtered.
+    let target = window1.clone();
+    let visible: Vec<bool> = f
+        .niri()
+        .layout
+        .active_workspace()
+        .unwrap()
+        .tiles_with_render_positions()
+        .filter(|(tile, _, _)| tile.window().window != target)
+        .map(|(_, _, vis)| vis)
+        .collect();
+    assert!(
+        visible.iter().all(|v| !*v),
+        "maximize exclusivity must not re-expose non-target live tiles"
+    );
+}
+
+#[test]
+fn maximize_committed_still_draws_lifecycle_overlays() {
+    let mut f = Fixture::with_config(linear_lifecycle_config());
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface1 = create_window(&mut f, id, 200, 200);
+    let surface2 = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface1).recent_configures();
+    let _ = f.client(id).window(&surface2).recent_configures();
+
+    set_time(f.niri(), Duration::ZERO);
+    f.niri_complete_animations();
+
+    let window1 = mapped_at(f.niri(), 0).window.clone();
+    f.niri().layout.activate_window(&window1);
+    f.niri().layout.set_maximized(&window1, true);
+    f.double_roundtrip(id);
+
+    // Client commits maximized size from the latest configure.
+    {
+        let win = f.client(id).window(&surface1);
+        let cfg = win
+            .recent_configures()
+            .last()
+            .cloned()
+            .expect("maximize configure");
+        win.set_size(cfg.size.0.max(1) as u16, cfg.size.1.max(1) as u16);
+        win.ack_last_and_commit();
+    }
+    f.roundtrip(id);
+
+    // Freeze clock so transition does not settle during observation.
+    set_time(f.niri(), Duration::from_millis(50));
+    f.niri().advance_animations();
+
+    let obs = observe_scrolling(f.niri());
+    assert_eq!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::Committed,
+        "after client maximize commit: {obs:?}"
+    );
+    assert!(obs.policy.maximize_exclusive);
+    assert_no_invisible_progress(&obs);
+
+    let window2 = mapped_at(f.niri(), 1).window.clone();
+    assert!(f
+        .niri_state()
+        .minimize_window_with_animation(&window2, None));
+    let obs = observe_scrolling(f.niri());
+    assert_eq!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::Committed
+    );
+    assert_no_invisible_progress(&obs);
+    let minimize = obs
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Minimize)
+        .expect("minimize during committed maximize");
+    assert!(minimize.rendered && minimize.active);
+    let p0 = minimize.progress.unwrap();
+    set_time(f.niri(), Duration::from_millis(300));
+    f.niri().advance_animations();
+    let obs = observe_scrolling(f.niri());
+    assert_no_invisible_progress(&obs);
+    let minimize = obs
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Minimize)
+        .expect("minimize still active");
+    assert!(minimize.progress.unwrap() > p0);
+}
+
+#[test]
+fn maximize_hides_floating_live_but_draws_floating_lifecycle_policy() {
+    let mut f = Fixture::with_config(linear_lifecycle_config());
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface1 = create_window(&mut f, id, 200, 200);
+    let surface_float = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface1).recent_configures();
+    let _ = f.client(id).window(&surface_float).recent_configures();
+
+    let window_float = mapped_at(f.niri(), 1).window.clone();
+    f.niri().layout.toggle_window_floating(Some(&window_float));
+    f.double_roundtrip(id);
+
+    let _window1 = start_maximize_pending(&mut f);
+    {
+        let ws = f.niri().layout.active_workspace().unwrap();
+        assert!(
+            !ws.is_floating_visible(),
+            "floating live tiles stay hidden during maximize exclusivity"
+        );
+        let policy = ws.scrolling().render_policy();
+        assert!(policy.suppress_floating_live_tiles);
+        assert_eq!(
+            policy.floating_lifecycle_overlays,
+            LifecycleOverlayAction::Draw
+        );
+    }
+
+    // Floating minimize while maximize exclusive: policy still Draw for floating overlays.
+    assert!(f
+        .niri_state()
+        .minimize_window_with_animation(&window_float, None));
+    {
+        let ws = f.niri().layout.active_workspace().unwrap();
+        let policy = ws.scrolling().render_policy();
+        assert!(policy.maximize_exclusive);
+        assert!(policy.suppress_floating_live_tiles);
+        assert!(policy.floating_lifecycle_overlays_are_rendered());
+        assert!(!ws.is_floating_visible());
+    }
 }
 
 #[test]

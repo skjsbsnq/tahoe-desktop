@@ -1813,19 +1813,28 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn render_floating<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<R>,
+        mut ctx: RenderCtx<R>,
         xray_pos: XrayPos,
         focus_ring: bool,
         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
     ) {
+        let policy = self.scrolling.render_policy();
+        let view_rect = Rectangle::from_size(self.view_size);
+
+        // Lifecycle overlays follow the explicit policy independently of live-tile visibility so
+        // maximize exclusivity cannot swallow already-active floating close/minimize/restore.
+        if policy.floating_lifecycle_overlays_are_rendered() {
+            self.floating
+                .render_lifecycle_overlays(ctx.r(), view_rect, &mut |elem| push(elem.into()));
+        }
+
         if !self.is_floating_visible() {
             return;
         }
 
-        let view_rect = Rectangle::from_size(self.view_size);
         let floating_focus_ring = focus_ring && self.floating_is_active();
         self.floating
-            .render(ctx, xray_pos, view_rect, floating_focus_ring, &mut |elem| {
+            .render_live_tiles(ctx.r(), xray_pos, floating_focus_ring, &mut |elem| {
                 push(elem.into())
             });
     }
@@ -1852,7 +1861,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn is_floating_visible(&self) -> bool {
-        if self.scrolling.maximize_transition_is_ongoing() {
+        // Live floating tiles share maximize exclusivity with scrolling live tiles via the
+        // scrolling render policy. Lifecycle overlays are not gated here (see render_floating).
+        if self.scrolling.render_policy().suppress_floating_live_tiles {
             return false;
         }
 

@@ -1507,12 +1507,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
         true
     }
 
-    pub fn render<R: NiriRenderer>(
+    /// Render closing/minimize/restore overlays only.
+    ///
+    /// Separated from live tiles so maximize exclusivity can hide floating live windows without
+    /// swallowing already-active lifecycle overlays (same ownership as scrolling's render policy).
+    pub fn render_lifecycle_overlays<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
-        xray_pos: XrayPos,
         view_rect: Rectangle<f64, Logical>,
-        focus_ring: bool,
         push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
@@ -1534,7 +1536,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
             let elem = restore.render(ctx.as_gles(), view_rect, scale);
             push(elem.into());
         }
+    }
 
+    pub fn render_live_tiles<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        xray_pos: XrayPos,
+        focus_ring: bool,
+        push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
+    ) {
         let active = self.active_window_id.clone();
         for (tile, tile_pos) in self.tiles_with_render_positions() {
             if tile.window().is_minimized() && !tile.should_render_minimized_animation() {
@@ -1552,6 +1562,18 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 push(elem.into())
             });
         }
+    }
+
+    pub fn render<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        xray_pos: XrayPos,
+        view_rect: Rectangle<f64, Logical>,
+        focus_ring: bool,
+        push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
+    ) {
+        self.render_lifecycle_overlays(ctx.r(), view_rect, push);
+        self.render_live_tiles(ctx.r(), xray_pos, focus_ring, push);
     }
 
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {

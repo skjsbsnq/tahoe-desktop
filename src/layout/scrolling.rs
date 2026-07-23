@@ -309,12 +309,74 @@ struct MaximizeTransition<Id> {
     timed_out: bool,
 }
 
+/// How an active lifecycle overlay lane is treated by the render policy.
+///
+/// Every active closing/minimize/restore entry must map to exactly one of these actions.
+/// There is no fourth state where the container keeps advancing while the render loop silently
+/// drops the element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleOverlayAction {
+    /// Push overlay elements; animation clocks continue (progress is clock-driven).
+    Draw,
+    /// Hold progress frozen and do not push elements. Reserved for future explicit rules.
+    #[allow(dead_code)]
+    Pause,
+    /// Drop the overlay from its container immediately. Reserved for explicit per-window rules.
+    #[allow(dead_code)]
+    Cancel,
+}
+
+/// Explicit render / hit-test policy owned by the scrolling space.
+///
+/// Separates maximize live-tile exclusivity from lifecycle overlay and floating decisions so a
+/// maximize transition can keep filtering ordinary tiles without swallowing already-active
+/// closing/minimize/restore overlays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollingRenderPolicy {
+    /// Ordinary live tiles are restricted to the maximize target (and inactive tabs stay hidden).
+    pub maximize_exclusive: bool,
+    /// Action for scrolling closing/minimize/restore overlays.
+    pub scrolling_lifecycle_overlays: LifecycleOverlayAction,
+    /// Maximize exclusivity also suppresses floating *live* tiles so transparent resize cannot
+    /// reveal them. Floating lifecycle overlays are controlled separately.
+    pub suppress_floating_live_tiles: bool,
+    /// Action for floating closing/minimize/restore overlays.
+    pub floating_lifecycle_overlays: LifecycleOverlayAction,
+}
+
+impl ScrollingRenderPolicy {
+    /// Default R01 policy: keep maximize live-tile exclusivity, but always draw non-conflicting
+    /// lifecycle overlays on both scrolling and floating lanes.
+    pub fn for_maximize_state(maximize_exclusive: bool) -> Self {
+        Self {
+            maximize_exclusive,
+            // Lifecycle overlays stack above ordinary tiles. Drawing them does not re-expose
+            // filtered live tiles through the maximize resize shader.
+            scrolling_lifecycle_overlays: LifecycleOverlayAction::Draw,
+            suppress_floating_live_tiles: maximize_exclusive,
+            floating_lifecycle_overlays: LifecycleOverlayAction::Draw,
+        }
+    }
+
+    pub fn scrolling_lifecycle_overlays_are_rendered(self) -> bool {
+        matches!(
+            self.scrolling_lifecycle_overlays,
+            LifecycleOverlayAction::Draw
+        )
+    }
+
+    pub fn floating_lifecycle_overlays_are_rendered(self) -> bool {
+        matches!(
+            self.floating_lifecycle_overlays,
+            LifecycleOverlayAction::Draw
+        )
+    }
+}
+
 /// Test-only view of the production lifecycle render decision.
 ///
-/// This deliberately reports the same predicate that [`ScrollingSpace::render`] uses; it does
-/// not maintain a parallel test state machine. R01 will replace the coarse visibility predicate
-/// with an explicit render policy, while these observations remain the regression oracle for its
-/// per-frame decisions.
+/// Reports the same policy that [`ScrollingSpace::render`] and floating visibility use; it does
+/// not maintain a parallel test state machine.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleOverlayKind {
@@ -350,8 +412,10 @@ pub enum MaximizeTransitionObservation {
 pub struct ScrollingRenderObservation<Id> {
     pub maximize_transition: MaximizeTransitionObservation,
     pub maximize_target: Option<Id>,
-    /// Production `render()` predicate: whether closing/minimize/restore overlays would be pushed.
-    /// Readable even when no lifecycle containers are currently active.
+    /// Full production policy for this frame.
+    pub policy: ScrollingRenderPolicy,
+    /// Production `render()` predicate: whether scrolling closing/minimize/restore overlays would
+    /// be pushed. Readable even when no lifecycle containers are currently active.
     pub lifecycle_overlays_rendered: bool,
     pub lifecycle_overlays: Vec<LifecycleOverlayObservation<Id>>,
 }
@@ -3493,18 +3557,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.maximizing_window_location().is_some()
     }
 
-    /// The current production render decision for lifecycle snapshots.
+    /// Explicit production render / hit-test policy for this scrolling space.
     ///
-    /// Keep this deliberately narrow in R00: it makes the existing decision observable without
-    /// changing it. In particular, an ongoing maximize transition still hides all lifecycle
-    /// overlays; R01 owns changing that behavior.
-    fn lifecycle_overlays_are_rendered(&self) -> bool {
-        !self.maximize_transition_is_ongoing()
+    /// Live-tile exclusivity during maximize is independent of lifecycle overlay drawing. Active
+    /// overlays always map to [`LifecycleOverlayAction::Draw`] unless a future per-window rule
+    /// chooses Pause or Cancel — never "advance invisibly".
+    pub fn render_policy(&self) -> ScrollingRenderPolicy {
+        ScrollingRenderPolicy::for_maximize_state(self.maximize_transition_is_ongoing())
     }
 
     #[cfg(test)]
     pub fn render_observation(&self) -> ScrollingRenderObservation<W::Id> {
-        let rendered = self.lifecycle_overlays_are_rendered();
+        let policy = self.render_policy();
+        let rendered = policy.scrolling_lifecycle_overlays_are_rendered();
         let maximize_transition = match self.maximize_transition.as_ref() {
             None => MaximizeTransitionObservation::Idle,
             Some(transition) if transition.timed_out => MaximizeTransitionObservation::TimedOut,
@@ -3552,6 +3617,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         ScrollingRenderObservation {
             maximize_transition,
             maximize_target,
+            policy,
             lifecycle_overlays_rendered: rendered,
             lifecycle_overlays,
         }
@@ -3607,7 +3673,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     ) {
         let scale = Scale::from(self.scale);
         let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
-        if self.lifecycle_overlays_are_rendered() {
+        let policy = self.render_policy();
+        // Lifecycle overlays are drawn under an explicit policy action, not gated by the same
+        // maximize_exclusive flag that filters ordinary live tiles.
+        if policy.scrolling_lifecycle_overlays_are_rendered() {
             // Draw the closing windows on top of the other windows.
             for closing in self.closing_windows.iter().rev() {
                 let elem = closing.render(ctx.as_gles(), view_rect, scale);
