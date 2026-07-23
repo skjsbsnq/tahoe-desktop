@@ -18,8 +18,12 @@ use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
+use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+};
 use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::client::{
-    zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1,
+    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
 };
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{
@@ -60,6 +64,7 @@ pub struct State {
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
+    pub ext_foreign_toplevel_list: Option<ExtForeignToplevelListV1>,
     pub tahoe_glass_manager: Option<TahoeGlassManagerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
@@ -67,6 +72,30 @@ pub struct State {
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
     pub foreign_toplevels: Vec<ZwlrForeignToplevelHandleV1>,
+    /// Creation-order records for coordinated ext ↔ wlr pairing tests (R11).
+    pub wlr_foreign_toplevel_meta: Vec<WlrForeignToplevelMeta>,
+    pub ext_foreign_toplevels: Vec<ExtForeignToplevelMeta>,
+}
+
+/// Client-side snapshot of one wlr foreign-toplevel handle stream event set.
+#[derive(Debug, Clone)]
+pub struct WlrForeignToplevelMeta {
+    pub handle: ZwlrForeignToplevelHandleV1,
+    pub title: Option<String>,
+    pub app_id: Option<String>,
+    pub done: bool,
+    pub closed: bool,
+}
+
+/// Client-side snapshot of one ext-foreign-toplevel-list handle.
+#[derive(Debug, Clone)]
+pub struct ExtForeignToplevelMeta {
+    pub handle: ExtForeignToplevelHandleV1,
+    pub identifier: Option<String>,
+    pub title: Option<String>,
+    pub app_id: Option<String>,
+    pub done: bool,
+    pub closed: bool,
 }
 
 pub struct Window {
@@ -190,12 +219,15 @@ impl Client {
             xdg_wm_base: None,
             layer_shell: None,
             foreign_toplevel_manager: None,
+            ext_foreign_toplevel_list: None,
             tahoe_glass_manager: None,
             spbm: None,
             viewporter: None,
             windows: Vec::new(),
             layers: Vec::new(),
             foreign_toplevels: Vec::new(),
+            wlr_foreign_toplevel_meta: Vec::new(),
+            ext_foreign_toplevels: Vec::new(),
         };
 
         Self {
@@ -248,6 +280,61 @@ impl Client {
 
     pub fn foreign_toplevel(&self, idx: usize) -> ZwlrForeignToplevelHandleV1 {
         self.state.foreign_toplevels[idx].clone()
+    }
+
+    /// Live ext-list handles that have received `done` and are not closed.
+    pub fn ext_foreign_toplevel_ready(&self) -> Vec<&ExtForeignToplevelMeta> {
+        self.state
+            .ext_foreign_toplevels
+            .iter()
+            .filter(|m| m.done && !m.closed)
+            .collect()
+    }
+
+    /// Live wlr handles that have received `done` and are not closed.
+    pub fn wlr_foreign_toplevel_ready(&self) -> Vec<&WlrForeignToplevelMeta> {
+        self.state
+            .wlr_foreign_toplevel_meta
+            .iter()
+            .filter(|m| m.done && !m.closed)
+            .collect()
+    }
+
+    /// FIFO coordinated pairing used by R11: both managers share niri
+    /// `ToplevelData` creation order (ext then wlr per window / same HashMap
+    /// walk on bind). Returns (identifier, app_id, title) triples for pairs.
+    pub fn pair_ext_wlr_by_creation_order(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, String> {
+        let ext: Vec<_> = self.ext_foreign_toplevel_ready();
+        let wlr: Vec<_> = self.wlr_foreign_toplevel_ready();
+        if ext.len() != wlr.len() {
+            return Err(format!(
+                "ext/wlr ready count desync: ext={} wlr={}",
+                ext.len(),
+                wlr.len()
+            ));
+        }
+        let mut pairs = Vec::with_capacity(ext.len());
+        for (e, w) in ext.iter().zip(wlr.iter()) {
+            let Some(identifier) = e.identifier.clone() else {
+                return Err("ext handle missing identifier".into());
+            };
+            if identifier.is_empty() {
+                return Err("ext identifier empty".into());
+            }
+            // Fail closed on app_id mismatch when both sides published one.
+            match (&e.app_id, &w.app_id) {
+                (Some(a), Some(b)) if a != b => {
+                    return Err(format!(
+                        "app_id desync on pair identifier={identifier}: ext={a:?} wlr={b:?}"
+                    ));
+                }
+                _ => {}
+            }
+            pairs.push((identifier, e.app_id.clone(), e.title.clone()));
+        }
+        Ok(pairs)
     }
 
     pub fn tahoe_glass_manager(&self) -> TahoeGlassManagerV1 {
@@ -407,6 +494,10 @@ impl Window {
         self.xdg_toplevel.set_title(title.to_owned());
     }
 
+    pub fn set_app_id(&self, app_id: &str) {
+        self.xdg_toplevel.set_app_id(app_id.to_owned());
+    }
+
     pub fn recent_configures(&mut self) -> impl Iterator<Item = &Configure> {
         let start = self.configures_looked_at;
         self.configures_looked_at = self.configures_received.len();
@@ -546,6 +637,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwlrLayerShellV1::interface().name {
                     let version = min(version, ZwlrLayerShellV1::interface().version);
                     state.layer_shell = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ExtForeignToplevelListV1::interface().name {
+                    let version = min(version, ExtForeignToplevelListV1::interface().version);
+                    state.ext_foreign_toplevel_list = Some(registry.bind(name, version, qh, ()));
                 } else if interface == ZwlrForeignToplevelManagerV1::interface().name {
                     let version = min(version, ZwlrForeignToplevelManagerV1::interface().version);
                     state.foreign_toplevel_manager = Some(registry.bind(name, version, qh, ()));
@@ -644,6 +738,73 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
     }
 }
 
+impl Dispatch<ExtForeignToplevelListV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtForeignToplevelListV1,
+        event: <ExtForeignToplevelListV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_foreign_toplevel_list_v1::Event::Toplevel { toplevel } => {
+                state.ext_foreign_toplevels.push(ExtForeignToplevelMeta {
+                    handle: toplevel,
+                    identifier: None,
+                    title: None,
+                    app_id: None,
+                    done: false,
+                    closed: false,
+                });
+            }
+            ext_foreign_toplevel_list_v1::Event::Finished => (),
+            _ => (),
+        }
+    }
+
+    wayland_client::event_created_child!(State, ExtForeignToplevelListV1, [
+        0 => (ExtForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtForeignToplevelHandleV1,
+        event: <ExtForeignToplevelHandleV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let Some(meta) = state
+            .ext_foreign_toplevels
+            .iter_mut()
+            .find(|m| &m.handle == proxy)
+        else {
+            return;
+        };
+        match event {
+            ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => {
+                meta.identifier = Some(identifier);
+            }
+            ext_foreign_toplevel_handle_v1::Event::Title { title } => {
+                meta.title = Some(title);
+            }
+            ext_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
+                meta.app_id = Some(app_id);
+            }
+            ext_foreign_toplevel_handle_v1::Event::Done => {
+                meta.done = true;
+            }
+            ext_foreign_toplevel_handle_v1::Event::Closed => {
+                meta.closed = true;
+            }
+            _ => (),
+        }
+    }
+}
+
 impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
     fn event(
         state: &mut Self,
@@ -655,6 +816,13 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
     ) {
         match event {
             zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } => {
+                state.wlr_foreign_toplevel_meta.push(WlrForeignToplevelMeta {
+                    handle: toplevel.clone(),
+                    title: None,
+                    app_id: None,
+                    done: false,
+                    closed: false,
+                });
                 state.foreign_toplevels.push(toplevel);
             }
             zwlr_foreign_toplevel_manager_v1::Event::Finished => (),
@@ -669,13 +837,35 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
 
 impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
     fn event(
-        _state: &mut Self,
-        _proxy: &ZwlrForeignToplevelHandleV1,
-        _event: <ZwlrForeignToplevelHandleV1 as wayland_client::Proxy>::Event,
+        state: &mut Self,
+        proxy: &ZwlrForeignToplevelHandleV1,
+        event: <ZwlrForeignToplevelHandleV1 as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        let Some(meta) = state
+            .wlr_foreign_toplevel_meta
+            .iter_mut()
+            .find(|m| &m.handle == proxy)
+        else {
+            return;
+        };
+        match event {
+            zwlr_foreign_toplevel_handle_v1::Event::Title { title } => {
+                meta.title = Some(title);
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
+                meta.app_id = Some(app_id);
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Done => {
+                meta.done = true;
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Closed => {
+                meta.closed = true;
+            }
+            _ => (),
+        }
     }
 }
 

@@ -348,3 +348,176 @@ fn zero_area_last_request_degrades_lifecycle_consume_without_clearing_slot() {
         .expect("zero-area last request must remain");
     assert!(r.rect.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// R11 feasibility: coordinated ext-list ↔ wlr management pairing on niri.
+// Identifier is MappedId decimal; creation order pairs streams without a new
+// compositor id protocol. Fail closed when ready counts desync.
+// ---------------------------------------------------------------------------
+
+fn mapped_ids_in_layout_order(f: &mut Fixture) -> Vec<String> {
+    f.niri()
+        .layout
+        .windows()
+        .map(|(_, mapped)| mapped.id().to_protocol_identifier())
+        .collect()
+}
+
+fn assert_pairs_match_mapped_ids(f: &mut Fixture, id: client::ClientId) {
+    f.double_roundtrip(id);
+    let pairs = f
+        .client(id)
+        .pair_ext_wlr_by_creation_order()
+        .expect("ext↔wlr FIFO pairing must succeed");
+    let mapped = mapped_ids_in_layout_order(f);
+    assert_eq!(
+        pairs.len(),
+        mapped.len(),
+        "pair count must match mapped windows"
+    );
+    let mut pair_ids: Vec<_> = pairs.iter().map(|(i, _, _)| i.clone()).collect();
+    let mut mapped_ids = mapped;
+    pair_ids.sort();
+    mapped_ids.sort();
+    assert_eq!(
+        pair_ids, mapped_ids,
+        "paired identifiers must equal MappedId set (order may follow HashMap)"
+    );
+}
+
+#[test]
+fn r11_pair_shell_first_then_create_windows() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    // Shell already bound both managers via registry (no windows yet).
+    f.double_roundtrip(id);
+    assert!(f.client(id).pair_ext_wlr_by_creation_order().unwrap().is_empty());
+
+    let _a = create_window(&mut f, id);
+    let _b = create_window(&mut f, id);
+    assert_pairs_match_mapped_ids(&mut f, id);
+
+    // Same app_id/title must still pair by stream order, not fuzzy title.
+    for surface in f.client(id).state.windows.iter().map(|w| w.surface.clone()).collect::<Vec<_>>() {
+        let window = f.client(id).window(&surface);
+        window.set_app_id("org.same.App");
+        window.set_title("Identical");
+        window.ack_last_and_commit();
+    }
+    f.double_roundtrip(id);
+    let pairs = f
+        .client(id)
+        .pair_ext_wlr_by_creation_order()
+        .expect("identical title still pairs");
+    assert_eq!(pairs.len(), 2);
+    assert!(pairs.iter().all(|(_, app, title)| {
+        app.as_deref() == Some("org.same.App") && title.as_deref() == Some("Identical")
+    }));
+    let ids: Vec<_> = pairs.into_iter().map(|(i, _, _)| i).collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "identifiers must remain distinct");
+}
+
+#[test]
+fn r11_pair_shell_restart_with_existing_windows() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    // App client creates windows first.
+    let app = f.add_client();
+    let _a = create_window(&mut f, app);
+    let _b = create_window(&mut f, app);
+    let _c = create_window(&mut f, app);
+    f.double_roundtrip(app);
+    let expected = mapped_ids_in_layout_order(&mut f);
+    assert_eq!(expected.len(), 3);
+
+    // Shell-like client binds after windows exist (registry bind order: ext then wlr).
+    let shell = f.add_client();
+    f.double_roundtrip(shell);
+    let pairs = f
+        .client(shell)
+        .pair_ext_wlr_by_creation_order()
+        .expect("restart pairing");
+    let mut got: Vec<_> = pairs.into_iter().map(|(i, _, _)| i).collect();
+    let mut exp = expected;
+    got.sort();
+    exp.sort();
+    assert_eq!(got, exp);
+}
+
+#[test]
+fn r11_pair_close_and_remap_updates_streams() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = create_window(&mut f, id);
+    assert_pairs_match_mapped_ids(&mut f, id);
+    let first_id = mapped_ids_in_layout_order(&mut f)[0].clone();
+
+    // Close the only window.
+    f.client(id).window(&surface).xdg_toplevel.destroy();
+    f.client(id).window(&surface).xdg_surface.destroy();
+    f.client(id).window(&surface).surface.destroy();
+    f.double_roundtrip(id);
+    // Allow compositor refresh to emit closed.
+    f.double_roundtrip(id);
+    let pairs = f
+        .client(id)
+        .pair_ext_wlr_by_creation_order()
+        .expect("empty after close");
+    assert!(pairs.is_empty(), "closed handles must not stay ready");
+
+    let _again = create_window(&mut f, id);
+    assert_pairs_match_mapped_ids(&mut f, id);
+    let second = mapped_ids_in_layout_order(&mut f)[0].clone();
+    assert_ne!(first_id, second, "MappedId must not reuse after unmap");
+}
+
+#[test]
+fn r11_pair_identifier_equals_mapped_id_decimal() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = create_window(&mut f, id);
+    f.double_roundtrip(id);
+    let mapped = f.niri().layout.windows().next().unwrap().1.id();
+    let pairs = f.client(id).pair_ext_wlr_by_creation_order().unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].0, mapped.to_protocol_identifier());
+    assert_eq!(pairs[0].0, mapped.get().to_string());
+}
+
+#[test]
+fn r11_pair_map_between_manager_binds_fails_closed_on_count_desync() {
+    // Prove fail-closed: if only one stream has a handle, pairing errors.
+    // Simulated by filtering closed meta rather than partial bind (auto-bind
+    // always pairs both); inject a synthetic ready-count mismatch via a closed
+    // flag on one side after a real pair exists.
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = create_window(&mut f, id);
+    f.double_roundtrip(id);
+    assert!(f.client(id).pair_ext_wlr_by_creation_order().is_ok());
+
+    // Mark one ext ready handle closed without closing wlr → desync.
+    {
+        let client = f.client(id);
+        let meta = client
+            .state
+            .ext_foreign_toplevels
+            .iter_mut()
+            .find(|m| m.done && !m.closed)
+            .expect("ext meta");
+        meta.closed = true;
+    }
+    let err = f
+        .client(id)
+        .pair_ext_wlr_by_creation_order()
+        .expect_err("must fail closed on count desync");
+    assert!(
+        err.contains("desync"),
+        "error should mention desync, got {err}"
+    );
+}
