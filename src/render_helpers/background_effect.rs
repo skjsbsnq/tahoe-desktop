@@ -8,9 +8,9 @@ use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::handlers::background_effect::get_cached_blur_region;
 use crate::niri_render_elements;
-use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
+use crate::render_helpers::resolved_effect_plan::{ResolvedEffectPlan, ResolvedEffectVisualKey};
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::region::TransformedRegion;
@@ -19,15 +19,11 @@ use crate::utils::surface_geo;
 #[derive(Debug)]
 pub struct BackgroundEffect {
     nonxray: FramebufferEffect,
-    /// Damage when options change.
+    /// Damage when resolved plan visuals change.
     damage: ExtraDamage,
-    /// Corner radius for clipping.
-    ///
-    /// Stored here in addition to `RenderParams` to damage when it changes.
-    // FIXME: would be good to remove this duplication of radius.
-    corner_radius: CornerRadius,
-    blur_config: niri_config::Blur,
-    options: Options,
+    /// Last resolved visual fingerprint (R12). Geometry is not included;
+    /// only material/blur/radius changes need ExtraDamage on the effect.
+    last_visual: Option<ResolvedEffectVisualKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -67,7 +63,7 @@ impl Default for GlassOptions {
 }
 
 impl GlassOptions {
-    fn from_effect(effect: niri_config::BackgroundEffect) -> Self {
+    pub(crate) fn from_effect(effect: niri_config::BackgroundEffect) -> Self {
         let tint_color = effect
             .tint_color
             .unwrap_or_else(|| niri_config::Color::new_unpremul(1., 1., 1., 1.))
@@ -85,7 +81,7 @@ impl GlassOptions {
         }
     }
 
-    fn is_visible(&self) -> bool {
+    pub(crate) fn is_visible(&self) -> bool {
         self.tint_amount > 0.
             || self.contrast != 1.
             || self.edge_highlight > 0.
@@ -97,7 +93,7 @@ impl GlassOptions {
 }
 
 impl Options {
-    fn is_visible(&self) -> bool {
+    pub(crate) fn is_visible(&self) -> bool {
         self.xray
             || self.blur
             || self.noise.is_some_and(|x| x > 0.)
@@ -107,7 +103,7 @@ impl Options {
 }
 
 /// Render-time parameters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RenderParams {
     /// Geometry of the background effect.
     pub geometry: Rectangle<f64, Logical>,
@@ -141,7 +137,7 @@ pub enum ClientBlurRegionGeometry {
 }
 
 impl RenderParams {
-    fn fit_clip_radius(&mut self) {
+    pub(crate) fn fit_clip_radius(&mut self) {
         if let Some((geo, radius)) = &mut self.clip {
             // HACK: increase radius to avoid slight bleed on rounded corners.
             *radius = radius.expanded_by(1.);
@@ -164,9 +160,7 @@ impl BackgroundEffect {
         Self {
             nonxray: FramebufferEffect::new(),
             damage: ExtraDamage::new(),
-            corner_radius: CornerRadius::default(),
-            blur_config: niri_config::Blur::default(),
-            options: Options::default(),
+            last_visual: None,
         }
     }
 
@@ -176,91 +170,34 @@ impl BackgroundEffect {
         self.nonxray.damage();
     }
 
-    pub fn update_config(&mut self, config: niri_config::Blur) {
-        if self.blur_config == config {
+    /// Track damage when the resolved visual fingerprint changes. Does not store
+    /// a parallel mutable options owner — the immutable plan is the only source
+    /// of visual parameters at render time (R12).
+    pub fn note_plan_visual(&mut self, key: ResolvedEffectVisualKey) {
+        if self.last_visual.as_ref() == Some(&key) {
             return;
         }
-
-        self.blur_config = config;
+        self.last_visual = Some(key);
         self.damage.damage_all();
         self.nonxray.damage();
     }
 
-    pub fn update_render_elements(
-        &mut self,
-        corner_radius: CornerRadius,
-        effect: niri_config::BackgroundEffect,
-        has_blur_region: bool,
-    ) {
-        // If the surface explicitly requests a blur region, default blur to true.
-        let blur = if has_blur_region {
-            effect.blur != Some(false)
-        } else {
-            effect.blur == Some(true)
-        };
-
-        let mut options = Options {
-            blur,
-            xray: effect.xray == Some(true),
-            noise: effect.noise,
-            saturation: effect.saturation,
-            glass: GlassOptions::from_effect(effect),
-        };
-
-        // If we have some background effect but xray wasn't explicitly set, default it to true
-        // since it's cheaper.
-        if options.is_visible() && effect.xray.is_none() {
-            options.xray = true;
-        }
-
-        if self.options == options && self.corner_radius == corner_radius {
-            return;
-        }
-
-        self.options = options;
-        self.corner_radius = corner_radius;
-        self.damage.damage_all();
-        self.nonxray.damage();
-    }
-
-    pub fn is_visible(&self) -> bool {
-        self.options.is_visible()
-    }
-
+    /// Render using an immutable plan only. No config fallback or radius rewrite.
     pub fn render(
         &self,
         ctx: RenderCtx<GlesRenderer>,
         ns: Option<usize>,
-        mut params: RenderParams,
+        plan: &ResolvedEffectPlan,
         xray_pos: XrayPos,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
-        if !self.is_visible() {
+        if !plan.is_visible() {
             return;
         }
 
-        if let Some(clip) = &mut params.clip {
-            clip.1 = self.corner_radius;
-        }
-        params.fit_clip_radius();
+        let damage = self.damage.render(plan.params.geometry);
 
-        let damage = self.damage.render(params.geometry);
-
-        // Use noise/saturation from options, falling back to blur defaults if blurred, and
-        // to no effect if not blurred.
-        let blur = self.options.blur && !self.blur_config.off;
-        let blur_options = blur.then_some(BlurOptions::from(self.blur_config));
-        let noise = if blur { self.blur_config.noise } else { 0. };
-        let noise = self.options.noise.unwrap_or(noise) as f32;
-        let saturation = if blur {
-            self.blur_config.saturation
-        } else {
-            1.
-        };
-        let saturation = self.options.saturation.unwrap_or(saturation) as f32;
-        let glass = self.options.glass;
-
-        if self.options.xray {
+        if plan.xray {
             let Some(xray) = ctx.xray else {
                 return;
             };
@@ -268,19 +205,23 @@ impl BackgroundEffect {
             push(damage.into());
             xray.render(
                 ctx,
-                params,
+                plan.params.clone(),
                 xray_pos,
-                blur,
-                noise,
-                saturation,
-                glass,
+                plan.blur,
+                plan.noise,
+                plan.saturation,
+                plan.glass,
                 &mut |elem| push(elem.into()),
             );
         } else {
-            // Render non-xray effect.
-            let elem = self
-                .nonxray
-                .render(ns, params, blur_options, noise, saturation, glass);
+            let elem = self.nonxray.render(
+                ns,
+                plan.params.clone(),
+                plan.blur_options,
+                plan.noise,
+                plan.saturation,
+                plan.glass,
+            );
             push(elem.into());
         }
     }
@@ -346,7 +287,7 @@ fn render_params_for_tile(
         }
     }
 
-    // This corner radius is reset to self.corner_radius in render().
+    // Clip radius is filled by ResolvedEffectPlan::build (R12), not at render time.
     let clip = clip.then_some((clip_geometry, CornerRadius::default()));
 
     Some(RenderParams {
@@ -509,13 +450,6 @@ pub fn render_for_tile(
         let blur_region = get_cached_blur_region(states);
         let has_blur_region = blur_region.as_ref().is_some_and(|r| !r.is_empty());
 
-        background_effect.update_config(blur_config);
-        background_effect.update_render_elements(radius, effect, has_blur_region);
-
-        if !background_effect.is_visible() {
-            return;
-        }
-
         let mut surface_geo = surface_geo(states).unwrap_or_default().to_f64();
         surface_geo.loc += surface_off;
 
@@ -533,8 +467,18 @@ pub fn render_for_tile(
             return;
         };
 
-        let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
-        background_effect.render(ctx, ns, params, xray_pos, push);
+        // R12: single resolve before GPU path — no update_config / radius rewrite order.
+        let visual = ResolvedEffectPlan::visual_key(blur_config, effect, has_blur_region, radius);
+        background_effect.note_plan_visual(visual);
+
+        let Some(plan) =
+            ResolvedEffectPlan::build(blur_config, effect, has_blur_region, radius, params)
+        else {
+            return;
+        };
+
+        let xray_pos = xray_pos.offset(plan.params.geometry.loc - geometry.loc);
+        background_effect.render(ctx, ns, &plan, xray_pos, push);
     });
 }
 

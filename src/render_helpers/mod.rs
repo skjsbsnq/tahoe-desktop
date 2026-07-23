@@ -28,6 +28,7 @@ use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
 pub mod blur;
+// R12 immutable plan builder (shared by window/layer/Tahoe region paths).
 pub mod border;
 pub mod clipped_surface;
 pub mod damage;
@@ -41,6 +42,7 @@ pub mod primary_gpu_texture;
 pub mod render_elements;
 pub mod renderer;
 pub mod resize;
+pub mod resolved_effect_plan;
 pub mod resources;
 pub mod shader_element;
 pub mod shaders;

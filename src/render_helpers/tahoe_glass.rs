@@ -14,6 +14,7 @@ use crate::render_helpers::background_effect::{
     BackgroundEffect, BackgroundEffectElement, RenderParams,
 };
 use crate::render_helpers::damage::ExtraDamage;
+use crate::render_helpers::resolved_effect_plan::ResolvedEffectPlan;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
@@ -344,18 +345,19 @@ fn render_region(
         "rendering Tahoe glass region"
     );
 
-    renderer.background_effect.update_config(blur_config);
-    // Corner radius stored on the effect is what render() writes into clip;
-    // keep it consistent with the visible clip decision above.
-    renderer
-        .background_effect
-        .update_render_elements(visible_radius, effect, region.flags.blur);
+    // R12: same ResolvedEffectPlan builder as window/layer tiles.
+    let has_blur_region = region.flags.blur;
+    let visual =
+        ResolvedEffectPlan::visual_key(blur_config, effect, has_blur_region, visible_radius);
+    renderer.background_effect.note_plan_visual(visual);
 
-    if renderer.background_effect.is_visible() {
+    if let Some(plan) =
+        ResolvedEffectPlan::build(blur_config, effect, has_blur_region, visible_radius, params)
+    {
         let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
         renderer
             .background_effect
-            .render(ctx.r(), ns, params, xray_pos, &mut |elem| push(elem.into()));
+            .render(ctx.r(), ns, &plan, xray_pos, &mut |elem| push(elem.into()));
     }
 
     // niri collects render elements front-to-back. Tahoe glass regions are
