@@ -88,6 +88,7 @@ pub mod floating;
 pub mod focus_ring;
 pub mod insert_hint_element;
 pub mod lifecycle_controller;
+pub mod maximize_visual_fsm;
 pub mod minimize_window_animation;
 pub mod monitor;
 pub mod opening_window;

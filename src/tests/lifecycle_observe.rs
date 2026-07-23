@@ -284,6 +284,413 @@ fn real_mapped_serial_old_configure_vs_latest_commit() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// R08 F02 decision gate: real Mapped configure → ack → commit against the
+// maximize visual FSM. Layout mock on_commit is not used here.
+//
+// Note: Fixture roundtrips clear the animation clock and call advance_animations
+// with real monotonic time, so an uncommitted maximize often reaches
+// TimedOutVisibleFallback after configure delivery. That is the production
+// timeout path and is part of the F02 scenarios below. PendingConfigure without
+// dispatch is covered by layout::tests and start_maximize_pending helpers.
+// ---------------------------------------------------------------------------
+
+/// maximize → timeout → valid late maximize commit resumes exclusivity.
+#[test]
+fn f02_timeout_then_valid_late_maximize_commit_resumes_fsm() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface1 = create_window(&mut f, id, 200, 200);
+    let surface2 = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface1).recent_configures();
+    let _ = f.client(id).window(&surface2).recent_configures();
+
+    // Pin started_at to 0 so later monotonic now during dispatch is always >= 1s.
+    set_time(f.niri(), Duration::ZERO);
+    f.niri_complete_animations();
+
+    let window1 = mapped_at(f.niri(), 0).window.clone();
+    f.niri().layout.activate_window(&window1);
+    f.niri().layout.set_maximized(&window1, true);
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::PendingConfigure
+    );
+
+    // Deliver maximize configure. Loop clears clock → real monotonic now >> started_at=0.
+    f.double_roundtrip(id);
+
+    let obs = observe_scrolling(f.niri());
+    assert_eq!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::TimedOutVisibleFallback,
+        "after configure delivery without client commit: {obs:?}"
+    );
+    assert!(!obs.policy.maximize_exclusive);
+
+    // Late valid maximize commit of the *current* configure.
+    {
+        let win = f.client(id).window(&surface1);
+        let cfg = win
+            .recent_configures()
+            .last()
+            .cloned()
+            .expect("maximize configure");
+        win.set_size(cfg.size.0.max(1) as u16, cfg.size.1.max(1) as u16);
+        win.ack_last_and_commit();
+    }
+    f.roundtrip(id);
+
+    let (committed, pending, _) = mapped_at(f.niri(), 0).test_maximize_commit_state();
+    assert!(committed && pending, "Mapped must show committed maximized");
+
+    // Freeze clock so settle does not clear the FSM before observation.
+    set_time(f.niri(), Duration::from_millis(50));
+    f.niri().advance_animations();
+    let obs = observe_scrolling(f.niri());
+    assert_eq!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::CommittedSettling,
+        "late valid commit must resume exclusivity: {obs:?}"
+    );
+    assert!(obs.policy.maximize_exclusive);
+}
+
+/// maximize → unmaximize → maximize: new request replaces FSM; unmaximize Cancels.
+#[test]
+fn f02_maximize_unmaximize_maximize_replaces_fsm() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    let window = mapped_at(f.niri(), 0).window.clone();
+
+    // PendingConfigure without dispatch (real clock not advanced).
+    set_time(f.niri(), Duration::ZERO);
+    f.niri_complete_animations();
+    f.niri().layout.set_maximized(&window, true);
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::PendingConfigure
+    );
+
+    f.niri().layout.set_maximized(&window, false);
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::Idle,
+        "unmaximize must Cancelled-clear the visual FSM"
+    );
+
+    // Fresh request without dispatch.
+    f.niri().layout.set_maximized(&window, true);
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::PendingConfigure,
+        "new maximize must begin a fresh PendingConfigure"
+    );
+
+    // Deliver configure + commit latest maximize.
+    f.double_roundtrip(id);
+    {
+        let win = f.client(id).window(&surface);
+        let cfg = win.recent_configures().last().cloned().unwrap();
+        win.set_size(cfg.size.0.max(1) as u16, cfg.size.1.max(1) as u16);
+        win.ack_last_and_commit();
+    }
+    f.roundtrip(id);
+    set_time(f.niri(), Duration::from_millis(10));
+    f.niri().advance_animations();
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::CommittedSettling
+    );
+}
+
+/// Old maximize serial after unmaximize+rem maximize: window-layer serials stay correct;
+/// visual FSM only advances when pending maximized and tile is committed maximized.
+#[test]
+fn f02_old_maximize_serial_after_new_request_does_not_mis_cancel() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    let window = mapped_at(f.niri(), 0).window.clone();
+
+    // Epoch A: maximize.
+    f.niri().layout.set_maximized(&window, true);
+    f.double_roundtrip(id);
+    let serial_a = f
+        .client(id)
+        .window(&surface)
+        .configures_received
+        .last()
+        .unwrap()
+        .0;
+
+    // Epoch B: unmaximize (clears FSM).
+    f.niri().layout.set_maximized(&window, false);
+    f.double_roundtrip(id);
+    let serial_b = f
+        .client(id)
+        .window(&surface)
+        .configures_received
+        .last()
+        .unwrap()
+        .0;
+    assert_ne!(serial_a, serial_b);
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::Idle
+    );
+
+    // Epoch C: maximize again (fresh FSM; dispatch may time it out).
+    f.niri().layout.set_maximized(&window, true);
+    f.double_roundtrip(id);
+    let serial_c = f
+        .client(id)
+        .window(&surface)
+        .configures_received
+        .last()
+        .unwrap()
+        .0;
+    assert_ne!(serial_b, serial_c);
+    let phase_after_c = observe_scrolling(f.niri()).maximize_transition;
+    assert!(
+        matches!(
+            phase_after_c,
+            MaximizeTransitionObservation::PendingConfigure
+                | MaximizeTransitionObservation::TimedOutVisibleFallback
+        ),
+        "C must have an active visual transition: {phase_after_c:?}"
+    );
+
+    // Commit only old maximize A while C is the current request.
+    {
+        let w = f.client(id).window(&surface);
+        w.ack_serial(serial_a);
+        w.attach_new_buffer();
+        w.set_size(1920, 1080);
+        w.commit();
+    }
+    f.roundtrip(id);
+
+    let (committed, pending, uncommitted) = mapped_at(f.niri(), 0).test_maximize_commit_state();
+    // Window-layer: A applied maximized=true; B/C may still be queued depending on serial order.
+    assert!(committed, "commit of A applies maximized=true");
+    assert!(pending, "pending still tracks latest maximize C");
+
+    set_time(f.niri(), Duration::from_millis(10));
+    f.niri().advance_animations();
+    let obs = observe_scrolling(f.niri());
+    // Current behavior (no request identity): pending+committed_maximize advances the *current*
+    // transition into CommittedSettling. Window is legitimately maximized under serial A while
+    // request C is still pending maximize, so exclusivity resuming is consistent with
+    // "target is maximized and pending wants max" — not proven as a harmful misidentification.
+    assert_eq!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::CommittedSettling,
+        "FSM has no request serial identity; pending+committed_maximize advances the live \
+         transition. uncommitted after A={uncommitted:?}; obs={obs:?}"
+    );
+    assert!(obs.policy.maximize_exclusive);
+
+    // Commit B (unmaximize) while C still pending: sizing leaves maximized; pending stays true.
+    {
+        let w = f.client(id).window(&surface);
+        w.ack_serial(serial_b);
+        w.attach_new_buffer();
+        w.set_size(200, 200);
+        w.commit();
+    }
+    f.roundtrip(id);
+    let (committed_after_b, pending_after_b, _) =
+        mapped_at(f.niri(), 0).test_maximize_commit_state();
+    assert!(!committed_after_b, "B must clear committed maximized");
+    assert!(pending_after_b, "C still pending maximize");
+
+    set_time(f.niri(), Duration::from_millis(20));
+    f.niri().advance_animations();
+    let obs = observe_scrolling(f.niri());
+    // Without identity, FSM may remain CommittedSettling even though tile is no longer
+    // committed maximized — settle requires is_maximized(), cancel requires !pending.
+    // Must not Idle-cancel incorrectly while C is still pending maximize.
+    assert_ne!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::Idle,
+        "B commit must not Cancel the C transition (pending still maximized); obs={obs:?}"
+    );
+
+    // Commit C: back to committed maximized; FSM stays/returns CommittedSettling.
+    {
+        let w = f.client(id).window(&surface);
+        w.ack_serial(serial_c);
+        w.attach_new_buffer();
+        w.set_size(1920, 1080);
+        w.commit();
+    }
+    f.roundtrip(id);
+    let (committed_c, _, _) = mapped_at(f.niri(), 0).test_maximize_commit_state();
+    assert!(committed_c);
+    set_time(f.niri(), Duration::from_millis(30));
+    f.niri().advance_animations();
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::CommittedSettling
+    );
+}
+
+/// Same-column other tab's commit must not advance the maximize target's FSM.
+#[test]
+fn f02_same_column_other_tab_commit_does_not_advance_target_fsm() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface1 = create_window(&mut f, id, 200, 200);
+    let surface2 = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface1).recent_configures();
+    let _ = f.client(id).window(&surface2).recent_configures();
+
+    let window1 = mapped_at(f.niri(), 0).window.clone();
+    let window2 = mapped_at(f.niri(), 1).window.clone();
+
+    // Tab both windows, maximize inactive tab (window2).
+    f.niri().layout.consume_into_column();
+    f.niri()
+        .layout
+        .set_column_display(niri_ipc::ColumnDisplay::Tabbed);
+    f.niri().layout.activate_window(&window1);
+    f.niri().layout.set_maximized(&window2, true);
+    f.double_roundtrip(id);
+
+    let obs = observe_scrolling(f.niri());
+    let phase_before = obs.maximize_transition;
+    assert!(
+        matches!(
+            phase_before,
+            MaximizeTransitionObservation::PendingConfigure
+                | MaximizeTransitionObservation::TimedOutVisibleFallback
+        ),
+        "target maximize must be active: {obs:?}"
+    );
+    // Target may be None when timed out (exclusivity off) — record target window via phase only.
+
+    // Non-target tab commits — must not mark target transition CommittedSettling.
+    {
+        let win = f.client(id).window(&surface1);
+        if let Some(cfg) = win.recent_configures().last().cloned() {
+            win.set_size(cfg.size.0.max(1) as u16, cfg.size.1.max(1) as u16);
+        }
+        win.ack_last_and_commit();
+    }
+    f.roundtrip(id);
+    set_time(f.niri(), Duration::from_millis(10));
+    f.niri().advance_animations();
+
+    let obs = observe_scrolling(f.niri());
+    assert_ne!(
+        obs.maximize_transition,
+        MaximizeTransitionObservation::CommittedSettling,
+        "other tab commit must not advance target FSM: {obs:?}"
+    );
+    assert_ne!(obs.maximize_transition, MaximizeTransitionObservation::Idle);
+
+    // Target commit advances to CommittedSettling.
+    {
+        let win = f.client(id).window(&surface2);
+        let cfg = win.recent_configures().last().cloned().unwrap();
+        win.set_size(cfg.size.0.max(1) as u16, cfg.size.1.max(1) as u16);
+        win.ack_last_and_commit();
+    }
+    f.roundtrip(id);
+    set_time(f.niri(), Duration::from_millis(20));
+    f.niri().advance_animations();
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::CommittedSettling
+    );
+}
+
+/// Activated configure/ack/commit after maximize is valid cumulative serial progress, not a bug.
+#[test]
+fn f02_activated_configure_after_maximize_is_not_false_epoch_bug() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface1 = create_window(&mut f, id, 200, 200);
+    let surface2 = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface1).recent_configures();
+    let _ = f.client(id).window(&surface2).recent_configures();
+
+    let window1 = mapped_at(f.niri(), 0).window.clone();
+    let window2 = mapped_at(f.niri(), 1).window.clone();
+
+    f.niri().layout.activate_window(&window1);
+    f.niri().layout.set_maximized(&window1, true);
+    f.double_roundtrip(id);
+    let maximize_serial = f
+        .client(id)
+        .window(&surface1)
+        .configures_received
+        .last()
+        .unwrap()
+        .0;
+
+    // Focus away then back: may produce Activated configures with cumulative Maximized state.
+    f.niri().layout.activate_window(&window2);
+    f.double_roundtrip(id);
+    f.niri().layout.activate_window(&window1);
+    f.double_roundtrip(id);
+
+    let latest_serial = f
+        .client(id)
+        .window(&surface1)
+        .configures_received
+        .last()
+        .unwrap()
+        .0;
+
+    // FSM still active until settle (often TimedOutVisibleFallback after dispatch).
+    assert_ne!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::Idle,
+        "maximize visual transition must still be tracked"
+    );
+
+    // Commit latest (possibly Activated-only after maximize was already configured).
+    {
+        let win = f.client(id).window(&surface1);
+        let cfg = win.recent_configures().last().cloned().unwrap();
+        win.set_size(cfg.size.0.max(1) as u16, cfg.size.1.max(1) as u16);
+        win.ack_last_and_commit();
+    }
+    f.roundtrip(id);
+
+    let (committed, pending, _) = mapped_at(f.niri(), 0).test_maximize_commit_state();
+    assert!(
+        committed && pending,
+        "committing cumulative state after maximize must apply maximized; \
+         maximize_serial={maximize_serial} latest={latest_serial}"
+    );
+
+    set_time(f.niri(), Duration::from_millis(10));
+    f.niri().advance_animations();
+    assert_eq!(
+        observe_scrolling(f.niri()).maximize_transition,
+        MaximizeTransitionObservation::CommittedSettling,
+        "Activated commit after maximize is valid serial progress, not an epoch bug"
+    );
+}
+
 #[test]
 fn dual_output_fractional_scale_and_transform_fixture() {
     let mut f = Fixture::new();
@@ -493,7 +900,7 @@ fn maximize_pending_draws_minimize_restore_reverse_and_close() {
     let obs = observe_scrolling(f.niri());
     assert_eq!(
         obs.maximize_transition,
-        MaximizeTransitionObservation::Pending
+        MaximizeTransitionObservation::PendingConfigure
     );
     assert_no_invisible_progress(&obs);
     assert!(obs
@@ -622,7 +1029,7 @@ fn maximize_committed_still_draws_lifecycle_overlays() {
     let obs = observe_scrolling(f.niri());
     assert_eq!(
         obs.maximize_transition,
-        MaximizeTransitionObservation::Committed,
+        MaximizeTransitionObservation::CommittedSettling,
         "after client maximize commit: {obs:?}"
     );
     assert!(obs.policy.maximize_exclusive);
@@ -633,7 +1040,7 @@ fn maximize_committed_still_draws_lifecycle_overlays() {
     let obs = observe_scrolling(f.niri());
     assert_eq!(
         obs.maximize_transition,
-        MaximizeTransitionObservation::Committed
+        MaximizeTransitionObservation::CommittedSettling
     );
     assert_no_invisible_progress(&obs);
     let minimize = obs

@@ -32,7 +32,7 @@ fn maximize_transition_observation_tracks_pending_timeout_and_idle() {
     let obs = observe_active_scrolling(&layout);
     assert_eq!(
         obs.maximize_transition,
-        MaximizeTransitionObservation::Pending
+        MaximizeTransitionObservation::PendingConfigure
     );
     assert_eq!(obs.maximize_target, Some(1));
     // Empty overlay containers still report the production Draw policy.
@@ -44,7 +44,7 @@ fn maximize_transition_observation_tracks_pending_timeout_and_idle() {
     let obs = observe_active_scrolling(&layout);
     assert_eq!(
         obs.maximize_transition,
-        MaximizeTransitionObservation::TimedOut
+        MaximizeTransitionObservation::TimedOutVisibleFallback
     );
     assert_eq!(obs.maximize_target, None);
 
@@ -52,7 +52,7 @@ fn maximize_transition_observation_tracks_pending_timeout_and_idle() {
     let obs = observe_active_scrolling(&layout);
     assert_eq!(
         obs.maximize_transition,
-        MaximizeTransitionObservation::Committed
+        MaximizeTransitionObservation::CommittedSettling
     );
     assert_eq!(obs.maximize_target, Some(1));
 
@@ -102,7 +102,8 @@ fn maximize_ongoing_still_draws_lifecycle_overlay_policy() {
     assert!(
         matches!(
             obs.maximize_transition,
-            MaximizeTransitionObservation::Pending | MaximizeTransitionObservation::Committed
+            MaximizeTransitionObservation::PendingConfigure
+                | MaximizeTransitionObservation::CommittedSettling
         ),
         "maximize transition still ongoing: {:?}",
         obs.maximize_transition

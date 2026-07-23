@@ -4033,6 +4033,53 @@ fn maximize_transition_times_out_and_restarts_on_late_commit() {
     assert_eq!(tile_visibility(&layout), [(1, true), (2, true)]);
 }
 
+/// R08: 1000 ms is already TimedOutVisibleFallback; 999 ms still exclusive (unadjusted clock).
+#[test]
+fn maximize_pending_timeout_boundary_1000_ms_unadjusted() {
+    use crate::layout::scrolling::MaximizeTransitionObservation;
+
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusColumnLeft,
+        Op::MaximizeWindowToEdges { id: Some(1) },
+    ];
+
+    let mut layout = check_ops_with_options(linear_resize_options(), ops);
+    let observe = |layout: &Layout<TestWindow>| {
+        layout
+            .active_workspace()
+            .unwrap()
+            .scrolling()
+            .render_observation()
+    };
+
+    assert_eq!(
+        observe(&layout).maximize_transition,
+        MaximizeTransitionObservation::PendingConfigure
+    );
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
+
+    Op::AdvanceAnimations { msec_delta: 999 }.apply(&mut layout);
+    assert_eq!(
+        observe(&layout).maximize_transition,
+        MaximizeTransitionObservation::PendingConfigure
+    );
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, false)]);
+
+    Op::AdvanceAnimations { msec_delta: 1 }.apply(&mut layout);
+    assert_eq!(
+        observe(&layout).maximize_transition,
+        MaximizeTransitionObservation::TimedOutVisibleFallback
+    );
+    assert_eq!(tile_visibility(&layout), [(1, true), (2, true)]);
+}
+
 #[test]
 fn maximizing_inactive_tab_prioritizes_target_tile() {
     let ops = [

@@ -14,6 +14,7 @@ use super::closing_window::ClosingWindowRenderElement;
 use super::lifecycle_controller::{
     ClosingAnimationLane, LeaseEvent, LifecycleAnimDirection, MinimizeRestoreController,
 };
+use super::maximize_visual_fsm::{MaximizeVisualClear, MaximizeVisualFsm, MaximizeVisualPhase};
 use super::minimize_window_animation::MinimizeWindowAnimationRenderElement;
 use super::monitor::InsertPosition;
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
@@ -36,9 +37,6 @@ use crate::window::ResolvedWindowRules;
 
 /// Amount of touchpad movement to scroll the view for the width of one working area.
 const VIEW_GESTURE_WORKING_AREA_MOVEMENT: f64 = 1200.;
-
-/// Do not let an unresponsive client hide the rest of the workspace indefinitely.
-const MAXIMIZE_PENDING_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A scrollable-tiling space for windows.
 #[derive(Debug)]
@@ -77,8 +75,8 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// View offset to restore after unfullscreening or unmaximizing.
     view_offset_to_restore: Option<f64>,
 
-    /// Window that temporarily owns rendering while entering the maximized state.
-    maximize_transition: Option<MaximizeTransition<W::Id>>,
+    /// Visual maximize FSM: exclusivity + settle while entering maximized (not protocol sizing).
+    maximize_transition: Option<MaximizeVisualFsm<W::Id>>,
 
     /// Shared closing animation lane (policy + cleanup ownership).
     closing: ClosingAnimationLane,
@@ -299,14 +297,6 @@ struct MoveAnimation {
     from: f64,
 }
 
-#[derive(Debug)]
-struct MaximizeTransition<Id> {
-    window: Id,
-    started_at: Duration,
-    committed: bool,
-    timed_out: bool,
-}
-
 /// How an active lifecycle overlay lane is treated by the render policy.
 ///
 /// Every active closing/minimize/restore entry must map to exactly one of these actions.
@@ -397,13 +387,7 @@ pub struct LifecycleOverlayObservation<Id> {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaximizeTransitionObservation {
-    Idle,
-    Pending,
-    Committed,
-    TimedOut,
-}
+pub use super::maximize_visual_fsm::MaximizeTransitionObservation;
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
@@ -1235,9 +1219,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if self
             .maximize_transition
             .as_ref()
-            .is_some_and(|transition| transition.window == id)
+            .is_some_and(|transition| transition.targets(&id))
         {
-            self.maximize_transition = None;
+            self.clear_maximize_transition(MaximizeVisualClear::Cancelled);
         }
         // Tile is leaving this space; drop controller entry without applying Reveal.
         let _ = self.minimize_restore.clear(&id);
@@ -1359,9 +1343,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let removes_maximizing_window = self
             .maximize_transition
             .as_ref()
-            .is_some_and(|transition| self.columns[column_idx].contains(&transition.window));
+            .is_some_and(|transition| self.columns[column_idx].contains(transition.window()));
         if removes_maximizing_window {
-            self.maximize_transition = None;
+            self.clear_maximize_transition(MaximizeVisualClear::Cancelled);
         }
 
         // Animate movement of the other columns.
@@ -1610,9 +1594,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         if committed_maximize {
             if let Some(transition) = &mut self.maximize_transition {
-                if &transition.window == window {
-                    transition.committed = true;
-                    transition.timed_out = false;
+                if transition.targets(window) {
+                    // PendingConfigure | TimedOutVisibleFallback → CommittedSettling.
+                    transition.on_target_maximized_commit();
                 }
             }
         }
@@ -3281,9 +3265,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let cancels_maximize_transition = self
             .maximize_transition
             .as_ref()
-            .is_some_and(|transition| &transition.window == window);
+            .is_some_and(|transition| transition.targets(window));
         if is_fullscreen && cancels_maximize_transition {
-            self.maximize_transition = None;
+            self.clear_maximize_transition(MaximizeVisualClear::Cancelled);
         }
 
         if is_fullscreen == self.columns[col_idx].is_pending_fullscreen {
@@ -3291,7 +3275,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         if cancels_maximize_transition {
-            self.maximize_transition = None;
+            self.clear_maximize_transition(MaximizeVisualClear::Cancelled);
         }
 
         let mut col = &mut self.columns[col_idx];
@@ -3348,22 +3332,27 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.data[col_idx].update(col);
 
         if maximize {
-            let committed = col.tiles[tile_idx].sizing_mode().is_maximized();
-            self.maximize_transition = Some(MaximizeTransition {
-                window: window.clone(),
-                started_at: self.clock.now_unadjusted(),
-                committed,
-                timed_out: false,
-            });
+            // New request replaces any previous transition for this space (explicit cancel+begin).
+            let already_committed = col.tiles[tile_idx].sizing_mode().is_maximized();
+            self.maximize_transition = Some(MaximizeVisualFsm::begin(
+                window.clone(),
+                self.clock.now_unadjusted(),
+                already_committed,
+            ));
         } else if self
             .maximize_transition
             .as_ref()
-            .is_some_and(|transition| &transition.window == window)
+            .is_some_and(|transition| transition.targets(window))
         {
-            self.maximize_transition = None;
+            self.clear_maximize_transition(MaximizeVisualClear::Cancelled);
         }
 
         true
+    }
+
+    /// Drop the visual maximize FSM (Cancelled or Finished). Protocol sizing is unchanged.
+    fn clear_maximize_transition(&mut self, _reason: MaximizeVisualClear) {
+        self.maximize_transition = None;
     }
 
     pub fn render_above_top_layer(&self) -> bool {
@@ -3396,11 +3385,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
     fn maximizing_window_location(&self) -> Option<(usize, usize)> {
         let transition = self.maximize_transition.as_ref()?;
-        if transition.timed_out {
+        // Typed exclusivity: TimedOutVisibleFallback does not filter live tiles.
+        if !transition.exclusivity_active() {
             return None;
         }
 
-        let window = &transition.window;
+        let window = transition.window();
         self.columns
             .iter()
             .enumerate()
@@ -3435,9 +3425,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let rendered = policy.scrolling_lifecycle_overlays_are_rendered();
         let maximize_transition = match self.maximize_transition.as_ref() {
             None => MaximizeTransitionObservation::Idle,
-            Some(transition) if transition.timed_out => MaximizeTransitionObservation::TimedOut,
-            Some(transition) if transition.committed => MaximizeTransitionObservation::Committed,
-            Some(_) => MaximizeTransitionObservation::Pending,
+            Some(transition) => transition.observation(),
         };
         let maximize_target = self
             .maximizing_window_location()
@@ -3490,20 +3478,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 .enumerate()
                 .find_map(|(column_idx, column)| {
                     column
-                        .position(&transition.window)
+                        .position(transition.window())
                         .map(|tile_idx| (column_idx, tile_idx))
                 })
         else {
-            self.maximize_transition = None;
+            self.clear_maximize_transition(MaximizeVisualClear::Cancelled);
             return;
         };
 
         let column = &self.columns[column_idx];
         let tile = &column.tiles[tile_idx];
         let cancelled = !column.is_pending_maximized() || column.is_pending_fullscreen();
-        let timed_out = !transition.committed
-            && now.saturating_sub(transition.started_at) >= MAXIMIZE_PENDING_TIMEOUT;
-        let settled = transition.committed
+        let settled = transition.phase() == MaximizeVisualPhase::CommittedSettling
             && tile.sizing_mode().is_maximized()
             && !tile.are_transitions_ongoing()
             && self.view_offset.is_static()
@@ -3512,10 +3498,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 .iter()
                 .all(|column| column.move_animation.is_none());
 
-        if cancelled || settled {
-            self.maximize_transition = None;
-        } else if timed_out {
-            self.maximize_transition.as_mut().unwrap().timed_out = true;
+        if cancelled {
+            self.clear_maximize_transition(MaximizeVisualClear::Cancelled);
+        } else if settled {
+            self.clear_maximize_transition(MaximizeVisualClear::Finished);
+        } else if let Some(transition) = self.maximize_transition.as_mut() {
+            // PendingConfigure → TimedOutVisibleFallback (unadjusted clock).
+            transition.on_clock_tick(now);
         }
     }
 
@@ -4457,7 +4446,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             assert!(
                 self.columns
                     .iter()
-                    .any(|column| column.contains(&transition.window)),
+                    .any(|column| column.contains(transition.window())),
                 "maximizing window must be present in the layout"
             );
         }
