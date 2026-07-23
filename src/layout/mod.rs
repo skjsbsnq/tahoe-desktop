@@ -463,12 +463,10 @@ struct InteractiveMoveData<W: LayoutElement> {
     pub(self) output: Output,
     /// Current pointer position within output.
     pub(self) pointer_pos_within_output: Point<f64, Logical>,
-    /// Window column width.
-    pub(self) width: ColumnWidth,
-    /// Whether the window column was full-width.
-    pub(self) is_full_width: bool,
-    /// Whether the window targets the floating layout.
-    pub(self) is_floating: bool,
+    /// Placement and expanded-mode intent captured when the move started (and updated for
+    /// floating toggles). Uses the same transport as [`RemovedTile`] so drop/end reinsertion
+    /// does not re-derive pending intent from the window alone.
+    pub(self) transport: TileTransport,
     /// Pointer location within the visual window geometry as ratio from geometry size.
     ///
     /// This helps the pointer remain inside the window as it resizes.
@@ -549,15 +547,101 @@ pub enum ConfigureIntent {
     ShouldSend,
 }
 
-/// Tile that was just removed from the layout.
+/// Placement and expanded-mode intent that must survive a tile remove → add boundary.
+///
+/// Captured from the source column (or floating space) at remove time and applied when the
+/// tile is reinserted. Fullscreen and maximized are independent flags: both may be true so
+/// that unfullscreen restores maximized. Do not collapse them into a single `SizingMode`.
+///
+/// This is the sole transport for that intent across workspace/output moves — no side table
+/// keyed by window id.
+#[derive(Debug, Clone, Copy)]
+pub struct TileTransport {
+    /// Width of the source column (or a floating fixed-width stand-in).
+    width: ColumnWidth,
+    /// Whether the source column was full-width.
+    is_full_width: bool,
+    /// Source placement: floating vs scrolling.
+    is_floating: bool,
+    /// Column pending maximized. May be true together with `is_pending_fullscreen`.
+    is_pending_maximized: bool,
+    /// Column pending fullscreen.
+    is_pending_fullscreen: bool,
+}
+
+impl TileTransport {
+    /// Placement-only transport for brand-new windows.
+    ///
+    /// Expanded intent is derived from the window's pending sizing mode in column construction
+    /// when both pending flags are false.
+    pub fn for_new_window(width: ColumnWidth, is_full_width: bool, is_floating: bool) -> Self {
+        Self {
+            width,
+            is_full_width,
+            is_floating,
+            is_pending_maximized: false,
+            is_pending_fullscreen: false,
+        }
+    }
+
+    /// Capture from a floating space remove.
+    pub fn floating(width: ColumnWidth) -> Self {
+        Self {
+            width,
+            is_full_width: false,
+            is_floating: true,
+            is_pending_maximized: false,
+            is_pending_fullscreen: false,
+        }
+    }
+
+    /// Capture from a scrolling column remove (single-tile or expelled tile).
+    pub fn scrolling(
+        width: ColumnWidth,
+        is_full_width: bool,
+        is_pending_maximized: bool,
+        is_pending_fullscreen: bool,
+    ) -> Self {
+        Self {
+            width,
+            is_full_width,
+            is_floating: false,
+            is_pending_maximized,
+            is_pending_fullscreen,
+        }
+    }
+
+    pub fn width(self) -> ColumnWidth {
+        self.width
+    }
+
+    pub fn is_full_width(self) -> bool {
+        self.is_full_width
+    }
+
+    pub fn is_floating(self) -> bool {
+        self.is_floating
+    }
+
+    pub fn is_pending_maximized(self) -> bool {
+        self.is_pending_maximized
+    }
+
+    pub fn is_pending_fullscreen(self) -> bool {
+        self.is_pending_fullscreen
+    }
+
+    pub fn with_floating(mut self, is_floating: bool) -> Self {
+        self.is_floating = is_floating;
+        self
+    }
+}
+
+/// Tile that was just removed from the layout, with transport state for reinsertion.
 pub struct RemovedTile<W: LayoutElement> {
     tile: Tile<W>,
-    /// Width of the column the tile was in.
-    width: ColumnWidth,
-    /// Whether the column the tile was in was full-width.
-    is_full_width: bool,
-    /// Whether the tile was floating.
-    is_floating: bool,
+    /// Source placement + column expanded intent for lossless reinsertion.
+    transport: TileTransport,
 }
 
 /// Whether to activate a newly added window.
@@ -1273,9 +1357,7 @@ impl<W: LayoutElement> Layout<W> {
                     tile,
                     target,
                     activate,
-                    scrolling_width,
-                    is_full_width,
-                    is_floating,
+                    TileTransport::for_new_window(scrolling_width, is_full_width, is_floating),
                 );
 
                 // Set the default height for scrolling windows.
@@ -1321,9 +1403,7 @@ impl<W: LayoutElement> Layout<W> {
 
                         return Some(RemovedTile {
                             tile: move_.tile,
-                            width: move_.width,
-                            is_full_width: move_.is_full_width,
-                            is_floating: false,
+                            transport: move_.transport.with_floating(false),
                         });
                     }
                 }
@@ -2595,7 +2675,7 @@ impl<W: LayoutElement> Layout<W> {
                     assert_abs_diff_eq!(tile_pos.y, rounded_pos.y, epsilon = 1e-5);
 
                     if let Some(alpha) = &move_.tile.alpha_animation {
-                        if move_.is_floating {
+                        if move_.transport.is_floating() {
                             assert_eq!(
                                 alpha.anim.to(),
                                 1.,
@@ -2779,7 +2859,7 @@ impl<W: LayoutElement> Layout<W> {
                 dnd_scroll = Some((
                     move_.output.clone(),
                     move_.pointer_pos_within_output,
-                    !move_.is_floating,
+                    !move_.transport.is_floating(),
                 ));
             }
         }
@@ -2925,7 +3005,7 @@ impl<W: LayoutElement> Layout<W> {
                 }
 
                 // Keep advancing animations if we might need to scroll the view.
-                if !move_.is_floating || self.overview_open {
+                if !move_.transport.is_floating() || self.overview_open {
                     return true;
                 }
             }
@@ -3053,7 +3133,7 @@ impl<W: LayoutElement> Layout<W> {
                         .unwrap();
                     let pos_within_workspace =
                         (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
-                    let position = if move_.is_floating {
+                    let position = if move_.transport.is_floating() {
                         InsertPosition::Floating
                     } else {
                         ws.scrolling_insert_position(pos_within_workspace)
@@ -3072,7 +3152,7 @@ impl<W: LayoutElement> Layout<W> {
                     });
                 }
                 InsertWorkspace::NewAt(_) => {
-                    let position = if move_.is_floating {
+                    let position = if move_.transport.is_floating() {
                         InsertPosition::Floating
                     } else {
                         InsertPosition::NewColumn(0)
@@ -3318,10 +3398,12 @@ impl<W: LayoutElement> Layout<W> {
     pub fn toggle_window_floating(&mut self, window: Option<&W::Id>) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
-                move_.is_floating = !move_.is_floating;
+                move_.transport = move_
+                    .transport
+                    .with_floating(!move_.transport.is_floating());
 
                 // When going to floating, restore the floating window size.
-                if move_.is_floating {
+                if move_.transport.is_floating() {
                     let floating_size = move_.tile.floating_window_size;
                     let win = move_.tile.window_mut();
                     let mut size =
@@ -3381,7 +3463,7 @@ impl<W: LayoutElement> Layout<W> {
     pub fn set_window_floating(&mut self, window: Option<&W::Id>, floating: bool) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
-                if move_.is_floating != floating {
+                if move_.transport.is_floating() != floating {
                     self.toggle_window_floating(window);
                 }
                 return;
@@ -3553,9 +3635,7 @@ impl<W: LayoutElement> Layout<W> {
                 },
                 activate,
                 true,
-                removed.width,
-                removed.is_full_width,
-                removed.is_floating,
+                removed.transport,
             );
             if activate.map_smart(|| false) {
                 *active_monitor_idx = new_idx;
@@ -4363,9 +4443,7 @@ impl<W: LayoutElement> Layout<W> {
 
                 let RemovedTile {
                     mut tile,
-                    width,
-                    is_full_width,
-                    is_floating,
+                    transport,
                 } = self.remove_window(window, Transaction::new()).unwrap();
 
                 tile.stop_move_animations();
@@ -4384,7 +4462,7 @@ impl<W: LayoutElement> Layout<W> {
                     .adjusted_for_scale(scale);
                 tile.update_config(view_size, scale, Rc::new(options));
 
-                if is_floating {
+                if transport.is_floating() {
                     if let Some(restore_size) = tile.snap_restore_window_size.take() {
                         tile.floating_window_size = Some(restore_size);
                         tile.window_mut().request_size_once(restore_size, true);
@@ -4417,9 +4495,7 @@ impl<W: LayoutElement> Layout<W> {
                     tile,
                     output,
                     pointer_pos_within_output,
-                    width,
-                    is_full_width,
-                    is_floating,
+                    transport,
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
@@ -4558,7 +4634,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         // Unlock the view on the workspaces.
-        if !move_.is_floating {
+        if !move_.transport.is_floating() {
             for ws in self.workspaces_mut() {
                 ws.dnd_scroll_gesture_end();
             }
@@ -4593,7 +4669,7 @@ impl<W: LayoutElement> Layout<W> {
                                     .position(|ws| ws.id() == ws_id)
                                     .unwrap();
 
-                                let position = if move_.is_floating {
+                                let position = if move_.transport.is_floating() {
                                     InsertPosition::Floating
                                 } else {
                                     let pos_within_workspace =
@@ -4605,7 +4681,7 @@ impl<W: LayoutElement> Layout<W> {
                                 (position, Some(geo.loc))
                             }
                             InsertWorkspace::NewAt(_) => {
-                                let position = if move_.is_floating {
+                                let position = if move_.transport.is_floating() {
                                     InsertPosition::Floating
                                 } else {
                                     InsertPosition::NewColumn(0)
@@ -4623,7 +4699,7 @@ impl<W: LayoutElement> Layout<W> {
                         let ws = &mon.workspaces[0];
                         let ws_geo = mon.workspaces_render_geo().next().unwrap();
 
-                        let position = if move_.is_floating {
+                        let position = if move_.transport.is_floating() {
                             InsertPosition::Floating
                         } else {
                             ws.scrolling_insert_position(Point::from((0., 0.)))
@@ -4667,9 +4743,7 @@ impl<W: LayoutElement> Layout<W> {
                         },
                         ActivateWindow::Yes,
                         allow_to_activate_workspace,
-                        move_.width,
-                        move_.is_full_width,
-                        false,
+                        move_.transport.with_floating(false),
                     );
 
                     if let Some(ws) = mon.workspaces.iter_mut().find(|ws| ws.has_window(&win_id)) {
@@ -4677,7 +4751,7 @@ impl<W: LayoutElement> Layout<W> {
                         if let Some(tile) =
                             ws.tiles_mut().find(|tile| tile.window().id() == &win_id)
                         {
-                            tile.restore_to_floating = move_.is_floating;
+                            tile.restore_to_floating = move_.transport.is_floating();
                         }
                     } else {
                         error!("workspace missing window after top snap maximize insertion");
@@ -4700,9 +4774,7 @@ impl<W: LayoutElement> Layout<W> {
                                 },
                                 ActivateWindow::Yes,
                                 allow_to_activate_workspace,
-                                move_.width,
-                                move_.is_full_width,
-                                false,
+                                move_.transport.with_floating(false),
                             );
                         }
                         InsertPosition::InColumn(column_idx, tile_idx) => {
@@ -4798,9 +4870,7 @@ impl<W: LayoutElement> Layout<W> {
                                 },
                                 ActivateWindow::Yes,
                                 allow_to_activate_workspace,
-                                move_.width,
-                                move_.is_full_width,
-                                true,
+                                move_.transport.with_floating(true),
                             );
                         }
                     }
@@ -4833,9 +4903,7 @@ impl<W: LayoutElement> Layout<W> {
                     move_.tile,
                     WorkspaceAddWindowTarget::Auto,
                     ActivateWindow::Yes,
-                    move_.width,
-                    move_.is_full_width,
-                    move_.is_floating,
+                    move_.transport,
                 );
             }
         }
@@ -5464,7 +5532,7 @@ impl<W: LayoutElement> Layout<W> {
             let win = move_.tile.window_mut();
 
             win.set_active_in_column(true);
-            win.set_floating(move_.is_floating);
+            win.set_floating(move_.transport.is_floating());
             win.set_activated(true);
 
             win.set_interactive_resize(None);
@@ -5474,7 +5542,7 @@ impl<W: LayoutElement> Layout<W> {
             win.send_pending_configure();
             win.refresh();
 
-            ongoing_scrolling_dnd.get_or_insert(!move_.is_floating);
+            ongoing_scrolling_dnd.get_or_insert(!move_.transport.is_floating());
         } else if let Some(InteractiveMoveState::Starting { window_id, .. }) =
             &self.interactive_move
         {

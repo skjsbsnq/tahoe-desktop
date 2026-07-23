@@ -21,7 +21,7 @@ use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
     ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, MinimizeRect, Options,
-    RemovedTile,
+    RemovedTile, TileTransport,
 };
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
@@ -1045,8 +1045,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         col_idx: Option<usize>,
         tile: Tile<W>,
         activate: bool,
-        width: ColumnWidth,
-        is_full_width: bool,
+        transport: TileTransport,
         anim_config: Option<niri_config::Animation>,
     ) {
         let column = Column::new_with_tile(
@@ -1055,8 +1054,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             self.working_area,
             self.parent_area,
             self.scale,
-            width,
-            is_full_width,
+            transport,
         );
 
         self.add_column(col_idx, column, activate, anim_config);
@@ -1122,8 +1120,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         right_of: &W::Id,
         tile: Tile<W>,
         activate: bool,
-        width: ColumnWidth,
-        is_full_width: bool,
+        transport: TileTransport,
     ) {
         let right_of_idx = self
             .columns
@@ -1132,7 +1129,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .unwrap();
         let col_idx = right_of_idx + 1;
 
-        self.add_tile(Some(col_idx), tile, activate, width, is_full_width, None);
+        self.add_tile(Some(col_idx), tile, activate, transport, None);
     }
 
     pub fn add_column(
@@ -1250,9 +1247,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             let mut column = self.remove_column_by_idx(column_idx, anim_config);
             return RemovedTile {
                 tile: column.tiles.remove(tile_idx),
-                width: column.width,
-                is_full_width: column.is_full_width,
-                is_floating: false,
+                transport: TileTransport::scrolling(
+                    column.width,
+                    column.is_full_width,
+                    column.is_pending_maximized,
+                    column.is_pending_fullscreen,
+                ),
             };
         }
 
@@ -1302,9 +1302,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let tile = RemovedTile {
             tile,
-            width: column.width,
-            is_full_width: column.is_full_width,
-            is_floating: false,
+            transport: TileTransport::scrolling(
+                column.width,
+                column.is_full_width,
+                column.is_pending_maximized,
+                column.is_pending_fullscreen,
+            ),
         };
 
         #[allow(clippy::comparison_chain)] // What do you even want here?
@@ -2269,8 +2272,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 Some(target_column_idx),
                 removed.tile,
                 source_tile_was_active,
-                removed.width,
-                removed.is_full_width,
+                removed.transport,
                 Some(self.options.animations.window_movement.0),
             );
 
@@ -2363,8 +2365,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 Some(target_column_idx),
                 removed.tile,
                 source_tile_was_active,
-                removed.width,
-                removed.is_full_width,
+                removed.transport,
                 Some(self.options.animations.window_movement.0),
             );
 
@@ -2437,8 +2438,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             Some(target_col_idx),
             removed.tile,
             false,
-            removed.width,
-            removed.is_full_width,
+            removed.transport,
             Some(self.options.animations.window_movement.0),
         );
 
@@ -2540,8 +2540,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     Some(source_column_idx),
                     target_tile,
                     true,
-                    source_removed.width,
-                    source_removed.is_full_width,
+                    source_removed.transport,
                     None,
                 )
             } else {
@@ -4598,15 +4597,13 @@ impl WindowHeight {
 }
 
 impl<W: LayoutElement> Column<W> {
-    #[allow(clippy::too_many_arguments)]
     fn new_with_tile(
         tile: Tile<W>,
         view_size: Size<f64, Logical>,
         working_area: Rectangle<f64, Logical>,
         parent_area: Rectangle<f64, Logical>,
         scale: f64,
-        width: ColumnWidth,
-        is_full_width: bool,
+        transport: TileTransport,
     ) -> Self {
         let options = tile.options.clone();
 
@@ -4615,6 +4612,9 @@ impl<W: LayoutElement> Column<W> {
             .rules()
             .default_column_display
             .unwrap_or(options.layout.default_column_display);
+
+        let width = transport.width();
+        let is_full_width = transport.is_full_width();
 
         // Try to match width to a preset width. Consider the following case: a terminal (foot)
         // sizes itself to the terminal grid. We open it with default-column-width 0.5. It shrinks
@@ -4656,10 +4656,23 @@ impl<W: LayoutElement> Column<W> {
 
         rv.add_tile_at(0, tile);
 
-        match pending_sizing_mode {
-            SizingMode::Normal => (),
-            SizingMode::Maximized => rv.set_maximized(true),
-            SizingMode::Fullscreen => rv.set_fullscreen(true),
+        // Apply transport expanded intent first. Fullscreen and maximized are independent:
+        // both may be true so unfullscreen restores maximized. `SizingMode` alone cannot
+        // express that combination.
+        if transport.is_pending_fullscreen() {
+            rv.set_fullscreen(true);
+        }
+        if transport.is_pending_maximized() {
+            rv.set_maximized(true);
+        }
+        // Brand-new windows and floating→scrolling use placement-only transport (both
+        // pending flags false); derive expanded intent from the window pending mode.
+        if !transport.is_pending_fullscreen() && !transport.is_pending_maximized() {
+            match pending_sizing_mode {
+                SizingMode::Normal => (),
+                SizingMode::Maximized => rv.set_maximized(true),
+                SizingMode::Fullscreen => rv.set_fullscreen(true),
+            }
         }
 
         // Animate the tab indicator for new columns.

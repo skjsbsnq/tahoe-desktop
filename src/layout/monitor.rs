@@ -17,7 +17,9 @@ use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
     WorkspaceRenderElement,
 };
-use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
+use super::{
+    compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options, TileTransport,
+};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
@@ -528,9 +530,7 @@ impl<W: LayoutElement> Monitor<W> {
             target,
             activate,
             true,
-            width,
-            is_full_width,
-            is_floating,
+            TileTransport::for_new_window(width, is_full_width, is_floating),
         );
     }
 
@@ -557,7 +557,6 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn add_tile(
         &mut self,
         tile: Tile<W>,
@@ -565,15 +564,13 @@ impl<W: LayoutElement> Monitor<W> {
         activate: ActivateWindow,
         // FIXME: Refactor ActivateWindow enum to make this better.
         allow_to_activate_workspace: bool,
-        width: ColumnWidth,
-        is_full_width: bool,
-        is_floating: bool,
+        transport: TileTransport,
     ) {
         let (mut workspace_idx, target) = self.resolve_add_window_target(target);
 
         let workspace = &mut self.workspaces[workspace_idx];
 
-        workspace.add_tile(tile, target, activate, width, is_full_width, is_floating);
+        workspace.add_tile(tile, target, activate, transport);
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
@@ -810,9 +807,7 @@ impl<W: LayoutElement> Monitor<W> {
             },
             activate,
             true,
-            removed.width,
-            removed.is_full_width,
-            removed.is_floating,
+            removed.transport,
         );
     }
 
@@ -844,9 +839,7 @@ impl<W: LayoutElement> Monitor<W> {
             },
             activate,
             true,
-            removed.width,
-            removed.is_full_width,
-            removed.is_floating,
+            removed.transport,
         );
     }
 
@@ -897,9 +890,7 @@ impl<W: LayoutElement> Monitor<W> {
                 ActivateWindow::No
             },
             true,
-            removed.width,
-            removed.is_full_width,
-            removed.is_floating,
+            removed.transport,
         );
 
         if self.workspace_switch.is_none() {

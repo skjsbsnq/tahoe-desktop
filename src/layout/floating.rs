@@ -15,7 +15,7 @@ use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, MinimizeRect, Options, RemovedTile,
-    SizeFrac,
+    SizeFrac, TileTransport,
 };
 use crate::animation::Clock;
 use crate::layout::minimize_window_animation::MinimizeWindowAnimationRenderElement;
@@ -660,9 +660,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let width = ColumnWidth::Fixed(tile.tile_expected_or_current_size().w);
         RemovedTile {
             tile,
-            width,
-            is_full_width: false,
-            is_floating: true,
+            transport: TileTransport::floating(width),
         }
     }
 

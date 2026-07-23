@@ -25,7 +25,7 @@ use super::shadow::Shadow;
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
     ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, MinimizeRect,
-    Options, RemovedTile, SizeFrac,
+    Options, RemovedTile, SizeFrac, TileTransport,
 };
 use crate::animation::Clock;
 use crate::niri_render_elements;
@@ -603,12 +603,10 @@ impl<W: LayoutElement> Workspace<W> {
         mut tile: Tile<W>,
         target: WorkspaceAddWindowTarget<W>,
         activate: ActivateWindow,
-        width: ColumnWidth,
-        is_full_width: bool,
-        is_floating: bool,
+        transport: TileTransport,
     ) {
         self.enter_output_for_window(tile.window());
-        tile.restore_to_floating = is_floating;
+        tile.restore_to_floating = transport.is_floating();
 
         match target {
             WorkspaceAddWindowTarget::Auto => {
@@ -617,7 +615,7 @@ impl<W: LayoutElement> Workspace<W> {
 
                 // If the tile is pending maximized or fullscreen, open it in the scrolling layout
                 // where it can do that.
-                if is_floating && tile.window().pending_sizing_mode().is_normal() {
+                if transport.is_floating() && tile.window().pending_sizing_mode().is_normal() {
                     self.floating.add_tile(tile, activate);
 
                     if activate || self.scrolling.is_empty() {
@@ -625,7 +623,7 @@ impl<W: LayoutElement> Workspace<W> {
                     }
                 } else {
                     self.scrolling
-                        .add_tile(None, tile, activate, width, is_full_width, None);
+                        .add_tile(None, tile, activate, transport, None);
 
                     if activate {
                         self.floating_is_active = FloatingActive::No;
@@ -635,7 +633,7 @@ impl<W: LayoutElement> Workspace<W> {
             WorkspaceAddWindowTarget::NewColumnAt(col_idx) => {
                 let activate = activate.map_smart(|| false);
                 self.scrolling
-                    .add_tile(Some(col_idx), tile, activate, width, is_full_width, None);
+                    .add_tile(Some(col_idx), tile, activate, transport, None);
 
                 if activate {
                     self.floating_is_active = FloatingActive::No;
@@ -646,7 +644,7 @@ impl<W: LayoutElement> Workspace<W> {
 
                 let floating_has_window = self.floating.has_window(next_to);
 
-                if is_floating && tile.window().pending_sizing_mode().is_normal() {
+                if transport.is_floating() && tile.window().pending_sizing_mode().is_normal() {
                     if floating_has_window {
                         self.floating.add_tile_above(next_to, tile, activate);
                     } else {
@@ -675,14 +673,14 @@ impl<W: LayoutElement> Workspace<W> {
                     }
                 } else if floating_has_window {
                     self.scrolling
-                        .add_tile(None, tile, activate, width, is_full_width, None);
+                        .add_tile(None, tile, activate, transport, None);
 
                     if activate {
                         self.floating_is_active = FloatingActive::No;
                     }
                 } else {
                     self.scrolling
-                        .add_tile_right_of(next_to, tile, activate, width, is_full_width);
+                        .add_tile_right_of(next_to, tile, activate, transport);
 
                     if activate {
                         self.floating_is_active = FloatingActive::No;
@@ -1576,8 +1574,7 @@ impl<W: LayoutElement> Workspace<W> {
                 None,
                 removed.tile,
                 target_is_active,
-                removed.width,
-                removed.is_full_width,
+                removed.transport.with_floating(false),
                 None,
             );
             if target_is_active {

@@ -4246,12 +4246,110 @@ fn move_window_to_workspace_maximize_and_fullscreen() {
     let layout = check_ops(ops);
     let (_, win) = layout.windows().next().unwrap();
 
-    // Unfullscreening should return to maximized because the window was maximized before.
-    //
-    // FIXME: it currently doesn't because windows themselves can only be either fullscreen or
-    // maximized. So when a window is fullscreen, whether it is also maximized or not is stored in
-    // the column. MoveWindowToWorkspace removes the window from the column and this information is
-    // forgotten.
+    // R07: RemovedTile transport carries column pending maximized across single-window moves, so
+    // unfullscreen after MoveWindowToWorkspace restores maximized (same as whole-column move).
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+}
+
+/// Cross-output single-window move must also preserve fullscreen+maximized combo.
+#[test]
+fn move_window_to_output_maximize_and_fullscreen() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::MaximizeWindowToEdges { id: None },
+        Op::FullscreenWindow(1),
+        Op::MoveWindowToOutput {
+            window_id: Some(1),
+            output_id: 2,
+            target_ws_idx: None,
+        },
+        Op::FullscreenWindow(1),
+    ];
+
+    let layout = check_ops(ops);
+    let (_, win) = layout.windows().next().unwrap();
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+}
+
+/// Round-trip two workspace moves must not forget or accumulate expanded intent.
+#[test]
+fn move_window_to_workspace_maximize_fullscreen_round_trip() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::MaximizeWindowToEdges { id: None },
+        Op::FullscreenWindow(1),
+        Op::MoveWindowToWorkspaceDown(true),
+        Op::MoveWindowToWorkspaceUp(true),
+    ];
+
+    let mut layout = check_ops(ops);
+    let ws = layout.active_workspace().unwrap();
+    let col = ws.scrolling().columns().next().unwrap();
+    assert!(col.is_pending_fullscreen());
+    assert!(col.is_pending_maximized());
+
+    check_ops_on_layout(&mut layout, [Op::FullscreenWindow(1)]);
+    let (_, win) = layout.windows().next().unwrap();
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+}
+
+/// Tabbed column with max+fs: expel one tab must transport pending flags on the new column.
+#[test]
+fn expel_tab_preserves_maximize_under_fullscreen() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: None },
+        Op::ToggleColumnTabbedDisplay,
+        Op::MaximizeWindowToEdges { id: None },
+        Op::FullscreenWindow(1),
+        // Expel window 2 into its own column.
+        Op::ConsumeOrExpelWindowRight { id: Some(2) },
+    ];
+
+    let layout = check_ops(ops);
+    let ws = layout.active_workspace().unwrap();
+    let cols: Vec<_> = ws.scrolling().columns().collect();
+    assert!(cols.len() >= 2);
+    let col2 = cols
+        .iter()
+        .find(|col| col.contains(&2))
+        .expect("window 2 column");
+    // Tabbed column shared pending flags; expelled tile transport must carry max+fs.
+    assert!(
+        col2.is_pending_fullscreen() && col2.is_pending_maximized(),
+        "expelled tab must retain column pending fullscreen+maximized via TileTransport"
+    );
+}
+
+/// Pure floating move must not invent expanded intent from transport.
+#[test]
+fn floating_remove_transport_has_no_expanded_intent() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::ToggleWindowFloating { id: None },
+        Op::MoveWindowToWorkspaceDown(true),
+    ];
+
+    let layout = check_ops(ops);
+    let ws = layout.active_workspace().unwrap();
+    assert!(ws.is_floating(&1));
+    let (_, win) = layout.windows().next().unwrap();
     assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
 }
 
