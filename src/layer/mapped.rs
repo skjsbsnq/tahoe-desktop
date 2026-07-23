@@ -539,7 +539,6 @@ impl MappedLayer {
                 self.surface.namespace(),
                 location,
                 self.scale,
-                self.blur_config,
                 &self.tahoe_glass_config,
                 open_alpha,
                 crop_rect,
@@ -660,7 +659,6 @@ impl MappedLayer {
             self.surface.namespace(),
             location,
             self.scale,
-            self.blur_config,
             &self.tahoe_glass_config,
             surface_alpha,
             crop_rect,
@@ -876,9 +874,7 @@ fn close_animation_origin(
                 anchor.contains(smithay::wayland::shell::wlr_layer::Anchor::BOTTOM),
             ),
         ),
-        niri_config::animations::LayerAnimationOrigin::Pointer => {
-            pointer_origin.unwrap_or(center)
-        }
+        niri_config::animations::LayerAnimationOrigin::Pointer => pointer_origin.unwrap_or(center),
     };
 
     origin.to_physical_precise_round(output_scale)
@@ -1257,10 +1253,7 @@ mod tests {
 
     impl StubElement {
         fn new(geo: Rectangle<i32, Physical>) -> Self {
-            Self {
-                id: Id::new(),
-                geo,
-            }
+            Self { id: Id::new(), geo }
         }
     }
 
@@ -1432,7 +1425,10 @@ mod tests {
         let cropped =
             crop_policy_geometry(post, Some(crop), Some(post), CropPolicyKind::Content).unwrap();
         assert_eq!(cropped, post.intersection(crop).unwrap());
-        assert_ne!(cropped, post, "content must not draw outside reveal viewport");
+        assert_ne!(
+            cropped, post,
+            "content must not draw outside reveal viewport"
+        );
     }
 
     /// Padded glass / ExtraDamage must not expand the reveal crop the way shadow does.
@@ -1443,9 +1439,13 @@ mod tests {
         // Sample padding extends 16px past the panel.
         let padded = expand_rect_i32(surface, 16, 16, 16, 16);
 
-        let as_content =
-            crop_policy_geometry(padded, Some(crop), Some(surface), CropPolicyKind::PaddedGlass)
-                .unwrap();
+        let as_content = crop_policy_geometry(
+            padded,
+            Some(crop),
+            Some(surface),
+            CropPolicyKind::PaddedGlass,
+        )
+        .unwrap();
         let as_shadow =
             crop_policy_geometry(padded, Some(crop), Some(surface), CropPolicyKind::Shadow)
                 .unwrap();
@@ -1471,7 +1471,8 @@ mod tests {
         // Moving surface shifted up (edge-reveal from top).
         let moving_loc = Point::from((80., 20.));
         let pre_geo = Rectangle::new(moving_loc, size).to_physical_precise_round(output_scale);
-        let origin = (moving_loc + size.to_point().downscale(2.)).to_physical_precise_round(output_scale);
+        let origin =
+            (moving_loc + size.to_point().downscale(2.)).to_physical_precise_round(output_scale);
         let anim_scale = 0.6;
 
         let stub = StubElement::new(pre_geo);

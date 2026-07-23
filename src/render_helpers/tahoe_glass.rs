@@ -128,7 +128,6 @@ pub fn render_for_layer(
     namespace: &str,
     location: Point<f64, Logical>,
     scale: f64,
-    blur_config: niri_config::Blur,
     config: &TahoeGlass,
     layer_alpha: f32,
     draw_clip: Option<Rectangle<i32, Physical>>,
@@ -143,7 +142,6 @@ pub fn render_for_layer(
         namespace,
         location,
         scale,
-        blur_config,
         config,
         layer_alpha,
         draw_clip,
@@ -161,7 +159,6 @@ pub fn render_frozen_regions_for_layer(
     namespace: &str,
     location: Point<f64, Logical>,
     scale: f64,
-    blur_config: niri_config::Blur,
     config: &TahoeGlass,
     layer_alpha: f32,
     draw_clip: Option<Rectangle<i32, Physical>>,
@@ -176,7 +173,6 @@ pub fn render_frozen_regions_for_layer(
         namespace,
         location,
         scale,
-        blur_config,
         config,
         layer_alpha,
         draw_clip,
@@ -194,7 +190,6 @@ fn render_regions_for_layer(
     namespace: &str,
     location: Point<f64, Logical>,
     scale: f64,
-    blur_config: niri_config::Blur,
     config: &TahoeGlass,
     layer_alpha: f32,
     draw_clip: Option<Rectangle<i32, Physical>>,
@@ -236,11 +231,12 @@ fn render_regions_for_layer(
             .retain(|id, _| regions.iter().any(|region| region.id == *id));
 
         for region in regions.iter() {
+            // R13: material.kernel is the sole blur kernel owner for this region.
             let material = config.material(&region.material);
             let region_renderer = renderer
                 .regions
                 .entry(region.id)
-                .or_insert_with(|| TahoeGlassRegionRenderer::new(material));
+                .or_insert_with(|| TahoeGlassRegionRenderer::new(material.clone()));
 
             render_region(
                 ctx.r(),
@@ -250,7 +246,6 @@ fn render_regions_for_layer(
                 material,
                 location,
                 scale,
-                blur_config,
                 layer_alpha,
                 draw_clip,
                 xray_pos,
@@ -271,7 +266,6 @@ fn render_region(
     material: TahoeGlassMaterial,
     surface_location: Point<f64, Logical>,
     scale: f64,
-    blur_config: niri_config::Blur,
     layer_alpha: f32,
     draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
@@ -283,6 +277,9 @@ fn render_region(
     let rect = region.rect.to_f64();
     let geometry = Rectangle::new(surface_location + rect.loc, rect.size);
     let material_alpha = region.material_alpha.clamp(0., 1.) * layer_alpha.clamp(0., 1.);
+
+    // Parse-time resolved kernel (R13); not the global blur owner.
+    let blur_kernel = material.kernel;
 
     let mut effect = material.background_effect;
     if !region.flags.blur {
@@ -314,7 +311,7 @@ fn render_region(
         effect.lens_depth = boost(effect.lens_depth);
     }
 
-    let sample_padding = glass_sample_padding(region, effect, blur_config);
+    let sample_padding = glass_sample_padding(region, effect, blur_kernel);
     // Capture/sample geometry may expand beyond the protocol region so blur
     // and refraction have enough context. Draw/visible geometry must stay
     // exactly on the protocol region — sample padding must never become a
@@ -345,14 +342,14 @@ fn render_region(
         "rendering Tahoe glass region"
     );
 
-    // R12: same ResolvedEffectPlan builder as window/layer tiles.
+    // R12/R13: plan uses the material's resolved kernel only.
     let has_blur_region = region.flags.blur;
     let visual =
-        ResolvedEffectPlan::visual_key(blur_config, effect, has_blur_region, visible_radius);
+        ResolvedEffectPlan::visual_key(blur_kernel, effect, has_blur_region, visible_radius);
     renderer.background_effect.note_plan_visual(visual);
 
     if let Some(plan) =
-        ResolvedEffectPlan::build(blur_config, effect, has_blur_region, visible_radius, params)
+        ResolvedEffectPlan::build(blur_kernel, effect, has_blur_region, visible_radius, params)
     {
         let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
         renderer

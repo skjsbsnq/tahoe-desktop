@@ -34,6 +34,7 @@ pub mod binds;
 pub mod debug;
 pub mod error;
 pub mod gestures;
+pub mod glass_schema;
 pub mod input;
 pub mod layer_rule;
 pub mod layout;
@@ -58,7 +59,10 @@ pub use crate::misc::*;
 pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
-pub use crate::tahoe_glass::{TahoeGlass, TahoeGlassMaterial, TahoeGlassPart};
+pub use crate::tahoe_glass::{
+    BlurKernelPart, ResolvedGlassMaterial, TahoeGlass, TahoeGlassMaterial, TahoeGlassPart,
+    DEFAULT_BLUR_KERNEL_NAME, GLASS_MATERIAL_NAMES, GLASS_SETTINGS_FIELDS,
+};
 pub use crate::utils::FloatOrInt;
 use crate::utils::{Flag, MergeWith as _};
 pub use crate::window_rule::{
@@ -82,7 +86,11 @@ pub struct Config {
     pub hotkey_overlay: HotkeyOverlay,
     pub config_notification: ConfigNotification,
     pub animations: Animations,
+    /// Default blur kernel (top-level `blur { }`). Reserved name `default`.
     pub blur: Blur,
+    /// Additional named blur kernels from `blur-kernel "name" { }`.
+    /// Must not contain the reserved name `default`.
+    pub blur_kernels: std::collections::BTreeMap<String, Blur>,
     pub tahoe_glass: TahoeGlass,
     pub gestures: Gestures,
     pub overview: Overview,
@@ -169,6 +177,7 @@ where
                     | "layer-rule"
                     | "workspace"
                     | "include"
+                    | "blur-kernel"
             ) && !seen.insert(name)
             {
                 ctx.emit_error(DecodeError::unexpected(
@@ -201,6 +210,31 @@ where
                 "config-notification" => m_merge!(config_notification),
                 "animations" => m_merge!(animations),
                 "blur" => m_merge!(blur),
+                "blur-kernel" => {
+                    let part = BlurKernelPart::decode_node(node, ctx)?;
+                    if part.name == DEFAULT_BLUR_KERNEL_NAME {
+                        ctx.emit_error(DecodeError::unexpected(
+                            node,
+                            "node",
+                            format!(
+                                "blur-kernel name `{DEFAULT_BLUR_KERNEL_NAME}` is reserved for the top-level blur block"
+                            ),
+                        ));
+                    } else if part.name.is_empty() {
+                        ctx.emit_error(DecodeError::unexpected(
+                            node,
+                            "node",
+                            "blur-kernel name must not be empty",
+                        ));
+                    } else {
+                        let mut config = config.borrow_mut();
+                        config
+                            .blur_kernels
+                            .entry(part.name.clone())
+                            .or_default()
+                            .merge_with(&part.to_blur_part());
+                    }
+                }
                 "tahoe-glass" => m_merge!(tahoe_glass),
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
@@ -459,11 +493,55 @@ where
             }
         }
 
+        // Named blur kernels and material → kernel binding resolve only after all
+        // includes/sections in this decode unit have merged. Inheritance does not
+        // continue at render time.
+        if recursion == 0 {
+            let mut config = config.borrow_mut();
+            for message in config.resolve_named_blur_kernels() {
+                ctx.emit_error(DecodeError::MissingNode { message });
+            }
+        }
+
         Ok(Self)
     }
 }
 
 impl Config {
+    /// Bind each material's `kernel` from its `kernel_name` and the default/
+    /// named kernel tables. Returns human-readable error messages (empty = ok).
+    ///
+    /// Called once after the root config document finishes merging so render
+    /// paths never re-select kernels from a parallel global blur owner.
+    pub fn resolve_named_blur_kernels(&mut self) -> Vec<String> {
+        use crate::tahoe_glass::lookup_blur_kernel;
+
+        let mut errors = Vec::new();
+
+        if self.blur_kernels.contains_key(DEFAULT_BLUR_KERNEL_NAME) {
+            errors.push(format!(
+                "blur-kernel name `{DEFAULT_BLUR_KERNEL_NAME}` is reserved for the top-level blur block"
+            ));
+            self.blur_kernels.remove(DEFAULT_BLUR_KERNEL_NAME);
+        }
+
+        let default_kernel = self.blur;
+        let named = &self.blur_kernels;
+
+        for (material_name, material) in &mut self.tahoe_glass.materials {
+            let ref_name = material
+                .kernel_name
+                .as_deref()
+                .unwrap_or(DEFAULT_BLUR_KERNEL_NAME);
+            match lookup_blur_kernel(ref_name, default_kernel, named) {
+                Ok(kernel) => material.kernel = kernel,
+                Err(msg) => errors.push(format!("tahoe-glass material `{material_name}`: {msg}")),
+            }
+        }
+
+        errors
+    }
+
     pub fn load_default() -> Self {
         let res = Config::parse(
             Path::new("default-config.kdl"),
@@ -715,10 +793,7 @@ mod tests {
         assert!(close_preset.contains("0.97"));
 
         let inline = "vec4 open_color(vec3 coords_geo, vec3 size_geo) { return vec4(1.0); }";
-        assert_eq!(
-            resolve_open_shader(Some(inline)).as_deref(),
-            Some(inline)
-        );
+        assert_eq!(resolve_open_shader(Some(inline)).as_deref(), Some(inline));
 
         let config = do_parse(
             r#"
@@ -732,8 +807,16 @@ mod tests {
             }
             "#,
         );
-        let open_resolved = config.animations.window_open.resolved_custom_shader().unwrap();
-        let close_resolved = config.animations.window_close.resolved_custom_shader().unwrap();
+        let open_resolved = config
+            .animations
+            .window_open
+            .resolved_custom_shader()
+            .unwrap();
+        let close_resolved = config
+            .animations
+            .window_close
+            .resolved_custom_shader()
+            .unwrap();
         assert!(open_resolved.contains("open_color"));
         assert!(close_resolved.contains("close_color"));
         // Stored value remains the short name; resolution is at compile time.
@@ -2300,6 +2383,7 @@ mod tests {
                 noise: 0.02,
                 saturation: 1.5,
             },
+            blur_kernels: {},
             tahoe_glass: TahoeGlass {
                 allow_namespaces: [
                     RegexEq(
@@ -2374,6 +2458,14 @@ mod tests {
                             },
                             inactive_color: None,
                         },
+                        kernel_name: None,
+                        kernel: Blur {
+                            off: false,
+                            passes: 3,
+                            offset: 3.0,
+                            noise: 0.02,
+                            saturation: 1.5,
+                        },
                     },
                     "dock": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
@@ -2439,6 +2531,14 @@ mod tests {
                                 a: 0.27,
                             },
                             inactive_color: None,
+                        },
+                        kernel_name: None,
+                        kernel: Blur {
+                            off: false,
+                            passes: 3,
+                            offset: 3.0,
+                            noise: 0.02,
+                            saturation: 1.5,
                         },
                     },
                     "launcher": TahoeGlassMaterial {
@@ -2506,6 +2606,14 @@ mod tests {
                             },
                             inactive_color: None,
                         },
+                        kernel_name: None,
+                        kernel: Blur {
+                            off: false,
+                            passes: 3,
+                            offset: 3.0,
+                            noise: 0.02,
+                            saturation: 1.5,
+                        },
                     },
                     "menu": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
@@ -2571,6 +2679,14 @@ mod tests {
                                 a: 0.27,
                             },
                             inactive_color: None,
+                        },
+                        kernel_name: None,
+                        kernel: Blur {
+                            off: false,
+                            passes: 3,
+                            offset: 3.0,
+                            noise: 0.02,
+                            saturation: 1.5,
                         },
                     },
                     "panel": TahoeGlassMaterial {
@@ -2638,6 +2754,14 @@ mod tests {
                             },
                             inactive_color: None,
                         },
+                        kernel_name: None,
+                        kernel: Blur {
+                            off: false,
+                            passes: 3,
+                            offset: 3.0,
+                            noise: 0.02,
+                            saturation: 1.5,
+                        },
                     },
                     "pill": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
@@ -2704,6 +2828,14 @@ mod tests {
                             },
                             inactive_color: None,
                         },
+                        kernel_name: None,
+                        kernel: Blur {
+                            off: false,
+                            passes: 3,
+                            offset: 3.0,
+                            noise: 0.02,
+                            saturation: 1.5,
+                        },
                     },
                     "toast": TahoeGlassMaterial {
                         background_effect: BackgroundEffect {
@@ -2769,6 +2901,14 @@ mod tests {
                                 a: 0.27,
                             },
                             inactive_color: None,
+                        },
+                        kernel_name: None,
+                        kernel: Blur {
+                            off: false,
+                            passes: 3,
+                            offset: 3.0,
+                            noise: 0.02,
+                            saturation: 1.5,
                         },
                     },
                 },

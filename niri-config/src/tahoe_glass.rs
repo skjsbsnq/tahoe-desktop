@@ -1,9 +1,26 @@
 use std::collections::BTreeMap;
 
 use crate::appearance::{
-    BackgroundEffect, BackgroundEffectRule, Color, Shadow, ShadowOffset, ShadowRule,
+    BackgroundEffect, BackgroundEffectRule, Blur, Color, Shadow, ShadowOffset, ShadowRule,
 };
 use crate::utils::{FloatOrInt, MergeWith, RegexEq};
+
+/// Reserved name of the kernel owned by the top-level `blur { }` block.
+pub const DEFAULT_BLUR_KERNEL_NAME: &str = "default";
+
+/// Built-in Tahoe glass material names (stable vocabulary for Shell and config).
+pub const GLASS_MATERIAL_NAMES: &[&str] = &[
+    "panel", "pill", "launcher", "dock", "menu", "toast", "backdrop",
+];
+
+/// Settings-tool editable material fields (KDL leaf names).
+pub const GLASS_SETTINGS_FIELDS: &[&str] = &[
+    "edge-highlight",
+    "refraction",
+    "inner-shadow",
+    "chromatic",
+    "lens-depth",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TahoeGlass {
@@ -11,10 +28,40 @@ pub struct TahoeGlass {
     pub materials: BTreeMap<String, TahoeGlassMaterial>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Config-time material with a fully resolved blur kernel after
+/// [`Config::resolve_named_blur_kernels`](crate::Config::resolve_named_blur_kernels).
+///
+/// Inheritance (kernel name → kernel body, material field merges) happens only
+/// during config parse. Render paths must not re-merge a global blur onto this.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TahoeGlassMaterial {
     pub background_effect: BackgroundEffect,
     pub shadow: Shadow,
+    /// Named kernel reference from KDL (`blur-kernel "name"`). `None` or
+    /// `"default"` selects the top-level `blur { }` block.
+    pub kernel_name: Option<String>,
+    /// Fully resolved kernel body (parse-time only).
+    pub kernel: Blur,
+}
+
+/// Immutable resolved glass material for render / golden tests.
+///
+/// Built only from parse-time resolution; not a second schema.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedGlassMaterial {
+    pub kernel: Blur,
+    pub effect: BackgroundEffect,
+    pub shadow: Shadow,
+}
+
+impl From<&TahoeGlassMaterial> for ResolvedGlassMaterial {
+    fn from(material: &TahoeGlassMaterial) -> Self {
+        Self {
+            kernel: material.kernel,
+            effect: material.background_effect,
+            shadow: material.shadow,
+        }
+    }
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
@@ -32,6 +79,9 @@ pub struct TahoeGlassAllowNamespace(#[knuffel(argument, str)] pub RegexEq);
 pub struct TahoeGlassMaterialRule {
     #[knuffel(argument, str)]
     pub name: String,
+    /// Optional named blur kernel (`blur-kernel "soft"`). Omitted → default.
+    #[knuffel(child, unwrap(argument, str))]
+    pub blur_kernel: Option<String>,
     #[knuffel(child, unwrap(argument))]
     pub xray: Option<bool>,
     #[knuffel(child, unwrap(argument))]
@@ -60,13 +110,50 @@ pub struct TahoeGlassMaterialRule {
     pub shadow: ShadowRule,
 }
 
+/// Top-level `blur-kernel "name" { ... }` part (body matches `blur { }`).
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct BlurKernelPart {
+    #[knuffel(argument, str)]
+    pub name: String,
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub passes: Option<u8>,
+    #[knuffel(child, unwrap(argument))]
+    pub offset: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub noise: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub saturation: Option<FloatOrInt<0, 1000>>,
+}
+
+impl BlurKernelPart {
+    pub fn to_blur_part(&self) -> crate::appearance::BlurPart {
+        crate::appearance::BlurPart {
+            off: self.off,
+            on: self.on,
+            passes: self.passes,
+            offset: self.offset,
+            noise: self.noise,
+            saturation: self.saturation,
+        }
+    }
+}
+
 impl TahoeGlass {
     pub fn material(&self, name: &str) -> TahoeGlassMaterial {
         self.materials
             .get(name)
             .or_else(|| self.materials.get("panel"))
-            .copied()
+            .cloned()
             .unwrap_or_default()
+    }
+
+    /// Fully resolved material for render/golden (kernel already bound).
+    pub fn resolved(&self, name: &str) -> ResolvedGlassMaterial {
+        ResolvedGlassMaterial::from(&self.material(name))
     }
 
     pub fn namespace_allowed(&self, namespace: &str) -> bool {
@@ -170,6 +257,8 @@ impl Default for TahoeGlassMaterial {
                 color: Color::new_unpremul(0., 0., 0., 0.27),
                 ..Default::default()
             },
+            kernel_name: None,
+            kernel: Blur::default(),
         }
     }
 }
@@ -195,6 +284,9 @@ impl MergeWith<TahoeGlassPart> for TahoeGlass {
 
 impl MergeWith<TahoeGlassMaterialRule> for TahoeGlassMaterial {
     fn merge_with(&mut self, part: &TahoeGlassMaterialRule) {
+        if let Some(name) = &part.blur_kernel {
+            self.kernel_name = Some(name.clone());
+        }
         self.background_effect.merge_with(&BackgroundEffectRule {
             xray: part.xray,
             blur: part.blur,
@@ -213,9 +305,25 @@ impl MergeWith<TahoeGlassMaterialRule> for TahoeGlassMaterial {
     }
 }
 
+/// Look up a named kernel: reserved `default` → top-level blur; else named map.
+pub fn lookup_blur_kernel<'a>(
+    name: &str,
+    default_kernel: Blur,
+    named: &'a BTreeMap<String, Blur>,
+) -> Result<Blur, String> {
+    if name == DEFAULT_BLUR_KERNEL_NAME {
+        return Ok(default_kernel);
+    }
+    named.get(name).copied().ok_or_else(|| {
+        format!(
+            "unknown blur-kernel `{name}` (define `blur-kernel \"{name}\" {{ ... }}` or use `{DEFAULT_BLUR_KERNEL_NAME}`)"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TahoeGlass;
+    use super::*;
     use crate::Config;
 
     #[test]
@@ -244,6 +352,11 @@ mod tests {
                 config.material(material).background_effect.xray,
                 Some(false),
                 "{material} should sample the live composed framebuffer"
+            );
+            assert_eq!(
+                config.material(material).kernel,
+                Blur::default(),
+                "{material} default kernel matches Blur::default before resolve"
             );
         }
     }
@@ -293,5 +406,125 @@ mod tests {
         assert_eq!(material.background_effect.lens_depth, Some(0.04));
         assert!(material.shadow.on);
         assert_eq!(material.shadow.softness, 28.);
+        // Unreferenced materials use default kernel = top-level blur (defaults).
+        assert_eq!(material.kernel, config.blur);
+    }
+
+    #[test]
+    fn named_kernel_isolates_dock_from_panel() {
+        let config = Config::parse_mem(
+            r##"
+            blur {
+                passes 4
+                offset 4
+                noise 0.004
+                saturation 1.22
+            }
+
+            blur-kernel "dock-soft" {
+                passes 1
+                offset 1
+                noise 0.001
+                saturation 1.0
+            }
+
+            tahoe-glass {
+                material "dock" {
+                    blur-kernel "dock-soft"
+                    edge-highlight 0.18
+                }
+                material "panel" {
+                    edge-highlight 0.14
+                }
+            }
+            "##,
+        )
+        .unwrap();
+
+        let dock = config.tahoe_glass.resolved("dock");
+        let panel = config.tahoe_glass.resolved("panel");
+        let toast = config.tahoe_glass.resolved("toast");
+
+        assert_eq!(dock.kernel.passes, 1);
+        assert_eq!(dock.kernel.offset, 1.0);
+        assert_eq!(panel.kernel.passes, 4);
+        assert_eq!(panel.kernel.offset, 4.0);
+        assert_eq!(toast.kernel, panel.kernel);
+        assert_ne!(dock.kernel, panel.kernel);
+    }
+
+    #[test]
+    fn old_blur_only_config_binds_all_materials_to_default_kernel() {
+        let config = Config::parse_mem(
+            r##"
+            blur {
+                passes 7
+                offset 9
+                noise 0.01
+                saturation 1.3
+            }
+            "##,
+        )
+        .unwrap();
+
+        for name in GLASS_MATERIAL_NAMES {
+            let resolved = config.tahoe_glass.resolved(name);
+            assert_eq!(resolved.kernel, config.blur, "{name}");
+            assert_eq!(resolved.kernel.passes, 7);
+        }
+    }
+
+    #[test]
+    fn unknown_kernel_reference_is_config_error() {
+        let err = Config::parse_mem(
+            r##"
+            tahoe-glass {
+                material "dock" {
+                    blur-kernel "does-not-exist"
+                }
+            }
+            "##,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("does-not-exist") || format!("{err}").contains("does-not-exist"),
+            "error should mention unknown kernel, got {err}"
+        );
+    }
+
+    #[test]
+    fn reserved_default_kernel_name_cannot_be_redefined() {
+        let err = Config::parse_mem(
+            r##"
+            blur-kernel "default" {
+                passes 2
+            }
+            "##,
+        )
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("default") || format!("{err:?}").contains("default"),
+            "error should reject reserved name, got {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_default_kernel_name_on_material_uses_top_level_blur() {
+        let config = Config::parse_mem(
+            r##"
+            blur {
+                passes 5
+            }
+            tahoe-glass {
+                material "panel" {
+                    blur-kernel "default"
+                }
+            }
+            "##,
+        )
+        .unwrap();
+        assert_eq!(config.tahoe_glass.resolved("panel").kernel.passes, 5);
     }
 }
