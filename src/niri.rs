@@ -2186,6 +2186,9 @@ impl State {
                 }
                 found = true;
                 window_output = mapped_output.cloned();
+                // Protocol last-hint fact: only Resolved is exposed here. Unresolved/Cleared
+                // yield no cache. Wrong-output and zero-area are still stored but filtered
+                // at animation consumption below (must not resurrect earlier rectangles).
                 if let Some(rect) = mapped.foreign_toplevel_rect() {
                     cached_anchor = Some(MinimizeRect {
                         output: rect.output.clone(),
@@ -2202,17 +2205,22 @@ impl State {
             LifecycleAnchorInput::Explicit(rect) => Some(rect),
             LifecycleAnchorInput::CachedForCurrentOutput => {
                 match (cached_anchor, window_output.as_ref()) {
-                    (Some(rect), Some(output)) if &rect.output == output => Some(rect),
+                    (Some(rect), Some(output))
+                        if &rect.output == output && !rect.rect.is_empty() =>
+                    {
+                        Some(rect)
+                    }
                     (Some(rect), _) => {
                         debug!(
                             source = ?command.source,
                             cached_output = %rect.output.name(),
+                            empty = rect.rect.is_empty(),
                             window_output = %window_output
                                 .as_ref()
                                 .map(|o| o.name())
                                 .unwrap_or_else(|| String::from("<none>")),
-                            "lifecycle command: cached anchor wrong-output or missing window \
-                             output; degrading to no-anchor"
+                            "lifecycle command: cached anchor wrong-output, zero-area, or \
+                             missing window output; degrading to no-anchor"
                         );
                         None
                     }

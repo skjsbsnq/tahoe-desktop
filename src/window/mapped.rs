@@ -23,7 +23,7 @@ use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
 use crate::handlers::KdeDecorationsModeState;
-use crate::layout::coords::OutputLocalRect;
+use crate::layout::coords::{OutputLocalRect, SurfaceLocalRect};
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
     LayoutElementRenderSnapshot, SizingMode,
@@ -48,6 +48,19 @@ use crate::utils::{
     ResizeEdge,
 };
 
+/// Why a legal non-delete `set_rectangle` could not become a resolved output-local hint.
+///
+/// The request still replaces any prior last-hint (protocol single-value semantics); it is
+/// never treated as “keep the previous rectangle”.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignToplevelRectUnresolvedReason {
+    /// Source layer/root is not currently mapped on any output.
+    SourceNotMapped,
+    /// Surface-local + layer geometry would overflow `i32`.
+    CoordinateOverflow,
+}
+
+/// Resolved last rectangle: output-local Dock geometry usable for Genie when output matches.
 #[derive(Debug, Clone)]
 pub struct ForeignToplevelRect {
     pub source_surface: WlSurface,
@@ -55,6 +68,56 @@ pub struct ForeignToplevelRect {
     pub output: Output,
     /// Dock icon geometry in **output-local** logical coordinates (layer geo + surface-local).
     pub rect: OutputLocalRect,
+    /// Monotonic generation for this window's last-hint slot (detects stale source cleanup).
+    pub generation: u64,
+}
+
+/// Last non-delete request that could not be resolved to an output-local rect.
+#[derive(Debug, Clone)]
+pub struct ForeignToplevelRectUnresolved {
+    pub source_surface: WlSurface,
+    pub source_root_surface: WlSurface,
+    pub surface_local_rect: SurfaceLocalRect,
+    pub generation: u64,
+    pub reason: ForeignToplevelRectUnresolvedReason,
+}
+
+/// Single typed last-hint slot for wlr `set_rectangle` (protocol: only the last rectangle).
+///
+/// `Cleared` is distinct from `Unresolved`: delete (`0×0`) and matching source destroy/unmap
+/// produce `Cleared`; a legal request that cannot be resolved produces `Unresolved` and still
+/// replaces any prior value. There is no per-output history and no “last usable” fallback.
+#[derive(Debug, Clone)]
+pub enum ForeignToplevelRectHint {
+    Cleared,
+    Unresolved(ForeignToplevelRectUnresolved),
+    Resolved(ForeignToplevelRect),
+}
+
+impl ForeignToplevelRectHint {
+    pub fn is_cleared(&self) -> bool {
+        matches!(self, Self::Cleared)
+    }
+
+    /// Resolved non-empty rect when its output matches the window's current output.
+    pub fn resolved_for_current_output(&self, output: &Output) -> Option<&ForeignToplevelRect> {
+        match self {
+            Self::Resolved(rect) if &rect.output == output && !rect.rect.is_empty() => Some(rect),
+            _ => None,
+        }
+    }
+
+    fn source_matches(&self, source_surface: &WlSurface) -> bool {
+        match self {
+            Self::Cleared => false,
+            Self::Unresolved(u) => {
+                u.source_surface == *source_surface || u.source_root_surface == *source_surface
+            }
+            Self::Resolved(r) => {
+                r.source_surface == *source_surface || r.source_root_surface == *source_surface
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -110,8 +173,10 @@ pub struct Mapped {
     /// Whether this window is minimized.
     is_minimized: bool,
 
-    /// Last rectangle provided through wlr foreign-toplevel set_rectangle.
-    foreign_toplevel_rect: Option<ForeignToplevelRect>,
+    /// Typed last-hint from wlr foreign-toplevel `set_rectangle` (single slot, no history).
+    foreign_toplevel_rect: ForeignToplevelRectHint,
+    /// Generation counter for last-hint writes (source identity / stale cleanup).
+    foreign_toplevel_rect_generation: u64,
 
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
@@ -306,7 +371,8 @@ impl Mapped {
             is_active_in_column: true,
             is_floating: false,
             is_minimized: false,
-            foreign_toplevel_rect: None,
+            foreign_toplevel_rect: ForeignToplevelRectHint::Cleared,
+            foreign_toplevel_rect_generation: 0,
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
@@ -416,24 +482,39 @@ impl Mapped {
         )
     }
 
+    /// Full typed last-hint slot (Cleared | Unresolved | Resolved).
+    pub fn foreign_toplevel_rect_hint(&self) -> &ForeignToplevelRectHint {
+        &self.foreign_toplevel_rect
+    }
+
+    /// Resolved last rectangle only (`None` for Cleared or Unresolved).
     pub fn foreign_toplevel_rect(&self) -> Option<&ForeignToplevelRect> {
-        self.foreign_toplevel_rect.as_ref()
-    }
-
-    pub fn set_foreign_toplevel_rect(&mut self, rect: Option<ForeignToplevelRect>) {
-        self.foreign_toplevel_rect = rect;
-    }
-
-    pub fn clear_foreign_toplevel_rect_for_source(&mut self, source_surface: &WlSurface) -> bool {
-        let should_clear = self.foreign_toplevel_rect.as_ref().is_some_and(|rect| {
-            rect.source_surface == *source_surface || rect.source_root_surface == *source_surface
-        });
-
-        if should_clear {
-            self.foreign_toplevel_rect = None;
+        match &self.foreign_toplevel_rect {
+            ForeignToplevelRectHint::Resolved(rect) => Some(rect),
+            ForeignToplevelRectHint::Cleared | ForeignToplevelRectHint::Unresolved(_) => None,
         }
+    }
 
-        should_clear
+    /// Replace the last-hint slot with a new typed value (always advances generation).
+    pub fn set_foreign_toplevel_rect_hint(&mut self, hint: ForeignToplevelRectHint) {
+        self.foreign_toplevel_rect = hint;
+    }
+
+    /// Allocate the next generation for a last-hint write on this window.
+    pub fn next_foreign_toplevel_rect_generation(&mut self) -> u64 {
+        self.foreign_toplevel_rect_generation =
+            self.foreign_toplevel_rect_generation.wrapping_add(1);
+        self.foreign_toplevel_rect_generation
+    }
+
+    /// Clear only when the destroyed/unmapped source matches the current slot's source/root.
+    /// Old source cleanup must not wipe a newer binding.
+    pub fn clear_foreign_toplevel_rect_for_source(&mut self, source_surface: &WlSurface) -> bool {
+        if !self.foreign_toplevel_rect.source_matches(source_surface) {
+            return false;
+        }
+        self.foreign_toplevel_rect = ForeignToplevelRectHint::Cleared;
+        true
     }
 
     pub fn is_window_cast_target(&self) -> bool {

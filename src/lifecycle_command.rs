@@ -23,8 +23,9 @@ pub enum LifecycleDirection {
 pub enum LifecycleAnchorInput {
     /// Explicit dock/taskbar rectangle already resolved by the caller.
     Explicit(MinimizeRect),
-    /// Use `Mapped.foreign_toplevel_rect` when its output matches the window's
-    /// current output; otherwise degrade to no-anchor (same as wrong-output filter).
+    /// Use the typed last-hint when it is `Resolved`, non-empty, and its output
+    /// matches the window's current output; otherwise degrade to no-anchor
+    /// (wrong-output, zero-area, Unresolved, or Cleared). Never reuses an older hint.
     CachedForCurrentOutput,
     /// No Genie target/source; reverse of in-flight animations still works.
     None,

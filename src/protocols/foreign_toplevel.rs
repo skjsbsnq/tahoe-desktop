@@ -623,7 +623,19 @@ where
                 y,
                 width,
                 height,
-            } => state.set_rectangle(surface, source_surface, x, y, width, height),
+            } => {
+                // wlroots foreign_toplevel_handle_set_rectangle posts invalid_rectangle for
+                // any negative dimension; non-negative combinations (including 0×N / N×0)
+                // are delivered to the compositor owner. width=height=0 is delete.
+                if width < 0 || height < 0 {
+                    resource.post_error(
+                        zwlr_foreign_toplevel_handle_v1::Error::InvalidRectangle,
+                        "rectangle width and height must be non-negative",
+                    );
+                    return;
+                }
+                state.set_rectangle(surface, source_surface, x, y, width, height)
+            }
             zwlr_foreign_toplevel_handle_v1::Request::Destroy => (),
             zwlr_foreign_toplevel_handle_v1::Request::SetFullscreen { output } => {
                 state.set_fullscreen(surface, output);

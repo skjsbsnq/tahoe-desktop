@@ -79,10 +79,28 @@ impl SurfaceLocalRect {
     }
 
     /// Protocol surface-local rect plus mapped layer geometry → output-local.
+    ///
+    /// Wrapping arithmetic is intentional only for tests of the naive path; production
+    /// protocol handling must use [`Self::try_to_output_local`].
     pub fn to_output_local(self, layer_geometry: Rectangle<i32, Logical>) -> OutputLocalRect {
         OutputLocalRect {
             rect: Rectangle::new(layer_geometry.loc + self.rect.loc, self.rect.size),
         }
+    }
+
+    /// Checked surface-local → output-local conversion.
+    ///
+    /// Returns `None` when coordinate addition overflows `i32`. Callers must fail closed
+    /// to an unresolved last-hint rather than panic, wrap, or keep a prior value.
+    pub fn try_to_output_local(
+        self,
+        layer_geometry: Rectangle<i32, Logical>,
+    ) -> Option<OutputLocalRect> {
+        let x = layer_geometry.loc.x.checked_add(self.rect.loc.x)?;
+        let y = layer_geometry.loc.y.checked_add(self.rect.loc.y)?;
+        Some(OutputLocalRect {
+            rect: Rectangle::new(Point::from((x, y)), self.rect.size),
+        })
     }
 }
 
@@ -375,6 +393,17 @@ mod tests {
             out.as_rect(),
             Rectangle::new(Point::from((10, 660)), Size::from((30, 40)))
         );
+        assert_eq!(
+            surface.try_to_output_local(layer).unwrap().as_rect(),
+            out.as_rect()
+        );
+    }
+
+    #[test]
+    fn try_to_output_local_fails_closed_on_i32_overflow() {
+        let surface = SurfaceLocalRect::new(Point::from((i32::MAX, 0)), Size::from((1, 1)));
+        let layer = Rectangle::new(Point::from((1, 0)), Size::from((10, 10)));
+        assert!(surface.try_to_output_local(layer).is_none());
     }
 
     #[test]

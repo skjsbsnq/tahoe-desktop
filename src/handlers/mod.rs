@@ -93,7 +93,10 @@ use crate::protocols::virtual_pointer::{
     VirtualPointerMotionEvent,
 };
 use crate::utils::{output_size, send_scale_transform};
-use crate::window::mapped::ForeignToplevelRect;
+use crate::window::mapped::{
+    ForeignToplevelRect, ForeignToplevelRectHint, ForeignToplevelRectUnresolved,
+    ForeignToplevelRectUnresolvedReason,
+};
 use crate::{
     delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
     delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
@@ -656,27 +659,41 @@ impl ForeignToplevelHandler for State {
         width: i32,
         height: i32,
     ) {
+        // Negative dimensions are protocol errors and must be rejected in the dispatch
+        // (invalid_rectangle) before this handler runs. Treat them as programmer bugs.
+        debug_assert!(width >= 0 && height >= 0);
+
         let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) else {
             return;
         };
         let mapped_id = mapped.id();
 
-        if width <= 0 || height <= 0 {
+        // XML: width=height=0 removes the already-set rectangle.
+        if width == 0 && height == 0 {
             if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&wl_surface) {
-                mapped.set_foreign_toplevel_rect(None);
+                mapped.set_foreign_toplevel_rect_hint(ForeignToplevelRectHint::Cleared);
             }
             debug!(
                 window = mapped_id.get(),
                 source = %source_surface.id(),
-                "cleared foreign-toplevel rectangle because dimensions are empty"
+                "cleared foreign-toplevel last-hint (0×0 delete)"
             );
             return;
         }
 
+        // Non-negative non-delete request, including 0×N / N×0: always replace the slot.
         let source_root = self.niri.find_root_shell_surface(&source_surface);
         let surface_local = SurfaceLocalRect::new(Point::from((x, y)), Size::from((width, height)));
 
-        let target = self.niri.layout.outputs().find_map(|output| {
+        enum ResolveOutcome {
+            Resolved {
+                output: Output,
+                rect: crate::layout::coords::OutputLocalRect,
+            },
+            Unresolved(ForeignToplevelRectUnresolvedReason),
+        }
+
+        let outcome = self.niri.layout.outputs().find_map(|output| {
             let layers = layer_map_for_output(output);
             let layer = layers.layer_for_surface(&source_root, WindowSurfaceType::TOPLEVEL)?;
 
@@ -685,44 +702,83 @@ impl ForeignToplevelHandler for State {
             }
 
             let layer_geo = layers.layer_geometry(layer)?;
-            let rect = surface_local.to_output_local(layer_geo);
-
-            Some((output.clone(), rect))
+            match surface_local.try_to_output_local(layer_geo) {
+                Some(rect) => Some(ResolveOutcome::Resolved {
+                    output: output.clone(),
+                    rect,
+                }),
+                None => Some(ResolveOutcome::Unresolved(
+                    ForeignToplevelRectUnresolvedReason::CoordinateOverflow,
+                )),
+            }
         });
 
-        let Some((output, rect)) = target else {
-            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&wl_surface) {
-                mapped.set_foreign_toplevel_rect(None);
-            }
-            debug!(
-                window = mapped_id.get(),
-                source = %source_surface.id(),
-                source_root = %source_root.id(),
-                "cleared foreign-toplevel rectangle because source layer surface was not mapped"
-            );
-            return;
-        };
-
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&wl_surface) {
-            mapped.set_foreign_toplevel_rect(Some(ForeignToplevelRect {
-                source_surface: source_surface.clone(),
-                source_root_surface: source_root.clone(),
-                output: output.clone(),
-                rect,
-            }));
+            let generation = mapped.next_foreign_toplevel_rect_generation();
+            match outcome {
+                Some(ResolveOutcome::Resolved { output, rect }) => {
+                    mapped.set_foreign_toplevel_rect_hint(ForeignToplevelRectHint::Resolved(
+                        ForeignToplevelRect {
+                            source_surface: source_surface.clone(),
+                            source_root_surface: source_root.clone(),
+                            output: output.clone(),
+                            rect,
+                            generation,
+                        },
+                    ));
+                    debug!(
+                        window = mapped_id.get(),
+                        source = %source_surface.id(),
+                        source_root = %source_root.id(),
+                        output = output.name(),
+                        generation,
+                        x = rect.loc().x,
+                        y = rect.loc().y,
+                        width = rect.size().w,
+                        height = rect.size().h,
+                        "stored foreign-toplevel last-hint Resolved (output-local)"
+                    );
+                }
+                Some(ResolveOutcome::Unresolved(reason)) => {
+                    mapped.set_foreign_toplevel_rect_hint(ForeignToplevelRectHint::Unresolved(
+                        ForeignToplevelRectUnresolved {
+                            source_surface: source_surface.clone(),
+                            source_root_surface: source_root.clone(),
+                            surface_local_rect: surface_local,
+                            generation,
+                            reason,
+                        },
+                    ));
+                    debug!(
+                        window = mapped_id.get(),
+                        source = %source_surface.id(),
+                        source_root = %source_root.id(),
+                        generation,
+                        ?reason,
+                        "stored foreign-toplevel last-hint Unresolved (replaced prior)"
+                    );
+                }
+                None => {
+                    mapped.set_foreign_toplevel_rect_hint(ForeignToplevelRectHint::Unresolved(
+                        ForeignToplevelRectUnresolved {
+                            source_surface: source_surface.clone(),
+                            source_root_surface: source_root.clone(),
+                            surface_local_rect: surface_local,
+                            generation,
+                            reason: ForeignToplevelRectUnresolvedReason::SourceNotMapped,
+                        },
+                    ));
+                    debug!(
+                        window = mapped_id.get(),
+                        source = %source_surface.id(),
+                        source_root = %source_root.id(),
+                        generation,
+                        "stored foreign-toplevel last-hint Unresolved (source not mapped; \
+                         replaced prior, did not restore earlier rectangle)"
+                    );
+                }
+            }
         }
-
-        debug!(
-            window = mapped_id.get(),
-            source = %source_surface.id(),
-            source_root = %source_root.id(),
-            output = output.name(),
-            x = rect.loc().x,
-            y = rect.loc().y,
-            width = rect.size().w,
-            height = rect.size().h,
-            "stored foreign-toplevel rectangle (output-local)"
-        );
     }
 }
 delegate_foreign_toplevel!(State);
