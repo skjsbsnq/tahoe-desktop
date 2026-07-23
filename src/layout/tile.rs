@@ -398,7 +398,20 @@ impl<W: LayoutElement> Tile<W> {
             let tile_change = self.tile_size().to_f64().to_point() - tile_size_from.to_point();
             let tile_change = f64::max(tile_change.x.abs(), tile_change.y.abs());
             let change = f64::max(change, tile_change);
-            if change > RESIZE_ANIMATION_THRESHOLD {
+
+            let fullscreen_to = if self.sizing_mode.is_fullscreen() {
+                1.
+            } else {
+                0.
+            };
+            let expanded_to = if self.sizing_mode.is_normal() { 0. } else { 1. };
+            // F08: same/near size unmaximize still needs the existing resize owner when
+            // fullscreen/expanded chrome progress would jump (border, radius, backdrop).
+            // Do not lower RESIZE_ANIMATION_THRESHOLD globally — only animate when mode
+            // progress actually changes or size delta exceeds the threshold.
+            let mode_progress_changes =
+                fullscreen_from != fullscreen_to || expanded_from != expanded_to;
+            if change > RESIZE_ANIMATION_THRESHOLD || mode_progress_changes {
                 let anim = Animation::new(
                     self.clock.clone(),
                     0.,
@@ -407,12 +420,6 @@ impl<W: LayoutElement> Tile<W> {
                     self.options.animations.window_resize.anim,
                 );
 
-                let fullscreen_to = if self.sizing_mode.is_fullscreen() {
-                    1.
-                } else {
-                    0.
-                };
-                let expanded_to = if self.sizing_mode.is_normal() { 0. } else { 1. };
                 let fullscreen_progress = (fullscreen_from != fullscreen_to)
                     .then(|| anim.restarted(fullscreen_from, fullscreen_to, 0.));
                 let expanded_progress = (expanded_from != expanded_to)
@@ -428,6 +435,7 @@ impl<W: LayoutElement> Tile<W> {
                     expanded_progress,
                 });
             } else {
+                // State/size effectively identical: no meaningful visual transition.
                 self.resize_animation = None;
             }
         }

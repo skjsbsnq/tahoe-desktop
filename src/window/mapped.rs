@@ -482,6 +482,12 @@ impl Mapped {
         )
     }
 
+    /// Test-only: serials queued for the existing Tile resize/expanded animation owner (F08).
+    #[cfg(test)]
+    pub(crate) fn test_animate_serials_len(&self) -> usize {
+        self.animate_serials.len()
+    }
+
     /// Full typed last-hint slot (Cleared | Unresolved | Resolved).
     pub fn foreign_toplevel_rect_hint(&self) -> &ForeignToplevelRectHint {
         &self.foreign_toplevel_rect
@@ -933,8 +939,14 @@ impl LayoutElement for Mapped {
             self.needs_configure = true;
         }
 
-        let changed = self.toplevel().with_pending_state(|state| {
-            let changed = state.size != Some(size);
+        // Size *or* expanded-mode state can change with an identical requested size (F08):
+        // e.g. unmaximize into a window that already matches working-area size. Mark animate
+        // for either so the existing Tile resize/expanded-progress owner can run.
+        let should_animate = self.toplevel().with_pending_state(|state| {
+            let size_changed = state.size != Some(size);
+            let had_fullscreen = state.states.contains(xdg_toplevel::State::Fullscreen);
+            let had_maximized = state.states.contains(xdg_toplevel::State::Maximized);
+
             state.size = Some(size);
 
             if mode.is_fullscreen() || self.is_pending_windowed_fullscreen {
@@ -948,10 +960,14 @@ impl LayoutElement for Mapped {
                 state.states.unset(xdg_toplevel::State::Maximized);
             }
 
-            changed
+            let has_fullscreen = state.states.contains(xdg_toplevel::State::Fullscreen);
+            let has_maximized = state.states.contains(xdg_toplevel::State::Maximized);
+            let mode_changed = had_fullscreen != has_fullscreen || had_maximized != has_maximized;
+
+            size_changed || mode_changed
         });
 
-        if changed && animate {
+        if should_animate && animate {
             self.animate_next_configure = true;
         }
 
@@ -1022,17 +1038,27 @@ impl LayoutElement for Mapped {
             return;
         }
 
-        let changed = self.toplevel().with_pending_state(|state| {
-            let changed = state.size != Some(size);
+        // Same as request_size: mode-only unmaximize/unfullscreen into an equal size still needs
+        // the resize/expanded animation owner (F08), not a parallel animation path.
+        let should_animate = self.toplevel().with_pending_state(|state| {
+            let size_changed = state.size != Some(size);
+            let had_fullscreen = state.states.contains(xdg_toplevel::State::Fullscreen);
+            let had_maximized = state.states.contains(xdg_toplevel::State::Maximized);
+
             state.size = Some(size);
             if !self.is_pending_windowed_fullscreen {
                 state.states.unset(xdg_toplevel::State::Fullscreen);
             }
             state.states.unset(xdg_toplevel::State::Maximized);
-            changed
+
+            let has_fullscreen = state.states.contains(xdg_toplevel::State::Fullscreen);
+            let has_maximized = state.states.contains(xdg_toplevel::State::Maximized);
+            let mode_changed = had_fullscreen != has_fullscreen || had_maximized != has_maximized;
+
+            size_changed || mode_changed
         });
 
-        if changed && animate {
+        if should_animate && animate {
             self.animate_next_configure = true;
         }
 

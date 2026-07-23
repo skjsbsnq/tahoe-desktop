@@ -105,35 +105,41 @@ impl TestWindow {
         let mut changed = false;
 
         let size = self.0.forced_size.get().or(self.0.requested_size.get());
+        let mut new_bbox = self.0.bbox.get();
         if let Some(size) = size {
             assert!(size.w >= 0);
             assert!(size.h >= 0);
 
-            let mut new_bbox = self.0.initial_bbox;
+            new_bbox = self.0.initial_bbox;
             if size.w != 0 {
                 new_bbox.size.w = size.w;
             }
             if size.h != 0 {
                 new_bbox.size.h = size.h;
             }
+        }
 
-            if self.0.bbox.get() != new_bbox {
-                if self.0.animate_next_configure.get() {
-                    self.0.animation_snapshot.replace(Some(RenderSnapshot {
-                        contents: Vec::new(),
-                        contents_with_blocked_out_bg: None,
-                        blocked_out_contents: Vec::new(),
-                        block_out_from: None,
-                        size: self.0.bbox.get().size.to_f64(),
-                        texture: OnceCell::new(),
-                        texture_with_blocked_out_bg: Default::default(),
-                        blocked_out_texture: OnceCell::new(),
-                    }));
-                }
+        let size_changed = self.0.bbox.get() != new_bbox;
+        let mode_will_change = self.0.sizing_mode.get() != self.0.pending_sizing_mode.get()
+            || self.0.is_windowed_fullscreen.get() != self.0.is_pending_windowed_fullscreen.get();
 
-                self.0.bbox.set(new_bbox);
-                changed = true;
-            }
+        // Snapshot when animation was requested for this configure (size and/or mode).
+        if self.0.animate_next_configure.get() && (size_changed || mode_will_change) {
+            self.0.animation_snapshot.replace(Some(RenderSnapshot {
+                contents: Vec::new(),
+                contents_with_blocked_out_bg: None,
+                blocked_out_contents: Vec::new(),
+                block_out_from: None,
+                size: self.0.bbox.get().size.to_f64(),
+                texture: OnceCell::new(),
+                texture_with_blocked_out_bg: Default::default(),
+                blocked_out_texture: OnceCell::new(),
+            }));
+        }
+
+        if size_changed {
+            self.0.bbox.set(new_bbox);
+            changed = true;
         }
 
         self.0.animate_next_configure.set(false);
@@ -177,15 +183,18 @@ impl LayoutElement for TestWindow {
         &mut self,
         size: Size<i32, Logical>,
         mode: SizingMode,
-        _animate: bool,
+        animate: bool,
         _transaction: Option<Transaction>,
     ) {
-        if self.0.requested_size.get() != Some(size) {
-            self.0.requested_size.set(Some(size));
+        let size_changed = self.0.requested_size.get() != Some(size);
+        let mode_changed = self.0.pending_sizing_mode.get() != mode;
+        self.0.requested_size.set(Some(size));
+        self.0.pending_sizing_mode.set(mode);
+
+        // Mirror Mapped F08 gate: mode-only unmaximize/unfullscreen still animates.
+        if animate && (size_changed || mode_changed) {
             self.0.animate_next_configure.set(true);
         }
-
-        self.0.pending_sizing_mode.set(mode);
 
         if mode.is_fullscreen() {
             self.0.is_pending_windowed_fullscreen.set(false);
@@ -4302,6 +4311,80 @@ fn scrolling_enter_expanded_captures_scrolling_return_placement() {
     let tile = scrolling.tiles().next().unwrap();
     assert_eq!(tile.return_placement(), ReturnPlacement::Scrolling);
     assert!(tile.window().pending_sizing_mode().is_maximized());
+}
+
+/// F08 observation + fix: unmaximize with identical window size still runs the existing
+/// resize/expanded-progress owner (border/radius chrome), not a parallel animation path.
+#[test]
+fn f08_same_size_unmaximize_runs_expanded_progress_animation() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::MaximizeWindowToEdges { id: None },
+        Op::Communicate(1),
+        Op::CompleteAnimations,
+    ];
+    let mut layout = check_ops(ops);
+
+    // Freeze the client buffer size so unmaximize commit has zero size delta.
+    let max_size = {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        let tile = scrolling.tiles().next().unwrap();
+        assert!(tile.window().sizing_mode().is_maximized());
+        assert!(
+            tile.resize_animation().is_none(),
+            "settled maximized should not leave a resize anim"
+        );
+        tile.window().size()
+    };
+    Op::SetForcedSize {
+        id: 1,
+        size: Some(max_size),
+    }
+    .apply(&mut layout);
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::MaximizeWindowToEdges { id: None }, // unmaximize
+            Op::Communicate(1),
+        ],
+    );
+
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    let tile = scrolling.tiles().next().unwrap();
+    assert!(tile.window().sizing_mode().is_normal());
+    assert_eq!(tile.window().size(), max_size, "size delta must be zero");
+    assert!(
+        tile.resize_animation().is_some(),
+        "F08: expanded progress must animate via existing resize owner when size is unchanged"
+    );
+}
+
+/// F08: when neither size nor expanded/fullscreen progress changes, do not invent animation.
+#[test]
+fn f08_identical_commit_without_mode_change_skips_resize_animation() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::Communicate(1),
+        Op::CompleteAnimations,
+    ];
+    let mut layout = check_ops(ops);
+
+    // Re-communicate with same size/mode: no snapshot → no resize anim.
+    Op::Communicate(1).apply(&mut layout);
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    let tile = scrolling.tiles().next().unwrap();
+    assert!(tile.window().sizing_mode().is_normal());
+    assert!(
+        tile.resize_animation().is_none(),
+        "no mode/size change must not create resize animation"
+    );
 }
 
 #[test]
