@@ -16,6 +16,7 @@ use super::*;
 mod animations;
 mod coords;
 mod fullscreen;
+mod lifecycle_controller;
 mod observe;
 
 impl<W: LayoutElement> Default for Layout<W> {

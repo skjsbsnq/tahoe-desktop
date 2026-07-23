@@ -712,3 +712,164 @@ fn lifecycle_diag_default_off_does_not_count() {
         assert_eq!(lifecycle_diag::snapshot().queue_redraw_all, 0);
     });
 }
+
+/// R05: reverse at 0% / mid / near-complete reuses one overlay (no dual morph jump) and
+/// completing restore releases the visibility lease so the live tile can show again.
+#[test]
+fn reverse_at_progress_points_continuous_and_lease_released() {
+    let mut f = Fixture::with_config(linear_lifecycle_config());
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // --- reverse near 0% ---
+    let window = mapped_at(f.niri(), 0).window.clone();
+    assert!(lifecycle_minimize(&mut f, window.clone()));
+    set_time(f.niri(), Duration::from_millis(10));
+    f.niri().advance_animations();
+    let p_min = observe_scrolling(f.niri())
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Minimize)
+        .and_then(|o| o.progress)
+        .expect("minimize near start");
+    assert!(lifecycle_restore(&mut f, window.clone()));
+    let obs = observe_scrolling(f.niri());
+    let restore = obs
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Restore)
+        .expect("restore after reverse near 0%");
+    // One entry: minimize gone, restore present (same controller entry, reversed).
+    assert_eq!(
+        obs.lifecycle_overlays
+            .iter()
+            .filter(|o| {
+                o.kind == LifecycleOverlayKind::Minimize || o.kind == LifecycleOverlayKind::Restore
+            })
+            .count(),
+        1
+    );
+    // Morph is "how minimized" in both directions; reverse reuses the same value (no jump).
+    let p_rest = restore.progress.unwrap();
+    assert!(
+        (p_rest - p_min).abs() < 0.15,
+        "near-0 reverse morph jump: min={p_min} rest={p_rest}"
+    );
+
+    // Finish restore so next cycle starts clean.
+    set_time(f.niri(), Duration::from_millis(2000));
+    f.niri().advance_animations();
+    assert!(
+        observe_scrolling(f.niri())
+            .lifecycle_overlays
+            .iter()
+            .all(|o| {
+                o.kind != LifecycleOverlayKind::Minimize && o.kind != LifecycleOverlayKind::Restore
+            }),
+        "restore must complete and clear controller"
+    );
+    // Live tile must not remain lease-suppressed after restore completion.
+    let suppressed = f
+        .niri()
+        .layout
+        .active_workspace()
+        .unwrap()
+        .tiles()
+        .any(|t| t.is_suppressed_by_restore_lease());
+    assert!(
+        !suppressed,
+        "visibility lease must release when restore finishes"
+    );
+
+    // Reset animation clock baseline before the next minimize cycle.
+    set_time(f.niri(), Duration::ZERO);
+
+    // --- reverse mid ---
+    assert!(lifecycle_minimize(&mut f, window.clone()));
+    set_time(f.niri(), Duration::from_millis(450));
+    f.niri().advance_animations();
+    let p_min = observe_scrolling(f.niri())
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Minimize)
+        .and_then(|o| o.progress)
+        .expect("minimize mid");
+    assert!(
+        p_min > 0.2 && p_min < 0.9,
+        "mid morph expected, got {p_min}"
+    );
+    assert!(lifecycle_restore(&mut f, window.clone()));
+    let p_rest = observe_scrolling(f.niri())
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Restore)
+        .and_then(|o| o.progress)
+        .expect("restore mid");
+    assert!(
+        (p_rest - p_min).abs() < 0.15,
+        "mid reverse morph jump: min={p_min} rest={p_rest}"
+    );
+
+    set_time(f.niri(), Duration::from_millis(2500));
+    f.niri().advance_animations();
+    set_time(f.niri(), Duration::ZERO);
+
+    // --- reverse near complete ---
+    assert!(lifecycle_minimize(&mut f, window.clone()));
+    set_time(f.niri(), Duration::from_millis(900));
+    f.niri().advance_animations();
+    let p_min = observe_scrolling(f.niri())
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Minimize)
+        .and_then(|o| o.progress)
+        .expect("minimize near end");
+    assert!(p_min > 0.7, "near-complete morph expected, got {p_min}");
+    assert!(lifecycle_restore(&mut f, window));
+    let p_rest = observe_scrolling(f.niri())
+        .lifecycle_overlays
+        .iter()
+        .find(|o| o.kind == LifecycleOverlayKind::Restore)
+        .and_then(|o| o.progress)
+        .expect("restore near end");
+    assert!(
+        (p_rest - p_min).abs() < 0.15,
+        "near-complete reverse morph jump: min={p_min} rest={p_rest}"
+    );
+
+    // Reverse restore → minimize must also keep a single overlay and release lease.
+    let window_again = mapped_at(f.niri(), 0).window.clone();
+    assert!(lifecycle_minimize(&mut f, window_again));
+    let obs = observe_scrolling(f.niri());
+    assert_eq!(
+        obs.lifecycle_overlays
+            .iter()
+            .filter(|o| {
+                o.kind == LifecycleOverlayKind::Minimize || o.kind == LifecycleOverlayKind::Restore
+            })
+            .count(),
+        1
+    );
+    assert!(
+        obs.lifecycle_overlays
+            .iter()
+            .any(|o| o.kind == LifecycleOverlayKind::Minimize),
+        "reverse back to minimize"
+    );
+    let suppressed = f
+        .niri()
+        .layout
+        .active_workspace()
+        .unwrap()
+        .tiles()
+        .any(|t| t.is_suppressed_by_restore_lease());
+    assert!(
+        !suppressed,
+        "reverse-to-minimize must release restore lease"
+    );
+}

@@ -102,8 +102,12 @@ pub struct Tile<W: LayoutElement> {
     /// The animation of the tile's opacity.
     pub(super) alpha_animation: Option<AlphaAnimation>,
 
-    /// Whether normal tile rendering is hidden while a restore snapshot fades in.
-    restore_animation_hidden: bool,
+    /// Live-tile visibility suppressed by the minimize/restore controller's restore lease.
+    ///
+    /// Only the shared [`crate::layout::lifecycle_controller::MinimizeRestoreController`]
+    /// policy may acquire/release this lease via the methods below; spaces must not invent
+    /// a parallel hide/show state machine.
+    restore_visibility_lease: bool,
 
     /// Offset during the initial interactive move rubberband.
     pub(super) interactive_move_offset: Point<f64, Logical>,
@@ -246,7 +250,7 @@ impl<W: LayoutElement> Tile<W> {
             move_x_animation: None,
             move_y_animation: None,
             alpha_animation: None,
-            restore_animation_hidden: false,
+            restore_visibility_lease: false,
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
@@ -713,17 +717,19 @@ impl<W: LayoutElement> Tile<W> {
             .is_some_and(|alpha| alpha.render_when_minimized && !alpha.anim.is_done())
     }
 
-    pub fn hide_for_restore_animation(&mut self) {
-        self.restore_animation_hidden = true;
+    /// Apply a controller-issued restore visibility lease (live tile must not draw).
+    pub fn apply_restore_visibility_lease(&mut self) {
+        self.restore_visibility_lease = true;
         self.alpha_animation = None;
     }
 
-    pub fn show_after_restore_animation(&mut self) {
-        self.restore_animation_hidden = false;
+    /// Release a controller-issued restore visibility lease.
+    pub fn release_restore_visibility_lease(&mut self) {
+        self.restore_visibility_lease = false;
     }
 
-    pub fn is_hidden_for_restore_animation(&self) -> bool {
-        self.restore_animation_hidden
+    pub fn is_suppressed_by_restore_lease(&self) -> bool {
+        self.restore_visibility_lease
     }
 
     pub fn ensure_alpha_animates_to_1(&mut self) {
