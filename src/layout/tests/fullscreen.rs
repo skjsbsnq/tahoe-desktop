@@ -351,7 +351,7 @@ fn interactive_move_restore_to_floating_animates_view_offset() {
         // Toggle window 1 to floating.
         Op::FocusWindow(1),
         Op::ToggleWindowFloating { id: None },
-        // Fullscreen window 1 - it moves to scrolling with restore_to_floating = true.
+        // Fullscreen window 1 - it moves to scrolling with ReturnPlacement::Floating.
         Op::FullscreenWindow(1),
         Op::Communicate(1),
         Op::CompleteAnimations,
@@ -359,12 +359,13 @@ fn interactive_move_restore_to_floating_animates_view_offset() {
 
     let mut layout = check_ops(ops);
 
-    // Verify window 1 is in scrolling and has restore_to_floating = true.
+    // Verify window 1 is in scrolling and returns to floating when leaving expanded mode.
     let scrolling = layout.active_workspace().unwrap().scrolling();
     let tile1 = scrolling.tiles().find(|t| *t.window().id() == 1).unwrap();
-    assert!(
-        tile1.restore_to_floating,
-        "window 1 should have restore_to_floating = true"
+    assert_eq!(
+        tile1.return_placement(),
+        crate::layout::expanded_mode::ReturnPlacement::Floating,
+        "window 1 should have ReturnPlacement::Floating"
     );
 
     let ops = [

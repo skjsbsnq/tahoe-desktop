@@ -4195,6 +4195,8 @@ fn navigating_to_maximized_window_does_not_cover_floating_layer() {
 
 #[test]
 fn restore_to_floating_persists_across_fullscreen_maximize() {
+    use crate::layout::expanded_mode::ReturnPlacement;
+
     let ops = [
         Op::AddOutput(1),
         Op::AddWindow {
@@ -4204,15 +4206,32 @@ fn restore_to_floating_persists_across_fullscreen_maximize() {
         // Maximize then fullscreen.
         Op::MaximizeWindowToEdges { id: None },
         Op::FullscreenWindow(1),
-        // Unfullscreen.
-        Op::FullscreenWindow(1),
     ];
 
     let mut layout = check_ops(ops);
 
-    // Unfullscreening should return the window to the maximized state.
-    let scrolling = layout.active_workspace().unwrap().scrolling();
-    assert!(scrolling.tiles().next().is_some());
+    // After floating → maximize → fullscreen, typed return placement must stay Floating
+    // (fullscreen+maximized stack must not clear it).
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        let tile = scrolling.tiles().next().expect("still in scrolling");
+        assert_eq!(tile.return_placement(), ReturnPlacement::Floating);
+        assert!(tile.window().pending_sizing_mode().is_fullscreen());
+    }
+
+    let ops = [
+        // Unfullscreen.
+        Op::FullscreenWindow(1),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+
+    // Unfullscreening should return the window to the maximized state (not float yet).
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        let tile = scrolling.tiles().next().expect("maximized in scrolling");
+        assert_eq!(tile.return_placement(), ReturnPlacement::Floating);
+        assert!(tile.window().pending_sizing_mode().is_maximized());
+    }
 
     let ops = [
         // Unmaximize.
@@ -4223,10 +4242,13 @@ fn restore_to_floating_persists_across_fullscreen_maximize() {
     // Unmaximize should return the window back to floating.
     let scrolling = layout.active_workspace().unwrap().scrolling();
     assert!(scrolling.tiles().next().is_none());
+    assert!(layout.active_workspace().unwrap().has_window(&1));
 }
 
 #[test]
 fn unmaximize_during_fullscreen_does_not_float() {
+    use crate::layout::expanded_mode::ReturnPlacement;
+
     let ops = [
         Op::AddOutput(1),
         Op::AddWindow {
@@ -4236,15 +4258,22 @@ fn unmaximize_during_fullscreen_does_not_float() {
         // Maximize then fullscreen.
         Op::MaximizeWindowToEdges { id: None },
         Op::FullscreenWindow(1),
-        // Unmaximize.
+        // Unmaximize while still fullscreen.
         Op::MaximizeWindowToEdges { id: None },
     ];
 
     let mut layout = check_ops(ops);
 
-    // Unmaximize shouldn't have changed the window state since it's fullscreen.
-    let scrolling = layout.active_workspace().unwrap().scrolling();
-    assert!(scrolling.tiles().next().is_some());
+    // Unmaximize shouldn't float while fullscreen; return placement remains Floating.
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        let tile = scrolling
+            .tiles()
+            .next()
+            .expect("still scrolling under fullscreen");
+        assert_eq!(tile.return_placement(), ReturnPlacement::Floating);
+        assert!(tile.window().pending_sizing_mode().is_fullscreen());
+    }
 
     let ops = [
         // Unfullscreen.
@@ -4252,9 +4281,27 @@ fn unmaximize_during_fullscreen_does_not_float() {
     ];
     check_ops_on_layout(&mut layout, ops);
 
-    // Unfullscreen should return the window back to floating.
+    // After unmaximize-during-fs cleared max intent, unfullscreen returns to floating.
     let scrolling = layout.active_workspace().unwrap().scrolling();
     assert!(scrolling.tiles().next().is_none());
+}
+
+#[test]
+fn scrolling_enter_expanded_captures_scrolling_return_placement() {
+    use crate::layout::expanded_mode::ReturnPlacement;
+
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::MaximizeWindowToEdges { id: None },
+    ];
+    let layout = check_ops(ops);
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    let tile = scrolling.tiles().next().unwrap();
+    assert_eq!(tile.return_placement(), ReturnPlacement::Scrolling);
+    assert!(tile.window().pending_sizing_mode().is_maximized());
 }
 
 #[test]

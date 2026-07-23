@@ -84,6 +84,7 @@ use crate::window::ResolvedWindowRules;
 
 pub mod closing_window;
 pub mod coords;
+pub mod expanded_mode;
 pub mod floating;
 pub mod focus_ring;
 pub mod insert_hint_element;
@@ -754,7 +755,11 @@ impl<W: LayoutElement> InteractiveMoveData<W> {
 }
 
 fn interactive_move_treat_as_floating<W: LayoutElement>(is_floating: bool, tile: &Tile<W>) -> bool {
-    is_floating || (tile.restore_to_floating && tile.window().pending_sizing_mode().is_maximized())
+    expanded_mode::ExpandedModeOrchestrator::interactive_move_treat_as_floating(
+        is_floating,
+        tile.return_placement(),
+        tile.window().pending_sizing_mode().is_maximized(),
+    )
 }
 
 impl SnapPreviewState {
@@ -4748,12 +4753,14 @@ impl<W: LayoutElement> Layout<W> {
                     );
 
                     if let Some(ws) = mon.workspaces.iter_mut().find(|ws| ws.has_window(&win_id)) {
-                        ws.set_maximized(&win_id, true);
-                        if let Some(tile) =
-                            ws.tiles_mut().find(|tile| tile.window().id() == &win_id)
-                        {
-                            tile.restore_to_floating = move_.transport.is_floating();
-                        }
+                        // Unified expanded-mode entry: maximize + return placement from source.
+                        ws.set_maximized_with_return_placement(
+                            &win_id,
+                            true,
+                            expanded_mode::ReturnPlacement::from_is_floating(
+                                move_.transport.is_floating(),
+                            ),
+                        );
                     } else {
                         error!("workspace missing window after top snap maximize insertion");
                     }

@@ -17,6 +17,9 @@ use smithay::utils::{Logical, Point, Rectangle, Serial, Size, Transform};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 
+use super::expanded_mode::{
+    ExpandedModeKind, ExpandedModeOrchestrator, ExpandedModePlan, ReturnPlacement,
+};
 use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
 use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
@@ -606,7 +609,7 @@ impl<W: LayoutElement> Workspace<W> {
         transport: TileTransport,
     ) {
         self.enter_output_for_window(tile.window());
-        tile.restore_to_floating = transport.is_floating();
+        tile.set_return_placement(ReturnPlacement::from_is_floating(transport.is_floating()));
 
         match target {
             WorkspaceAddWindowTarget::Auto => {
@@ -1378,60 +1381,12 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.expand_column_to_available_width();
     }
 
+    /// Workspace expanded-mode owner: fullscreen request orchestration.
+    ///
+    /// Column applies pending fullscreen sizing; Mapped owns protocol state; R08 owns visual
+    /// exclusivity. This method only orchestrates floating migration and return placement.
     pub fn set_fullscreen(&mut self, window: &W::Id, is_fullscreen: bool) {
-        let mut restore_to_floating = false;
-        if self.floating.has_window(window) {
-            if is_fullscreen {
-                restore_to_floating = true;
-                self.toggle_window_floating(Some(window));
-            } else {
-                // Floating windows are never fullscreen, so this is an unfullscreen request for an
-                // already unfullscreen window.
-                return;
-            }
-        } else if !is_fullscreen {
-            // The window is in the scrolling layout and we're requesting an unfullscreen. If it is
-            // indeed fullscreen (i.e. this isn't a duplicate unfullscreen request), then we may
-            // need to unfullscreen into floating.
-            let col = self
-                .scrolling
-                .columns()
-                .find(|col| col.contains(window))
-                .unwrap();
-
-            // When going from fullscreen to maximized, don't consider restore_to_floating yet.
-            if col.is_pending_fullscreen() && !col.is_pending_maximized() {
-                let (tile, _) = col
-                    .tiles()
-                    .find(|(tile, _)| tile.window().id() == window)
-                    .unwrap();
-                if tile.restore_to_floating {
-                    // Unfullscreen and float in one call so it has a chance to notice and request a
-                    // (0, 0) size, rather than the scrolling column size.
-                    self.toggle_window_floating(Some(window));
-                    return;
-                }
-            }
-        }
-
-        let tile = self
-            .scrolling
-            .tiles()
-            .find(|tile| tile.window().id() == window)
-            .unwrap();
-        let was_normal = tile.window().pending_sizing_mode().is_normal();
-
-        self.scrolling.set_fullscreen(window, is_fullscreen);
-
-        // When going from normal to fullscreen, remember if we should unfullscreen to floating.
-        let tile = self
-            .scrolling
-            .tiles_mut()
-            .find(|tile| tile.window().id() == window)
-            .unwrap();
-        if was_normal && !tile.window().pending_sizing_mode().is_normal() {
-            tile.restore_to_floating = restore_to_floating;
-        }
+        self.apply_expanded_mode(window, ExpandedModeKind::Fullscreen, is_fullscreen);
     }
 
     pub fn toggle_fullscreen(&mut self, window: &W::Id) {
@@ -1443,53 +1398,146 @@ impl<W: LayoutElement> Workspace<W> {
         self.set_fullscreen(window, !current);
     }
 
+    /// Workspace expanded-mode owner: maximize request orchestration.
     pub fn set_maximized(&mut self, window: &W::Id, maximize: bool) {
-        let mut restore_to_floating = false;
-        if self.floating.has_window(window) {
-            if maximize {
-                restore_to_floating = true;
-                self.toggle_window_floating(Some(window));
-            } else {
-                // Floating windows are never maximized, so this is an unmaximize request for an
-                // already unmaximized window.
-                return;
-            }
-        } else if !maximize {
-            // The window is in the scrolling layout and we're requesting to unmaximize. If it is
-            // indeed maximized (i.e. this isn't a duplicate unmaximize request), then we may
-            // need to unmaximize into floating.
-            let tile = self
-                .scrolling
-                .tiles()
-                .find(|tile| tile.window().id() == window)
-                .unwrap();
-            // The tile cannot unmaximize into fullscreen (pending_sizing_mode() will be fullscreen
-            // in that case and not maximized), so this check works.
-            if tile.window().pending_sizing_mode().is_maximized() && tile.restore_to_floating {
-                // Unmaximize and float in one call so it has a chance to notice and request a
-                // (0, 0) size, rather than the scrolling column size.
-                self.toggle_window_floating(Some(window));
-                return;
-            }
+        self.apply_expanded_mode(window, ExpandedModeKind::Maximized, maximize);
+    }
+
+    /// Maximize (or unmaximize) and set typed return placement in one owner entry.
+    ///
+    /// Used by top-snap: the window is inserted into scrolling first, then maximized with
+    /// return placement taken from the interactive-move transport source.
+    pub fn set_maximized_with_return_placement(
+        &mut self,
+        window: &W::Id,
+        maximize: bool,
+        return_placement: ReturnPlacement,
+    ) {
+        self.set_maximized(window, maximize);
+        if maximize {
+            self.set_return_placement(window, return_placement);
         }
+    }
 
-        let tile = self
-            .scrolling
-            .tiles()
-            .find(|tile| tile.window().id() == window)
-            .unwrap();
-        let was_normal = tile.window().pending_sizing_mode().is_normal();
+    /// Explicit return-placement write (transport insert, top-snap, tests).
+    pub fn set_return_placement(&mut self, window: &W::Id, placement: ReturnPlacement) {
+        if let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == window) {
+            tile.set_return_placement(placement);
+        }
+    }
 
-        self.scrolling.set_maximized(window, maximize);
+    fn apply_expanded_mode(&mut self, window: &W::Id, kind: ExpandedModeKind, enable: bool) {
+        let currently_floating = self.floating.has_window(window);
 
-        // When going from normal to maximized, remember if we should unmaximize to floating.
-        let tile = self
-            .scrolling
-            .tiles_mut()
-            .find(|tile| tile.window().id() == window)
-            .unwrap();
-        if was_normal && !tile.window().pending_sizing_mode().is_normal() {
-            tile.restore_to_floating = restore_to_floating;
+        let (column_pending_fullscreen, column_pending_maximized, return_placement, was_normal) =
+            if currently_floating {
+                let tile = self
+                    .floating
+                    .tiles()
+                    .find(|tile| tile.window().id() == window)
+                    .unwrap();
+                (
+                    false,
+                    false,
+                    tile.return_placement(),
+                    tile.window().pending_sizing_mode().is_normal(),
+                )
+            } else {
+                let col = self
+                    .scrolling
+                    .columns()
+                    .find(|col| col.contains(window))
+                    .unwrap();
+                let (tile, _) = col
+                    .tiles()
+                    .find(|(tile, _)| tile.window().id() == window)
+                    .unwrap();
+                (
+                    col.is_pending_fullscreen(),
+                    col.is_pending_maximized(),
+                    tile.return_placement(),
+                    tile.window().pending_sizing_mode().is_normal(),
+                )
+            };
+
+        let plan = match kind {
+            ExpandedModeKind::Fullscreen => ExpandedModeOrchestrator::plan_fullscreen(
+                currently_floating,
+                enable,
+                column_pending_fullscreen,
+                column_pending_maximized,
+                return_placement,
+                was_normal,
+            ),
+            ExpandedModeKind::Maximized => {
+                let window_pending_is_maximized = if currently_floating {
+                    false
+                } else {
+                    // Window pending maximized (not fullscreen) — unmaximize-to-float gate.
+                    self.scrolling
+                        .tiles()
+                        .find(|tile| tile.window().id() == window)
+                        .unwrap()
+                        .window()
+                        .pending_sizing_mode()
+                        .is_maximized()
+                };
+                ExpandedModeOrchestrator::plan_maximized(
+                    currently_floating,
+                    enable,
+                    window_pending_is_maximized,
+                    return_placement,
+                    was_normal,
+                )
+            }
+        };
+
+        match plan {
+            ExpandedModePlan::NoOp => {}
+            ExpandedModePlan::ExitToFloating => {
+                // Combined unexpand + float so the window can request a floating size rather
+                // than a scrolling column size.
+                self.toggle_window_floating(Some(window));
+            }
+            ExpandedModePlan::ApplyInScrolling {
+                move_from_floating,
+                enable,
+                capture_return,
+            } => {
+                if move_from_floating {
+                    self.toggle_window_floating(Some(window));
+                }
+
+                let tile = self
+                    .scrolling
+                    .tiles()
+                    .find(|tile| tile.window().id() == window)
+                    .unwrap();
+                let was_normal = tile.window().pending_sizing_mode().is_normal();
+
+                match kind {
+                    ExpandedModeKind::Fullscreen => {
+                        self.scrolling.set_fullscreen(window, enable);
+                    }
+                    ExpandedModeKind::Maximized => {
+                        self.scrolling.set_maximized(window, enable);
+                    }
+                }
+
+                if let Some(placement) = capture_return {
+                    let tile = self
+                        .scrolling
+                        .tiles_mut()
+                        .find(|tile| tile.window().id() == window)
+                        .unwrap();
+                    if ExpandedModeOrchestrator::should_write_return_placement(
+                        was_normal,
+                        tile.window().pending_sizing_mode().is_normal(),
+                    ) {
+                        tile.set_return_placement(placement);
+                    }
+                }
+            }
         }
     }
 

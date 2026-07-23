@@ -62,8 +62,10 @@ pub struct Tile<W: LayoutElement> {
     /// The black backdrop for fullscreen windows.
     fullscreen_backdrop: SolidColorBuffer,
 
-    /// Whether the tile should float upon unfullscreening.
-    pub(super) restore_to_floating: bool,
+    /// Where the tile should return upon fully leaving maximized/fullscreen.
+    ///
+    /// Owned as typed placement by the Workspace expanded-mode orchestrator (not a bare bool).
+    pub(super) return_placement: super::expanded_mode::ReturnPlacement,
 
     /// The size that the window should assume when going floating.
     ///
@@ -239,7 +241,7 @@ impl<W: LayoutElement> Tile<W> {
             shadow: Shadow::new(shadow_config),
             sizing_mode,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
-            restore_to_floating: false,
+            return_placement: super::expanded_mode::ReturnPlacement::Scrolling,
             floating_window_size: None,
             floating_pos: None,
             snap_restore_window_size: None,
@@ -754,6 +756,18 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn window_mut(&mut self) -> &mut W {
         &mut self.window
+    }
+
+    /// Expanded-mode return placement (Workspace expanded-mode owner).
+    pub fn return_placement(&self) -> super::expanded_mode::ReturnPlacement {
+        self.return_placement
+    }
+
+    pub(super) fn set_return_placement(
+        &mut self,
+        placement: super::expanded_mode::ReturnPlacement,
+    ) {
+        self.return_placement = placement;
     }
 
     pub fn sizing_mode(&self) -> SizingMode {
