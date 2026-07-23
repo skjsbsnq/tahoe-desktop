@@ -95,7 +95,11 @@ fn real_mapped_serial_distinguishes_configure_ack_and_commit() {
         !uncommitted.is_empty(),
         "Mapped must queue uncommitted_maximized serials (production path, not layout mock)"
     );
-    let queued_serials_before = uncommitted.clone();
+    assert!(
+        uncommitted.iter().any(|(_, maximized)| *maximized),
+        "queue must record maximized=true for the pending configure: {uncommitted:?}"
+    );
+    let queued_before = uncommitted.clone();
 
     // Ack alone must not apply committed maximized (only commit does).
     f.client(id).window(&surface).ack_last();
@@ -105,7 +109,7 @@ fn real_mapped_serial_distinguishes_configure_ack_and_commit() {
     assert!(!committed, "ack without commit must not apply maximized");
     assert!(pending);
     assert_eq!(
-        uncommitted_after_ack, queued_serials_before,
+        uncommitted_after_ack, queued_before,
         "ack alone must not drain uncommitted_maximized"
     );
 
@@ -123,15 +127,138 @@ fn real_mapped_serial_distinguishes_configure_ack_and_commit() {
         "commit of latest configure (client serial {latest_client_serial}) must apply maximized via Mapped::on_commit"
     );
     assert!(
-        uncommitted_after_commit.len() < queued_serials_before.len()
-            || uncommitted_after_commit
-                .iter()
-                .all(|s| !queued_serials_before.contains(s)),
-        "commit must consume the previously queued uncommitted_maximized serials: before={queued_serials_before:?} after={uncommitted_after_commit:?}"
+        uncommitted_after_commit
+            .iter()
+            .all(|(serial, _)| !queued_before.iter().any(|(s, _)| s == serial)),
+        "commit must consume the previously queued uncommitted_maximized serials: before={queued_before:?} after={uncommitted_after_commit:?}"
     );
 
     // Sanity: still a real Mapped (not layout TestWindow).
     let _: &ToplevelSurface = mapped_at(f.niri(), 0).toplevel();
+}
+
+/// Old configure serial vs latest: commit of an earlier maximize serial must not clear a
+/// newer unmaximize entry, and the latest commit decides the final committed maximized flag.
+#[test]
+fn real_mapped_serial_old_configure_vs_latest_commit() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = create_window(&mut f, id, 200, 200);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    let window = mapped_at(f.niri(), 0).window.clone();
+
+    // Configure epoch A: maximize.
+    f.niri().layout.set_maximized(&window, true);
+    f.double_roundtrip(id);
+    let serial_a = f
+        .client(id)
+        .window(&surface)
+        .configures_received
+        .last()
+        .unwrap()
+        .0;
+    let (committed, pending, uncommitted) = mapped_at(f.niri(), 0).test_maximize_commit_state();
+    assert!(!committed);
+    assert!(pending);
+    assert!(
+        uncommitted.iter().any(|(_, m)| *m),
+        "epoch A must queue maximized=true: {uncommitted:?}"
+    );
+    let uncommitted_after_a = uncommitted.clone();
+
+    // Configure epoch B: unmaximize before the client commits A.
+    f.niri().layout.set_maximized(&window, false);
+    f.double_roundtrip(id);
+    let serial_b = f
+        .client(id)
+        .window(&surface)
+        .configures_received
+        .last()
+        .unwrap()
+        .0;
+    assert_ne!(
+        serial_a, serial_b,
+        "unmaximize must send a new configure serial"
+    );
+
+    let (committed, pending, uncommitted) = mapped_at(f.niri(), 0).test_maximize_commit_state();
+    assert!(!committed, "still uncommitted before any client commit");
+    assert!(!pending, "pending follows the latest unmaximize request");
+    assert!(
+        uncommitted.len() >= 2,
+        "both old maximize and latest unmaximize serials must remain queued: after_a={uncommitted_after_a:?} now={uncommitted:?}"
+    );
+    assert!(
+        uncommitted.iter().any(|(_, m)| *m) && uncommitted.iter().any(|(_, m)| !*m),
+        "queue must hold both maximized=true and maximized=false entries: {uncommitted:?}"
+    );
+    let has_newer_false = uncommitted.iter().any(|(serial, m)| {
+        !*m && serial.is_no_older_than(&uncommitted.iter().find(|(_, m)| *m).unwrap().0)
+    });
+    assert!(
+        has_newer_false || uncommitted.last().is_some_and(|(_, m)| !*m),
+        "latest queued value should be unmaximize (false): {uncommitted:?}"
+    );
+
+    // Commit only the *old* maximize configure (ack A, not B).
+    {
+        let w = f.client(id).window(&surface);
+        w.ack_serial(serial_a);
+        w.attach_new_buffer();
+        w.set_size(1920, 1080);
+        w.commit();
+    }
+    f.roundtrip(id);
+
+    let (committed, pending, uncommitted_after_old) =
+        mapped_at(f.niri(), 0).test_maximize_commit_state();
+    assert!(
+        committed,
+        "commit of old maximize serial A must apply maximized=true via on_commit"
+    );
+    assert!(!pending);
+    assert!(
+        uncommitted_after_old.iter().any(|(_, m)| !*m),
+        "newer unmaximize serial B must still be waiting after old commit: {uncommitted_after_old:?}"
+    );
+    let a_true_serials: Vec<_> = uncommitted_after_a
+        .iter()
+        .filter(|(_, m)| *m)
+        .map(|(s, _)| *s)
+        .collect();
+    assert!(
+        a_true_serials
+            .iter()
+            .all(|sa| !uncommitted_after_old.iter().any(|(s, _)| s == sa)),
+        "epoch A maximize serial(s) must leave the queue after commit of A: a={a_true_serials:?} after={uncommitted_after_old:?}"
+    );
+
+    // Commit the *latest* unmaximize configure B.
+    {
+        let w = f.client(id).window(&surface);
+        w.ack_serial(serial_b);
+        w.attach_new_buffer();
+        w.set_size(200, 200);
+        w.commit();
+    }
+    f.roundtrip(id);
+
+    let (committed, pending, uncommitted_final) =
+        mapped_at(f.niri(), 0).test_maximize_commit_state();
+    assert!(
+        !committed,
+        "commit of latest unmaximize serial B must leave committed maximized=false"
+    );
+    assert!(!pending);
+    assert!(
+        uncommitted_final.is_empty()
+            || uncommitted_final
+                .iter()
+                .all(|(s, _)| !uncommitted_after_old.iter().any(|(so, _)| so == s)),
+        "latest commit must consume the remaining unmaximize serial(s): {uncommitted_final:?}"
+    );
 }
 
 #[test]
@@ -223,101 +350,99 @@ fn maximize_ongoing_plus_active_minimize_overlay_reports_suppressed_decision() {
     config.animations.window_resize.anim.kind = LINEAR;
     config.animations.window_close.anim.kind = LINEAR;
 
-    let mut f = Fixture::with_config(config);
-    f.niri_state().backend.headless().add_renderer().unwrap();
-    f.add_output(1, (1920, 1080));
+    lifecycle_diag::with_enabled_for_test(|| {
+        let mut f = Fixture::with_config(config);
+        f.niri_state().backend.headless().add_renderer().unwrap();
+        f.add_output(1, (1920, 1080));
 
-    lifecycle_diag::enable();
-    lifecycle_diag::reset();
+        let id = f.add_client();
+        let surface1 = create_window(&mut f, id, 200, 200);
+        let surface2 = create_window(&mut f, id, 200, 200);
+        f.double_roundtrip(id);
+        let _ = f.client(id).window(&surface1).recent_configures();
+        let _ = f.client(id).window(&surface2).recent_configures();
 
-    let id = f.add_client();
-    let surface1 = create_window(&mut f, id, 200, 200);
-    let surface2 = create_window(&mut f, id, 200, 200);
-    f.double_roundtrip(id);
-    let _ = f.client(id).window(&surface1).recent_configures();
-    let _ = f.client(id).window(&surface2).recent_configures();
+        set_time(f.niri(), Duration::ZERO);
+        f.niri_complete_animations();
 
-    set_time(f.niri(), Duration::ZERO);
-    f.niri_complete_animations();
+        // Focus left window (idx 0) and start maximize transition without committing client size yet.
+        let window1 = mapped_at(f.niri(), 0).window.clone();
+        f.niri().layout.activate_window(&window1);
+        f.niri().layout.set_maximized(&window1, true);
+        // Avoid dispatch/advance_animations: fixture roundtrips advance the real clock and can
+        // settle or time out maximize transitions before we observe them.
 
-    // Focus left window (idx 0) and start maximize transition without committing client size yet.
-    let window1 = mapped_at(f.niri(), 0).window.clone();
-    f.niri().layout.activate_window(&window1);
-    f.niri().layout.set_maximized(&window1, true);
-    // Avoid dispatch/advance_animations: fixture roundtrips advance the real clock and can
-    // settle or time out maximize transitions before we observe them.
-    // The configure is still sent via the layout request path; client will ack later if needed.
+        let obs = observe_scrolling(f.niri());
+        assert_ne!(
+            obs.maximize_transition,
+            MaximizeTransitionObservation::Idle,
+            "maximize transition must be ongoing before client commit; obs={obs:?}"
+        );
+        assert!(
+            !obs.lifecycle_overlays_rendered,
+            "lifecycle overlays suppressed while maximize ongoing; obs={obs:?}"
+        );
 
-    let obs = observe_scrolling(f.niri());
-    assert_ne!(
-        obs.maximize_transition,
-        MaximizeTransitionObservation::Idle,
-        "maximize transition must be ongoing before client commit; obs={obs:?}"
-    );
-    assert!(
-        !obs.lifecycle_overlays_rendered,
-        "lifecycle overlays suppressed while maximize ongoing; obs={obs:?}"
-    );
+        // Minimize non-target with real Genie snapshot (renderer present).
+        let window2 = mapped_at(f.niri(), 1).window.clone();
+        let changed = f
+            .niri_state()
+            .minimize_window_with_animation(&window2, None);
+        assert!(changed, "minimize of non-target must succeed");
 
-    // Minimize non-target with real Genie snapshot (renderer present).
-    let window2 = mapped_at(f.niri(), 1).window.clone();
-    let changed = f
-        .niri_state()
-        .minimize_window_with_animation(&window2, None);
-    assert!(changed, "minimize of non-target must succeed");
+        let obs = observe_scrolling(f.niri());
+        assert!(
+            !obs.lifecycle_overlays_rendered,
+            "F01 baseline: maximize ongoing must suppress overlay render decision"
+        );
+        let minimize = obs
+            .lifecycle_overlays
+            .iter()
+            .find(|o| o.kind == LifecycleOverlayKind::Minimize)
+            .expect("active minimize overlay must be observed from production containers");
+        assert!(minimize.active);
+        assert!(
+            !minimize.rendered,
+            "overlay entry exists and advances, but production decision keeps it unrendered"
+        );
+        assert!(minimize.progress.is_some());
 
-    let obs = observe_scrolling(f.niri());
-    assert!(
-        !obs.lifecycle_overlays_rendered,
-        "F01 baseline: maximize ongoing must suppress overlay render decision"
-    );
-    let minimize = obs
-        .lifecycle_overlays
-        .iter()
-        .find(|o| o.kind == LifecycleOverlayKind::Minimize)
-        .expect("active minimize overlay must be observed from production containers");
-    assert!(minimize.active);
-    assert!(
-        !minimize.rendered,
-        "overlay entry exists and advances, but production decision keeps it unrendered"
-    );
-    assert!(minimize.progress.is_some());
+        // Advance clock: progress must still grow even while suppressed (F01 risk captured).
+        let p0 = minimize.progress.unwrap();
+        set_time(f.niri(), Duration::from_millis(250));
+        f.niri().advance_animations();
+        let obs = observe_scrolling(f.niri());
+        let minimize = obs
+            .lifecycle_overlays
+            .iter()
+            .find(|o| o.kind == LifecycleOverlayKind::Minimize)
+            .expect("minimize still active after partial advance");
+        let p1 = minimize.progress.unwrap();
+        assert!(
+            p1 > p0 || !obs.lifecycle_overlays_rendered,
+            "progress observed under suppressed decision (p0={p0}, p1={p1})"
+        );
+        assert!(!obs.lifecycle_overlays_rendered);
 
-    // Advance clock: progress must still grow even while suppressed (F01 risk captured).
-    let p0 = minimize.progress.unwrap();
-    set_time(f.niri(), Duration::from_millis(250));
-    f.niri().advance_animations();
-    let obs = observe_scrolling(f.niri());
-    let minimize = obs
-        .lifecycle_overlays
-        .iter()
-        .find(|o| o.kind == LifecycleOverlayKind::Minimize)
-        .expect("minimize still active after partial advance");
-    let p1 = minimize.progress.unwrap();
-    assert!(
-        p1 > p0 || !obs.lifecycle_overlays_rendered,
-        "progress observed under suppressed decision (p0={p0}, p1={p1})"
-    );
-    assert!(!obs.lifecycle_overlays_rendered);
-
-    let diag = lifecycle_diag::snapshot();
-    assert!(
-        diag.genie_create >= 1,
-        "opt-in diag must count Genie snapshot creation when enabled"
-    );
-    assert!(diag.snapshot_peak_bytes > 0);
-
-    lifecycle_diag::disable_and_reset();
+        let diag = lifecycle_diag::snapshot();
+        assert!(
+            diag.genie_create >= 1,
+            "opt-in diag must count Genie snapshot creation when enabled"
+        );
+        assert!(diag.snapshot_peak_bytes > 0);
+    });
 }
 
 #[test]
 fn lifecycle_diag_default_off_does_not_count() {
-    lifecycle_diag::disable_and_reset();
-    assert!(!lifecycle_diag::is_enabled());
+    lifecycle_diag::with_test_lock(|| {
+        lifecycle_diag::disable_and_reset();
+        assert!(!lifecycle_diag::is_enabled());
 
-    let mut f = Fixture::new();
-    f.add_output(1, (1920, 1080));
-    // queue_redraw_all happens on various paths; with diag off, snapshot stays zero.
-    f.niri().queue_redraw_all();
-    assert_eq!(lifecycle_diag::snapshot().queue_redraw_all, 0);
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+        // queue_redraw_all happens on various paths; with diag off, snapshot stays zero.
+        f.niri().queue_redraw_all();
+        assert_eq!(lifecycle_diag::snapshot().queue_redraw_all, 0);
+    });
 }

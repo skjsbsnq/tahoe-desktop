@@ -3,6 +3,10 @@
 //! Production keeps these quiet by default. When `NIRI_LIFECYCLE_DIAG=1` (or tests call
 //! [`enable`]), counters accumulate without per-frame string allocation or logging.
 //! Tracy spans remain the GPU/CPU span source of truth.
+//!
+//! Hot-path notes (`note_*`) check [`is_enabled`] first and return without further work when
+//! disabled. Callers that need non-trivial work to build a sample must gate that work on
+//! [`is_enabled`] or pass a lazy `FnOnce` (see [`note_genie_create`]).
 
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -72,10 +76,15 @@ pub fn note_queue_redraw() {
     QUEUE_REDRAW_ONE.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn note_genie_create(variant_bytes: u64) {
+/// Record a Genie snapshot creation.
+///
+/// `variant_bytes` is only evaluated when diagnostics are enabled, so production stays at a
+/// single atomic enabled-check on the create path.
+pub fn note_genie_create(variant_bytes: impl FnOnce() -> u64) {
     if !is_enabled() {
         return;
     }
+    let variant_bytes = variant_bytes();
     GENIE_CREATE.fetch_add(1, Ordering::Relaxed);
     SNAPSHOT_VARIANT_BYTES.fetch_add(variant_bytes, Ordering::Relaxed);
     SNAPSHOT_PEAK_BYTES.fetch_max(variant_bytes, Ordering::Relaxed);
@@ -127,41 +136,83 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+/// Serialize test access to the process-global enable flag and counters.
+///
+/// Production hot paths do not take this lock; only tests that flip enablement need isolation
+/// from parallel `cargo test` threads.
+#[cfg(test)]
+pub fn with_test_lock<R>(f: impl FnOnce() -> R) -> R {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f()
+}
+
+/// Enable, reset, run `f`, then always disable+reset — under [`with_test_lock`].
+#[cfg(test)]
+pub fn with_enabled_for_test<R>(f: impl FnOnce() -> R) -> R {
+    with_test_lock(|| {
+        enable();
+        reset();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        disable_and_reset();
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn disabled_by_default_has_zero_cost_path() {
-        disable_and_reset();
-        assert!(!is_enabled());
-        note_queue_redraw_all();
-        note_genie_create(1024);
-        assert_eq!(snapshot(), Snapshot::default());
+        with_test_lock(|| {
+            disable_and_reset();
+            assert!(!is_enabled());
+            note_queue_redraw_all();
+            note_genie_create(|| 1024);
+            assert_eq!(snapshot(), Snapshot::default());
+        });
     }
 
     #[test]
     fn enabled_counters_accumulate_without_logging() {
-        enable();
-        reset();
-        note_queue_redraw_all();
-        note_queue_redraw();
-        note_genie_create(100);
-        note_genie_create(250);
-        note_tahoe_region_request();
-        note_tahoe_region_commit();
-        note_tahoe_region_capture();
+        with_enabled_for_test(|| {
+            note_queue_redraw_all();
+            note_queue_redraw();
+            note_genie_create(|| 100);
+            note_genie_create(|| 250);
+            note_tahoe_region_request();
+            note_tahoe_region_commit();
+            note_tahoe_region_capture();
 
-        let s = snapshot();
-        assert_eq!(s.queue_redraw_all, 1);
-        assert_eq!(s.queue_redraw, 1);
-        assert_eq!(s.genie_create, 2);
-        assert_eq!(s.snapshot_variant_bytes, 350);
-        assert_eq!(s.snapshot_peak_bytes, 250);
-        assert_eq!(s.tahoe_region_request, 1);
-        assert_eq!(s.tahoe_region_commit, 1);
-        assert_eq!(s.tahoe_region_capture, 1);
+            let s = snapshot();
+            assert_eq!(s.queue_redraw_all, 1);
+            assert_eq!(s.queue_redraw, 1);
+            assert_eq!(s.genie_create, 2);
+            assert_eq!(s.snapshot_variant_bytes, 350);
+            assert_eq!(s.snapshot_peak_bytes, 250);
+            assert_eq!(s.tahoe_region_request, 1);
+            assert_eq!(s.tahoe_region_commit, 1);
+            assert_eq!(s.tahoe_region_capture, 1);
+        });
+    }
 
-        disable_and_reset();
+    #[test]
+    fn note_genie_create_lazy_closure_not_run_when_disabled() {
+        with_test_lock(|| {
+            disable_and_reset();
+            let mut ran = false;
+            note_genie_create(|| {
+                ran = true;
+                99
+            });
+            assert!(!ran, "disabled path must not evaluate variant_bytes");
+            assert_eq!(snapshot().genie_create, 0);
+        });
     }
 }

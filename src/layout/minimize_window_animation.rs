@@ -219,17 +219,19 @@ impl MinimizeWindowAnimation {
             None
         };
 
-        // Opt-in only: default production path is a single atomic load and returns.
-        let variant_bytes = texture_variant_bytes(&buffer)
-            + buffer_with_blocked_out_bg
-                .as_ref()
-                .map(texture_variant_bytes)
-                .unwrap_or(0)
-            + blocked_out
-                .as_ref()
-                .map(|(buf, _)| texture_variant_bytes(buf))
-                .unwrap_or(0);
-        crate::utils::lifecycle_diag::note_genie_create(variant_bytes);
+        // Lazy sample: when diagnostics are off, note_genie_create returns after one atomic load
+        // and does not touch texture sizes.
+        crate::utils::lifecycle_diag::note_genie_create(|| {
+            texture_variant_bytes(&buffer)
+                + buffer_with_blocked_out_bg
+                    .as_ref()
+                    .map(texture_variant_bytes)
+                    .unwrap_or(0)
+                + blocked_out
+                    .as_ref()
+                    .map(|(buf, _)| texture_variant_bytes(buf))
+                    .unwrap_or(0)
+        });
 
         Ok(Self {
             buffer,

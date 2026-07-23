@@ -356,6 +356,11 @@ impl Window {
         self.xdg_surface.ack_configure(serial);
     }
 
+    /// Ack a specific configure serial (for old-vs-latest serial fixture coverage).
+    pub fn ack_serial(&self, serial: u32) {
+        self.xdg_surface.ack_configure(serial);
+    }
+
     pub fn ack_last_and_commit(&self) {
         self.ack_last();
         self.commit();

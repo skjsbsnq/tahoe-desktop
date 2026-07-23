@@ -403,15 +403,14 @@ impl Mapped {
     ///
     /// The fixture uses this to prove that old and latest ack/commit events exercise `Mapped`,
     /// rather than relying on the layout test element's no-op `on_commit` implementation.
+    /// Returns `(committed_maximized, pending_maximized, uncommitted_maximized queue)`.
+    /// The queue pairs are the same `(Serial, bool)` values [`Self::on_commit`] consumes.
     #[cfg(test)]
-    pub(crate) fn test_maximize_commit_state(&self) -> (bool, bool, Vec<Serial>) {
+    pub(crate) fn test_maximize_commit_state(&self) -> (bool, bool, Vec<(Serial, bool)>) {
         (
             self.is_maximized,
             self.is_pending_maximized,
-            self.uncommitted_maximized
-                .iter()
-                .map(|(serial, _)| *serial)
-                .collect(),
+            self.uncommitted_maximized.clone(),
         )
     }
 
