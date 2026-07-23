@@ -1,20 +1,25 @@
-//! Shared minimize/restore lifecycle controller.
+//! Shared lifecycle animation controllers.
 //!
-//! Floating and scrolling each hold one runtime instance. The **policy** lives only here:
-//! per-window active animation, duplicate/no-op, reverse reusing the same snapshot/texture,
-//! advance + completion cleanup, restore-period live-tile visibility lease, and overlay
-//! enumeration metadata.
+//! Floating and scrolling each hold one runtime instance of each controller. **Policy**
+//! lives only here:
 //!
-//! Space adapters supply tile lookup/position, snapshot capture context, layout-specific
-//! focus/activation, and where overlays are placed in the render stack. This module never
-//! inspects Column or FloatingSpace layout structure.
+//! - minimize/restore: per-window active animation, reverse reusing the same snapshot/texture,
+//!   advance + completion cleanup, restore-period live-tile visibility lease, overlay enum
+//! - closing: `ClosingWindow` set ownership, advance + completion cleanup (texture drop),
+//!   overlay enumeration; transaction leaf ownership stays inside `ClosingWindow`
+//!
+//! Space adapters supply tile lookup/position (including scrolling column-delete compensation
+//! and floating stacking/position), snapshot capture, layout-specific focus, and where
+//! overlays sit in the render stack. This module never inspects Column or FloatingSpace
+//! layout structure.
 
 use std::fmt::Debug;
 
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Logical, Point, Rectangle, Scale};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use tracing::warn;
 
+use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::coords::{GenieEndpointResolve, OutputLocalRect};
 use super::minimize_window_animation::{
     MinimizeWindowAnimation, MinimizeWindowAnimationRenderElement,
@@ -22,6 +27,7 @@ use super::minimize_window_animation::{
 use super::tile::TileRenderSnapshot;
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::RenderCtx;
+use crate::utils::transaction::TransactionBlocker;
 
 /// Direction of an active minimize/restore Genie (or alpha fallback) animation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +317,120 @@ impl<Id: Clone + PartialEq + Debug> MinimizeRestoreController<Id> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Closing animation lane
+// ---------------------------------------------------------------------------
+
+/// Shared closing-animation lane: unique owner of active `ClosingWindow` entries.
+///
+/// Floating and scrolling each hold one instance. Creation, advance, completion cleanup
+/// (texture release via drop), and overlay enumeration live here. Space adapters compute
+/// layout positions and resolve transaction disable flags before calling [`Self::start`].
+///
+/// `ClosingWindow::AnimationState::{Waiting, Animating}` remains the transaction leaf owner;
+/// this lane does not rewrite the transaction protocol.
+#[derive(Debug)]
+pub struct ClosingAnimationLane {
+    entries: Vec<ClosingWindow>,
+}
+
+impl Default for ClosingAnimationLane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClosingAnimationLane {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True while any entry is waiting on a transaction blocker or still animating.
+    pub fn are_animations_ongoing(&self) -> bool {
+        self.entries
+            .iter()
+            .any(ClosingWindow::are_animations_ongoing)
+    }
+
+    /// Start a closing overlay at the adapter-provided workspace-content position.
+    ///
+    /// When `disable_transactions` is set, the blocker is replaced with a completed one so the
+    /// animation begins immediately (same as the previous dual-space helpers).
+    ///
+    /// Returns `true` if an entry was pushed; `false` on creation failure (no leak).
+    pub fn start(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        snapshot: TileRenderSnapshot,
+        scale: Scale<f64>,
+        geo_size: Size<f64, Logical>,
+        pos: Point<f64, Logical>,
+        blocker: TransactionBlocker,
+        clock: Clock,
+        anim_config: niri_config::Animation,
+        scale_to: f64,
+        disable_transactions: bool,
+    ) -> bool {
+        let anim = Animation::new(clock, 0., 1., 0., anim_config);
+        let blocker = if disable_transactions {
+            TransactionBlocker::completed()
+        } else {
+            blocker
+        };
+
+        match ClosingWindow::new(
+            renderer, snapshot, scale, geo_size, pos, blocker, anim, scale_to,
+        ) {
+            Ok(closing) => {
+                self.entries.push(closing);
+                true
+            }
+            Err(err) => {
+                warn!("error creating a closing window animation: {err:?}");
+                false
+            }
+        }
+    }
+
+    /// Advance all entries; drop finished ones so textures release on the completing frame.
+    pub fn advance(&mut self) {
+        self.entries.retain_mut(|closing| {
+            closing.advance_animations();
+            closing.are_animations_ongoing()
+        });
+    }
+
+    /// Iterate overlays oldest-first (render typically uses `.rev()` via [`Self::render_overlays`]).
+    pub fn for_each(&self, mut f: impl FnMut(&ClosingWindow)) {
+        for entry in &self.entries {
+            f(entry);
+        }
+    }
+
+    /// Render all closing overlays into `view_rect` (adapter chooses workspace-content vs view space).
+    pub fn render_overlays(
+        &self,
+        mut ctx: RenderCtx<GlesRenderer>,
+        view_rect: Rectangle<f64, Logical>,
+        scale: Scale<f64>,
+        mut push: impl FnMut(ClosingWindowRenderElement),
+    ) {
+        for entry in self.entries.iter().rev() {
+            push(entry.render(ctx.r(), view_rect, scale));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +474,18 @@ mod tests {
         assert_eq!(LeaseEvent::Suppress(1u32), LeaseEvent::Suppress(1));
         assert_eq!(LeaseEvent::Reveal(2u32), LeaseEvent::Reveal(2));
         assert_ne!(LeaseEvent::Suppress(1u32), LeaseEvent::Reveal(1));
+    }
+
+    #[test]
+    fn empty_closing_lane_reports_no_activity() {
+        let mut lane = ClosingAnimationLane::new();
+        assert!(lane.is_empty());
+        assert_eq!(lane.len(), 0);
+        assert!(!lane.are_animations_ongoing());
+        lane.advance();
+        assert!(lane.is_empty());
+        let mut n = 0;
+        lane.for_each(|_| n += 1);
+        assert_eq!(n, 0);
     }
 }

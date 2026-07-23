@@ -74,8 +74,11 @@ niri_render_elements! {
     }
 }
 
+/// Transaction leaf owner for a single closing overlay.
+///
+/// Kept private to the closing path except for unit tests of the Waiting→Animating transition.
 #[derive(Debug)]
-enum AnimationState {
+pub(crate) enum AnimationState {
     Waiting {
         /// Blocker for a transaction before starting the animation.
         blocker: TransactionBlocker,
@@ -93,6 +96,25 @@ impl AnimationState {
             // closing animation is created. Though, it does happen with disable-transactions debug
             // flag.
             Self::Animating(anim)
+        }
+    }
+
+    fn advance(&mut self) {
+        match self {
+            AnimationState::Waiting { blocker, anim } => {
+                if blocker.state() != BlockerState::Pending {
+                    let anim = anim.restarted(0., 1., 0.);
+                    *self = AnimationState::Animating(anim);
+                }
+            }
+            AnimationState::Animating(_anim) => (),
+        }
+    }
+
+    fn are_animations_ongoing(&self) -> bool {
+        match self {
+            AnimationState::Waiting { .. } => true,
+            AnimationState::Animating(anim) => !anim.is_done(),
         }
     }
 }
@@ -168,22 +190,11 @@ impl ClosingWindow {
     }
 
     pub fn advance_animations(&mut self) {
-        match &mut self.anim_state {
-            AnimationState::Waiting { blocker, anim } => {
-                if blocker.state() != BlockerState::Pending {
-                    let anim = anim.restarted(0., 1., 0.);
-                    self.anim_state = AnimationState::Animating(anim);
-                }
-            }
-            AnimationState::Animating(_anim) => (),
-        }
+        self.anim_state.advance();
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        match &self.anim_state {
-            AnimationState::Waiting { .. } => true,
-            AnimationState::Animating(anim) => !anim.is_done(),
-        }
+        self.anim_state.are_animations_ongoing()
     }
 
     pub fn render(
@@ -317,14 +328,70 @@ impl ClosingWindow {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use approx::assert_relative_eq;
 
     use super::native_scale;
+    use super::AnimationState;
+    use crate::animation::{Animation, Clock};
+    use crate::utils::transaction::{Transaction, TransactionBlocker};
 
     #[test]
     fn native_scale_interpolates_to_configured_value() {
         assert_relative_eq!(native_scale(0., 0.97), 1.);
         assert_relative_eq!(native_scale(0.5, 0.97), 0.985);
         assert_relative_eq!(native_scale(1., 0.97), 0.97);
+    }
+
+    fn linear_anim(clock: Clock, ms: u32) -> Animation {
+        Animation::new(
+            clock,
+            0.,
+            1.,
+            0.,
+            niri_config::Animation {
+                off: false,
+                kind: niri_config::animations::Kind::Easing(
+                    niri_config::animations::EasingParams {
+                        duration_ms: ms,
+                        curve: niri_config::animations::Curve::Linear,
+                    },
+                ),
+            },
+        )
+    }
+
+    #[test]
+    fn completed_blocker_starts_animating_immediately() {
+        let clock = Clock::with_time(Duration::ZERO);
+        let state = AnimationState::new(TransactionBlocker::completed(), linear_anim(clock, 100));
+        assert!(matches!(state, AnimationState::Animating(_)));
+        assert!(state.are_animations_ongoing());
+    }
+
+    #[test]
+    fn pending_blocker_waits_then_animates_after_release() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let transaction = Transaction::new();
+        let mut state = AnimationState::new(transaction.blocker(), linear_anim(clock.clone(), 100));
+        assert!(matches!(state, AnimationState::Waiting { .. }));
+        assert!(state.are_animations_ongoing());
+
+        // Advance while pending: must not complete or transition early.
+        state.advance();
+        assert!(matches!(state, AnimationState::Waiting { .. }));
+        assert!(state.are_animations_ongoing());
+
+        // Drop the last Transaction handle so the weak blocker releases (complete on Drop).
+        drop(transaction);
+        state.advance();
+        assert!(matches!(state, AnimationState::Animating(_)));
+        assert!(state.are_animations_ongoing());
+
+        // After duration, animation is done and lane advance would drop the entry/texture.
+        clock.set_unadjusted(Duration::from_millis(150));
+        let _ = clock.now();
+        assert!(!state.are_animations_ongoing());
     }
 }

@@ -8,8 +8,8 @@ use niri_ipc::{PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
-use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
-use super::lifecycle_controller::{LeaseEvent, MinimizeRestoreController};
+use super::closing_window::ClosingWindowRenderElement;
+use super::lifecycle_controller::{ClosingAnimationLane, LeaseEvent, MinimizeRestoreController};
 use super::scrolling::ColumnWidth;
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
@@ -17,7 +17,7 @@ use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, MinimizeRect, Options, RemovedTile,
     SizeFrac,
 };
-use crate::animation::{Animation, Clock};
+use crate::animation::Clock;
 use crate::layout::minimize_window_animation::MinimizeWindowAnimationRenderElement;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -53,8 +53,8 @@ pub struct FloatingSpace<W: LayoutElement> {
     /// Ongoing interactive resize.
     interactive_resize: Option<InteractiveResize<W>>,
 
-    /// Windows in the closing animation.
-    closing_windows: Vec<ClosingWindow>,
+    /// Shared closing animation lane (policy + cleanup ownership).
+    closing: ClosingAnimationLane,
 
     /// Shared minimize/restore lifecycle controller (policy + lease ownership).
     minimize_restore: MinimizeRestoreController<W::Id>,
@@ -219,7 +219,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             data: Vec::new(),
             active_window_id: None,
             interactive_resize: None,
-            closing_windows: Vec::new(),
+            closing: ClosingAnimationLane::new(),
             minimize_restore: MinimizeRestoreController::new(),
             view_size,
             working_area,
@@ -280,10 +280,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             tile.advance_animations();
         }
 
-        self.closing_windows.retain_mut(|closing| {
-            closing.advance_animations();
-            closing.are_animations_ongoing()
-        });
+        self.closing.advance();
 
         let lease_events = self.minimize_restore.advance();
         self.apply_lease_events(lease_events);
@@ -291,13 +288,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     pub fn are_animations_ongoing(&self) -> bool {
         self.tiles.iter().any(Tile::are_animations_ongoing)
-            || !self.closing_windows.is_empty()
+            || self.closing.are_animations_ongoing()
             || self.minimize_restore.are_animations_ongoing()
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
         self.tiles.iter().any(Tile::are_transitions_ongoing)
-            || !self.closing_windows.is_empty()
+            || !self.closing.is_empty()
             || !self.minimize_restore.is_empty()
     }
 
@@ -669,7 +666,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
-    pub fn start_close_animation_for_window(
+    /// Adapter: floating position + stacking; lane owns the ClosingWindow entry.
+    pub fn start_closing(
         &mut self,
         renderer: &mut GlesRenderer,
         id: &W::Id,
@@ -686,7 +684,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let tile_size = tile.tile_size();
 
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.start_closing_at(renderer, snapshot, tile_size, tile_pos, blocker);
     }
 
     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
@@ -923,7 +921,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.data.insert(to_idx, data);
     }
 
-    pub fn start_close_animation_for_tile(
+    /// Adapter: start closing at a precomputed workspace position (interactive-move drop).
+    pub fn start_closing_at(
         &mut self,
         renderer: &mut GlesRenderer,
         snapshot: TileRenderSnapshot,
@@ -931,39 +930,18 @@ impl<W: LayoutElement> FloatingSpace<W> {
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
     ) {
-        let anim = Animation::new(
-            self.clock.clone(),
-            0.,
-            1.,
-            0.,
-            self.options.animations.window_close.anim,
-        );
-
-        let blocker = if self.options.disable_transactions {
-            TransactionBlocker::completed()
-        } else {
-            blocker
-        };
-
-        let scale = Scale::from(self.scale);
-        let res = ClosingWindow::new(
+        let _ = self.closing.start(
             renderer,
             snapshot,
-            scale,
+            Scale::from(self.scale),
             tile_size,
             tile_pos,
             blocker,
-            anim,
+            self.clock.clone(),
+            self.options.animations.window_close.anim,
             self.options.animations.window_close.scale_to,
+            self.options.disable_transactions,
         );
-        match res {
-            Ok(closing) => {
-                self.closing_windows.push(closing);
-            }
-            Err(err) => {
-                warn!("error creating a closing window animation: {err:?}");
-            }
-        }
     }
 
     pub fn toggle_window_width(&mut self, id: Option<&W::Id>, forwards: bool) {
@@ -1406,13 +1384,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
     ) {
         let scale = Scale::from(self.scale);
 
-        // Draw the closing windows on top of the other windows.
+        // Draw closing windows on top of live tiles (stacking among closings: newest last / top).
         //
         // FIXME: I guess this should rather preserve the stacking order when the window is closed.
-        for closing in self.closing_windows.iter().rev() {
-            let elem = closing.render(ctx.as_gles(), view_rect, scale);
-            push(elem.into());
-        }
+        self.closing
+            .render_overlays(ctx.as_gles(), view_rect, scale, |elem| {
+                push(elem.into());
+            });
 
         self.minimize_restore
             .render_overlays(ctx.as_gles(), view_rect, scale, |elem| {

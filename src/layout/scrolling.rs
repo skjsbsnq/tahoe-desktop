@@ -10,8 +10,10 @@ use ordered_float::NotNan;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
-use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
-use super::lifecycle_controller::{LeaseEvent, LifecycleAnimDirection, MinimizeRestoreController};
+use super::closing_window::ClosingWindowRenderElement;
+use super::lifecycle_controller::{
+    ClosingAnimationLane, LeaseEvent, LifecycleAnimDirection, MinimizeRestoreController,
+};
 use super::minimize_window_animation::MinimizeWindowAnimationRenderElement;
 use super::monitor::InsertPosition;
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
@@ -78,8 +80,8 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// Window that temporarily owns rendering while entering the maximized state.
     maximize_transition: Option<MaximizeTransition<W::Id>>,
 
-    /// Windows in the closing animation.
-    closing_windows: Vec<ClosingWindow>,
+    /// Shared closing animation lane (policy + cleanup ownership).
+    closing: ClosingAnimationLane,
 
     /// Shared minimize/restore lifecycle controller (policy + lease ownership).
     minimize_restore: MinimizeRestoreController<W::Id>,
@@ -435,7 +437,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
             maximize_transition: None,
-            closing_windows: Vec::new(),
+            closing: ClosingAnimationLane::new(),
             minimize_restore: MinimizeRestoreController::new(),
             view_size,
             working_area,
@@ -537,10 +539,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         self.finish_maximize_transition_if_settled();
 
-        self.closing_windows.retain_mut(|closing| {
-            closing.advance_animations();
-            closing.are_animations_ongoing()
-        });
+        self.closing.advance();
 
         let lease_events = self.minimize_restore.advance();
         self.apply_lease_events(lease_events);
@@ -549,14 +548,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     pub fn are_animations_ongoing(&self) -> bool {
         self.view_offset.is_animation_ongoing()
             || self.columns.iter().any(Column::are_animations_ongoing)
-            || !self.closing_windows.is_empty()
+            || self.closing.are_animations_ongoing()
             || self.minimize_restore.are_animations_ongoing()
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
         !self.view_offset.is_static()
             || self.columns.iter().any(Column::are_transitions_ongoing)
-            || !self.closing_windows.is_empty()
+            || !self.closing.is_empty()
             || !self.minimize_restore.is_empty()
     }
 
@@ -1878,7 +1877,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         true
     }
 
-    pub fn start_close_animation_for_window(
+    /// Adapter: scrolling column-delete compensation + tabbed skip; lane owns the entry.
+    pub fn start_closing(
         &mut self,
         renderer: &mut GlesRenderer,
         window: &W::Id,
@@ -1936,10 +1936,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             tile_pos.x -= offset;
         }
 
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.start_closing_at(renderer, snapshot, tile_size, tile_pos, blocker);
     }
 
-    fn start_close_animation_for_tile(
+    /// Adapter: start closing at a precomputed workspace-content position.
+    pub fn start_closing_at(
         &mut self,
         renderer: &mut GlesRenderer,
         snapshot: TileRenderSnapshot,
@@ -1947,39 +1948,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
     ) {
-        let anim = Animation::new(
-            self.clock.clone(),
-            0.,
-            1.,
-            0.,
-            self.options.animations.window_close.anim,
-        );
-
-        let blocker = if self.options.disable_transactions {
-            TransactionBlocker::completed()
-        } else {
-            blocker
-        };
-
-        let scale = Scale::from(self.scale);
-        let res = ClosingWindow::new(
+        let _ = self.closing.start(
             renderer,
             snapshot,
-            scale,
+            Scale::from(self.scale),
             tile_size,
             tile_pos,
             blocker,
-            anim,
+            self.clock.clone(),
+            self.options.animations.window_close.anim,
             self.options.animations.window_close.scale_to,
+            self.options.disable_transactions,
         );
-        match res {
-            Ok(closing) => {
-                self.closing_windows.push(closing);
-            }
-            Err(err) => {
-                warn!("error creating a closing window animation: {err:?}");
-            }
-        }
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
@@ -3466,16 +3446,16 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .map(|tile| tile.window().id().clone());
 
         let mut lifecycle_overlays =
-            Vec::with_capacity(self.closing_windows.len() + self.minimize_restore.len());
-        lifecycle_overlays.extend(self.closing_windows.iter().map(|_| {
-            LifecycleOverlayObservation {
+            Vec::with_capacity(self.closing.len() + self.minimize_restore.len());
+        lifecycle_overlays.extend(
+            (0..self.closing.len()).map(|_| LifecycleOverlayObservation {
                 kind: LifecycleOverlayKind::Closing,
                 window: None,
                 active: true,
                 rendered,
                 progress: None,
-            }
-        }));
+            }),
+        );
         self.minimize_restore
             .for_each_overlay(|id, direction, animation| {
                 lifecycle_overlays.push(LifecycleOverlayObservation {
@@ -3556,11 +3536,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // Lifecycle overlays are drawn under an explicit policy action, not gated by the same
         // maximize_exclusive flag that filters ordinary live tiles.
         if policy.scrolling_lifecycle_overlays_are_rendered() {
-            // Draw the closing windows on top of the other windows.
-            for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.as_gles(), content_view_rect, scale);
-                push(elem.into());
-            }
+            // Closing still stores workspace-content positions and subtracts current view_pos.
+            self.closing
+                .render_overlays(ctx.as_gles(), content_view_rect, scale, |elem| {
+                    push(elem.into())
+                });
 
             self.minimize_restore.render_overlays(
                 ctx.as_gles(),

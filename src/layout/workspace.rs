@@ -1909,22 +1909,22 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
-    pub fn start_close_animation_for_window(
+    /// Route close overlay to the space that owns the window; lane lives in each space.
+    pub fn start_closing(
         &mut self,
         renderer: &mut GlesRenderer,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
         if self.floating.has_window(window) {
-            self.floating
-                .start_close_animation_for_window(renderer, window, blocker);
+            self.floating.start_closing(renderer, window, blocker);
         } else {
-            self.scrolling
-                .start_close_animation_for_window(renderer, window, blocker);
+            self.scrolling.start_closing(renderer, window, blocker);
         }
     }
 
-    pub fn start_close_animation_for_tile(
+    /// Interactive-move close lands on floating with a precomputed workspace position.
+    pub fn start_closing_at(
         &mut self,
         renderer: &mut GlesRenderer,
         snapshot: TileRenderSnapshot,
@@ -1933,7 +1933,7 @@ impl<W: LayoutElement> Workspace<W> {
         blocker: TransactionBlocker,
     ) {
         self.floating
-            .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+            .start_closing_at(renderer, snapshot, tile_size, tile_pos, blocker);
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {

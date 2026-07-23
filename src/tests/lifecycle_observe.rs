@@ -873,3 +873,135 @@ fn reverse_at_progress_points_continuous_and_lease_released() {
         "reverse-to-minimize must release restore lease"
     );
 }
+
+/// R06: closing lane starts with completed blocker, draws, then drops entry (texture release).
+#[test]
+fn closing_overlay_completes_and_releases_on_advance() {
+    let mut f = Fixture::with_config(linear_lifecycle_config());
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    set_time(f.niri(), Duration::ZERO);
+    f.niri_complete_animations();
+
+    let window = mapped_at(f.niri(), 0).window.clone();
+    f.niri_state().store_unmap_snapshot(&window, None);
+    {
+        let state = f.niri_state();
+        state.backend.with_primary_renderer(|renderer| {
+            state.niri.layout.start_close_animation_for_window(
+                renderer,
+                &window,
+                TransactionBlocker::completed(),
+            );
+        });
+    }
+
+    let obs = observe_scrolling(f.niri());
+    assert_eq!(
+        obs.lifecycle_overlays
+            .iter()
+            .filter(|o| o.kind == LifecycleOverlayKind::Closing)
+            .count(),
+        1,
+        "closing lane must hold one entry after start: {obs:?}"
+    );
+    assert!(
+        obs.lifecycle_overlays
+            .iter()
+            .any(|o| o.kind == LifecycleOverlayKind::Closing && o.active && o.rendered),
+        "closing must be active and drawn under Draw policy: {obs:?}"
+    );
+
+    // Mid-animation: still present.
+    set_time(f.niri(), Duration::from_millis(400));
+    f.niri().advance_animations();
+    let obs = observe_scrolling(f.niri());
+    assert!(
+        obs.lifecycle_overlays
+            .iter()
+            .any(|o| o.kind == LifecycleOverlayKind::Closing && o.active),
+        "closing still active mid-flight: {obs:?}"
+    );
+
+    // Past duration: advance drops finished entry → texture released with drop.
+    set_time(f.niri(), Duration::from_millis(1100));
+    f.niri().advance_animations();
+    let obs = observe_scrolling(f.niri());
+    assert!(
+        obs.lifecycle_overlays
+            .iter()
+            .all(|o| o.kind != LifecycleOverlayKind::Closing),
+        "closing entry must be gone after completion: {obs:?}"
+    );
+}
+
+/// R06: floating close uses the floating space lane; scrolling observation stays free of it.
+#[test]
+fn floating_closing_uses_floating_lane_not_scrolling() {
+    let mut f = Fixture::with_config(linear_lifecycle_config());
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface_t = create_window(&mut f, id, 200, 200);
+    let surface_f = create_window(&mut f, id, 200, 200);
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface_t).recent_configures();
+    let _ = f.client(id).window(&surface_f).recent_configures();
+
+    let window_f = mapped_at(f.niri(), 1).window.clone();
+    f.niri().layout.toggle_window_floating(Some(&window_f));
+    f.double_roundtrip(id);
+
+    set_time(f.niri(), Duration::ZERO);
+    f.niri_complete_animations();
+
+    f.niri_state().store_unmap_snapshot(&window_f, None);
+    {
+        let state = f.niri_state();
+        state.backend.with_primary_renderer(|renderer| {
+            state.niri.layout.start_close_animation_for_window(
+                renderer,
+                &window_f,
+                TransactionBlocker::completed(),
+            );
+        });
+    }
+
+    // Scrolling lane must not own the floating close overlay.
+    let obs = observe_scrolling(f.niri());
+    assert!(
+        obs.lifecycle_overlays
+            .iter()
+            .all(|o| o.kind != LifecycleOverlayKind::Closing),
+        "floating close must not appear on scrolling observation: {obs:?}"
+    );
+    // Floating space reports ongoing animation while the lane holds the entry.
+    assert!(
+        f.niri()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .floating()
+            .are_animations_ongoing(),
+        "floating closing lane must report ongoing animation"
+    );
+
+    set_time(f.niri(), Duration::from_millis(1100));
+    f.niri().advance_animations();
+    assert!(
+        !f.niri()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .floating()
+            .are_animations_ongoing(),
+        "floating closing lane must clear after completion"
+    );
+}

@@ -1,7 +1,7 @@
-//! R05: shared minimize/restore controller ownership and lease invariants.
+//! R05/R06: shared minimize/restore + closing lane ownership invariants.
 //!
 //! Layout-level tests cover floating / scrolling / tabbed model adapters without GPU.
-//! GPU reverse morph continuity is covered in `tests::lifecycle_observe`.
+//! GPU reverse morph / closing completion is covered in `tests::lifecycle_observe`.
 
 use super::*;
 use crate::layout::lifecycle_controller::MinimizeRestoreController;
@@ -172,5 +172,79 @@ fn minimize_then_restore_without_rect_does_not_suppress_live_tile() {
                 "no-anchor restore must not leave restore visibility lease"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R06: closing animation lane
+// ---------------------------------------------------------------------------
+
+/// Close without unmap snapshot must not invent a closing overlay (adapters require snapshot).
+#[test]
+fn table_close_without_snapshot_leaves_closing_lane_empty() {
+    for kind in [SpaceKind::Scrolling, SpaceKind::Floating, SpaceKind::Tabbed] {
+        let mut layout = layout_for(kind);
+        // Model-level close removes the window; without store_unmap_snapshot there is no
+        // closing entry (start_closing only pushes after take_unmap_snapshot).
+        Op::CloseWindow(1).apply(&mut layout);
+        if let Some(ws) = layout.active_workspace() {
+            // Remaining space (if any) must not report a Closing overlay observation.
+            let obs = ws.scrolling().render_observation();
+            assert!(
+                obs.lifecycle_overlays
+                    .iter()
+                    .all(|o| o.kind != LifecycleOverlayKind::Closing),
+                "{kind:?}: no closing overlay without snapshot: {obs:?}"
+            );
+            // Advance paths on both spaces remain safe (independent lane instances).
+            let _ = ws.scrolling().are_animations_ongoing();
+            let _ = ws.floating().are_animations_ongoing();
+        }
+    }
+}
+
+#[test]
+fn floating_and_scrolling_each_own_separate_closing_lanes() {
+    let mut params = TestWindowParams::new(2);
+    params.is_floating = true;
+    let layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow { params },
+    ]);
+    let ws = layout.active_workspace().unwrap();
+    // Structural: both spaces answer animation queries independently; no closing overlays.
+    assert!(!ws.scrolling().are_animations_ongoing());
+    assert!(!ws.floating().are_animations_ongoing());
+    assert!(ws
+        .scrolling()
+        .render_observation()
+        .lifecycle_overlays
+        .iter()
+        .all(|o| o.kind != LifecycleOverlayKind::Closing));
+}
+
+#[test]
+fn close_while_opening_path_is_safe_without_snapshot() {
+    // Opening unfinished + close: model remove must not panic; no fake closing entry.
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::CompleteAnimations,
+    ]);
+    layout.start_open_animation_for_window(&1);
+    Op::CloseWindow(1).apply(&mut layout);
+    if let Some(ws) = layout.active_workspace() {
+        let obs = ws.scrolling().render_observation();
+        assert!(
+            obs.lifecycle_overlays
+                .iter()
+                .all(|o| o.kind != LifecycleOverlayKind::Closing),
+            "close without snapshot must not leave closing overlay: {obs:?}"
+        );
     }
 }
