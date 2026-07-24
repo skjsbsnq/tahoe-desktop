@@ -11,6 +11,7 @@ mod fullscreen;
 mod layer_shell;
 mod lifecycle_command;
 mod lifecycle_observe;
+mod r15_perf_baseline;
 mod remove_output;
 mod tahoe_glass;
 mod transactions;
