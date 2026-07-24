@@ -242,6 +242,60 @@ impl ShaderRenderElement {
         self.commit_counter.increment();
     }
 
+    /// Seed uniform slots once (static names). Subsequent frames should mutate values via
+    /// [`Self::with_uniforms_mut`] instead of allocating a new `Rc`.
+    pub fn seed_uniforms(&mut self, uniforms: Rc<[Uniform<'static>]>) {
+        self.additional_uniforms = uniforms;
+    }
+
+    /// Mutate existing uniform *values* without replacing the `Rc` when uniquely owned.
+    ///
+    /// Callers must drop prior-frame `clone()`s of this element before the next update so the
+    /// `Rc` is unique. If a clone is still held, rebuilds once to regain exclusive ownership
+    /// (preserves names/types; not the normal Genie single-pass path after the frame list drops).
+    pub fn with_uniforms_mut<R>(&mut self, f: impl FnOnce(&mut [Uniform<'static>]) -> R) -> R {
+        if Rc::get_mut(&mut self.additional_uniforms).is_none() {
+            // Regain exclusive ownership; preserves names/types, clones current values.
+            self.additional_uniforms = self.additional_uniforms.iter().cloned().collect();
+        }
+        f(
+            Rc::get_mut(&mut self.additional_uniforms)
+                .expect("uniforms uniquely owned after rebind"),
+        )
+    }
+
+    /// Insert or replace a texture binding. Allocates the map key only on first insert.
+    pub fn set_texture(&mut self, name: &str, texture: GlesTexture) {
+        if let Some(slot) = self.textures.get_mut(name) {
+            *slot = texture;
+        } else {
+            self.textures.insert(name.to_owned(), texture);
+        }
+    }
+
+    /// Update size/scale/alpha and full area (including location) without changing identity.
+    ///
+    /// When `opaque_regions` is `None`, existing opaque regions are left unchanged (avoids
+    /// allocating an empty `Vec` every frame on paths that never use opaque regions).
+    pub fn set_geometry(
+        &mut self,
+        area: Rectangle<f64, Logical>,
+        opaque_regions: Option<Vec<Rectangle<f64, Logical>>>,
+        scale: f32,
+        alpha: f32,
+    ) {
+        self.area = area;
+        if let Some(regions) = opaque_regions {
+            self.opaque_regions = regions;
+        }
+        self.scale = scale;
+        self.alpha = alpha;
+    }
+
+    pub fn set_location(&mut self, location: Point<f64, Logical>) {
+        self.area.loc = location;
+    }
+
     pub fn with_location(mut self, location: Point<f64, Logical>) -> Self {
         self.area.loc = location;
         self
@@ -250,6 +304,44 @@ impl ShaderRenderElement {
     pub fn with_alpha(mut self, alpha: f32) -> Self {
         self.alpha = alpha;
         self
+    }
+}
+
+/// In-place uniform value helpers shared by Genie (and any shader element that seeds slots once).
+pub mod uniform_value {
+    use glam::Mat3;
+    use smithay::backend::renderer::gles::{Uniform, UniformValue};
+
+    pub fn set_f32(uniform: &mut Uniform<'static>, value: f32) {
+        uniform.value = UniformValue::_1f(value);
+    }
+
+    pub fn set_rect4(uniform: &mut Uniform<'static>, value: [f32; 4]) {
+        uniform.value = UniformValue::_4f(value[0], value[1], value[2], value[3]);
+    }
+
+    /// Overwrite a pre-seeded `Matrix3x3` slot without reallocating the matrices `Vec` when possible.
+    pub fn set_mat3(uniform: &mut Uniform<'static>, mat: Mat3) {
+        let cols = mat.to_cols_array();
+        match &mut uniform.value {
+            UniformValue::Matrix3x3 {
+                matrices,
+                transpose,
+            } => {
+                if let Some(slot) = matrices.first_mut() {
+                    *slot = cols;
+                } else {
+                    matrices.push(cols);
+                }
+                *transpose = false;
+            }
+            _ => {
+                uniform.value = UniformValue::Matrix3x3 {
+                    matrices: vec![cols],
+                    transpose: false,
+                };
+            }
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
@@ -6,8 +6,8 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::element::{Kind, RenderElement};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform};
+use smithay::backend::renderer::element::{Element, Kind, RenderElement};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform, UniformValue};
 use smithay::backend::renderer::Texture;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Transform};
 
@@ -17,8 +17,8 @@ use crate::animation::Animation;
 use crate::layout::coords::{OutputLocalPoint, OutputLocalRectF};
 use crate::niri_render_elements;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
-use crate::render_helpers::shader_element::ShaderRenderElement;
-use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
+use crate::render_helpers::shader_element::{uniform_value, ShaderRenderElement};
+use crate::render_helpers::shaders::{ProgramType, Shaders};
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::{render_to_encompassing_texture, RenderCtx, RenderTarget};
@@ -81,6 +81,11 @@ pub struct MinimizeWindowAnimation {
     /// Dock / restore endpoint in the same output-local space as `pos`.
     target_rect: Option<OutputLocalRectF>,
     direction: GenieDirection,
+
+    /// Stable Genie shader element: `Id` created once; per-frame path only mutates uniforms,
+    /// texture binding, geometry and commit counter. Interior mutability so layout render stays
+    /// `&self` while still updating dynamic data in place.
+    genie_shader: RefCell<ShaderRenderElement>,
 }
 
 niri_render_elements! {
@@ -239,6 +244,8 @@ impl MinimizeWindowAnimation {
                     .unwrap_or(0)
         });
 
+        let genie_shader = RefCell::new(seed_genie_shader(buffer.texture().clone()));
+
         Ok(Self {
             buffer,
             buffer_with_blocked_out_bg,
@@ -252,6 +259,7 @@ impl MinimizeWindowAnimation {
             alpha_to,
             target_rect,
             direction,
+            genie_shader,
         })
     }
 
@@ -431,34 +439,93 @@ impl MinimizeWindowAnimation {
         let progress = self.anim.value();
         let clamped_progress = self.anim.clamped_value().clamp(0., 1.);
 
-        let uniforms = Rc::new([
-            Uniform::new("niri_area_rect", rect_uniform(area)),
-            Uniform::new("niri_window_rect", rect_uniform(window_rect)),
-            Uniform::new("niri_target_rect", rect_uniform(target_rect)),
-            mat3_uniform("niri_geo_to_tex", geo_to_tex),
-            Uniform::new("niri_progress", progress as f32),
-            Uniform::new("niri_clamped_progress", clamped_progress as f32),
-            Uniform::new("niri_direction", self.direction.shader_value()),
-        ]);
-
         // Single output-local → render-target step (identity when view origin is zero).
         let mut location = area.loc;
         location -= view_rect.loc;
 
-        Some(
-            ShaderRenderElement::new(
-                ProgramType::Genie,
-                area.size,
-                None,
-                scale.x as f32,
-                1.,
-                uniforms,
-                HashMap::from([(String::from("niri_tex"), buffer.texture().clone())]),
-                Kind::Unspecified,
-            )
-            .with_location(location),
-        )
+        let area_rect = rect_uniform(area);
+        let window_rect_u = rect_uniform(window_rect);
+        let target_rect_u = rect_uniform(target_rect);
+        let progress_f = progress as f32;
+        let clamped_f = clamped_progress as f32;
+        let direction_f = self.direction.shader_value();
+        let texture = buffer.texture().clone();
+
+        // Stable element path: no per-frame ShaderRenderElement::new / Id::new, no Rc::new of
+        // uniforms, no HashMap::from / String::from for the texture key.
+        let mut genie = self.genie_shader.borrow_mut();
+        genie.set_geometry(
+            Rectangle::new(location, area.size),
+            None,
+            scale.x as f32,
+            1.,
+        );
+        genie.set_texture(GENIE_TEX_UNIFORM, texture);
+        genie.with_uniforms_mut(|uniforms| {
+            debug_assert_eq!(uniforms.len(), genie_uniform::COUNT);
+            uniform_value::set_rect4(&mut uniforms[genie_uniform::AREA_RECT], area_rect);
+            uniform_value::set_rect4(&mut uniforms[genie_uniform::WINDOW_RECT], window_rect_u);
+            uniform_value::set_rect4(&mut uniforms[genie_uniform::TARGET_RECT], target_rect_u);
+            uniform_value::set_mat3(&mut uniforms[genie_uniform::GEO_TO_TEX], geo_to_tex);
+            uniform_value::set_f32(&mut uniforms[genie_uniform::PROGRESS], progress_f);
+            uniform_value::set_f32(&mut uniforms[genie_uniform::CLAMPED_PROGRESS], clamped_f);
+            uniform_value::set_f32(&mut uniforms[genie_uniform::DIRECTION], direction_f);
+        });
+        genie.damage_all();
+
+        Some(genie.clone())
     }
+
+    /// Stable Genie element id (test/observation). Present after construction.
+    #[cfg(test)]
+    pub(crate) fn test_genie_element_id(&self) -> smithay::backend::renderer::element::Id {
+        self.genie_shader.borrow().id().clone()
+    }
+
+    /// Genie commit counter after the last `render_genie` update (test/observation).
+    #[cfg(test)]
+    pub(crate) fn test_genie_commit(&self) -> smithay::backend::renderer::utils::CommitCounter {
+        self.genie_shader.borrow().current_commit()
+    }
+}
+
+const GENIE_TEX_UNIFORM: &str = "niri_tex";
+
+/// Indices into the seeded Genie uniform array (must match [`seed_genie_shader`]).
+mod genie_uniform {
+    pub const AREA_RECT: usize = 0;
+    pub const WINDOW_RECT: usize = 1;
+    pub const TARGET_RECT: usize = 2;
+    pub const GEO_TO_TEX: usize = 3;
+    pub const PROGRESS: usize = 4;
+    pub const CLAMPED_PROGRESS: usize = 5;
+    pub const DIRECTION: usize = 6;
+    pub const COUNT: usize = 7;
+}
+
+/// Create the stable Genie element once: single `Id::new`, seed uniforms + texture key.
+fn seed_genie_shader(initial_tex: GlesTexture) -> ShaderRenderElement {
+    let mut elem = ShaderRenderElement::empty(ProgramType::Genie, Kind::Unspecified);
+    // One-time Rc for the seven named slots; frames only mutate `.value`.
+    debug_assert_eq!(genie_uniform::COUNT, 7);
+    elem.seed_uniforms(Rc::new([
+        Uniform::new("niri_area_rect", [0f32; 4]),
+        Uniform::new("niri_window_rect", [0f32; 4]),
+        Uniform::new("niri_target_rect", [0f32; 4]),
+        Uniform {
+            name: std::borrow::Cow::Borrowed("niri_geo_to_tex"),
+            value: UniformValue::Matrix3x3 {
+                matrices: vec![Mat3::IDENTITY.to_cols_array()],
+                transpose: false,
+            },
+        },
+        Uniform::new("niri_progress", 0f32),
+        Uniform::new("niri_clamped_progress", 0f32),
+        Uniform::new("niri_direction", 1f32),
+    ]));
+    // One-time String key; later frames only replace the GlesTexture value.
+    elem.set_texture(GENIE_TEX_UNIFORM, initial_tex);
+    elem
 }
 
 fn rect_uniform(rect: Rectangle<f64, Logical>) -> [f32; 4] {
@@ -564,5 +631,82 @@ mod tests {
         let buggy_dock = 900.0 - view_pos;
         assert_eq!(buggy_dock, -100.0);
         assert!(buggy_dock < 0.0);
+    }
+
+    #[test]
+    fn seed_genie_shader_has_stable_id_and_seven_uniforms() {
+        // Cannot construct GlesTexture without GL; exercise seed structure via empty + seed.
+        let mut elem = ShaderRenderElement::empty(ProgramType::Genie, Kind::Unspecified);
+        let id0 = elem.id().clone();
+        elem.seed_uniforms(Rc::new([
+            Uniform::new("niri_area_rect", [0f32; 4]),
+            Uniform::new("niri_window_rect", [0f32; 4]),
+            Uniform::new("niri_target_rect", [0f32; 4]),
+            Uniform {
+                name: std::borrow::Cow::Borrowed("niri_geo_to_tex"),
+                value: UniformValue::Matrix3x3 {
+                    matrices: vec![Mat3::IDENTITY.to_cols_array()],
+                    transpose: false,
+                },
+            },
+            Uniform::new("niri_progress", 0f32),
+            Uniform::new("niri_clamped_progress", 0f32),
+            Uniform::new("niri_direction", 1f32),
+        ]));
+        assert_eq!(elem.id(), &id0, "seed must not create a new Id");
+
+        let c0 = elem.current_commit();
+        elem.with_uniforms_mut(|u| {
+            assert_eq!(u.len(), 7);
+            uniform_value::set_f32(&mut u[4], 0.5);
+            uniform_value::set_mat3(&mut u[3], Mat3::from_scale(Vec2::new(2., 2.)));
+        });
+        elem.set_geometry(
+            Rectangle::new(Point::from((10., 20.)), Size::from((100., 200.))),
+            None,
+            1.5,
+            1.,
+        );
+        elem.damage_all();
+        let c1 = elem.current_commit();
+        assert_ne!(c0, c1, "dynamic commit must advance on damage");
+        assert_eq!(elem.id(), &id0, "update must keep stable Id");
+
+        // Second frame: still same Id, commit advances again.
+        elem.with_uniforms_mut(|u| uniform_value::set_f32(&mut u[4], 0.75));
+        elem.damage_all();
+        assert_eq!(elem.id(), &id0);
+        assert_ne!(elem.current_commit(), c1);
+    }
+
+    #[test]
+    fn uniform_value_set_mat3_reuses_matrices_slot() {
+        let mut u = Uniform {
+            name: std::borrow::Cow::Borrowed("niri_geo_to_tex"),
+            value: UniformValue::Matrix3x3 {
+                matrices: vec![Mat3::IDENTITY.to_cols_array()],
+                transpose: false,
+            },
+        };
+        let ptr_before = match &u.value {
+            UniformValue::Matrix3x3 { matrices, .. } => matrices.as_ptr(),
+            _ => panic!("expected matrix"),
+        };
+        uniform_value::set_mat3(&mut u, Mat3::from_translation(Vec2::new(1., 2.)));
+        match &u.value {
+            UniformValue::Matrix3x3 {
+                matrices,
+                transpose,
+            } => {
+                assert_eq!(matrices.len(), 1);
+                assert!(!*transpose);
+                assert_eq!(
+                    matrices.as_ptr(),
+                    ptr_before,
+                    "in-place mat3 update must not reallocate the matrices Vec"
+                );
+            }
+            _ => panic!("expected matrix after set"),
+        }
     }
 }

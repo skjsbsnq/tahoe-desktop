@@ -3466,6 +3466,32 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
+    /// Test/observation: visit active minimize/restore Genie animations (stable element identity).
+    #[cfg(test)]
+    pub(crate) fn test_for_each_minimize_restore(
+        &self,
+        f: impl FnMut(
+            &W::Id,
+            LifecycleAnimDirection,
+            &super::minimize_window_animation::MinimizeWindowAnimation,
+        ),
+    ) {
+        self.minimize_restore.for_each_overlay(f);
+    }
+
+    /// Test/observation: render minimize/restore overlays through the production path.
+    #[cfg(test)]
+    pub(crate) fn test_render_minimize_restore_overlays(
+        &self,
+        mut ctx: crate::render_helpers::RenderCtx<GlesRenderer>,
+        view_rect: Rectangle<f64, Logical>,
+        scale: Scale<f64>,
+        mut push: impl FnMut(MinimizeWindowAnimationRenderElement),
+    ) {
+        self.minimize_restore
+            .render_overlays(ctx.r(), view_rect, scale, |elem| push(elem));
+    }
+
     fn finish_maximize_transition_if_settled(&mut self) {
         let now = self.clock.now_unadjusted();
         let Some(transition) = self.maximize_transition.as_ref() else {
