@@ -6,7 +6,9 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::element::{Element, Kind, RenderElement};
+use smithay::backend::renderer::element::{Kind, RenderElement};
+#[cfg(test)]
+use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform, UniformValue};
 use smithay::backend::renderer::Texture;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Transform};

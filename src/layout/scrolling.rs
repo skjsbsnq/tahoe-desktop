@@ -12,8 +12,10 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::ClosingWindowRenderElement;
 use super::lifecycle_controller::{
-    ClosingAnimationLane, LeaseEvent, LifecycleAnimDirection, MinimizeRestoreController,
+    ClosingAnimationLane, LeaseEvent, MinimizeRestoreController,
 };
+#[cfg(test)]
+use super::lifecycle_controller::LifecycleAnimDirection;
 use super::maximize_visual_fsm::{MaximizeVisualClear, MaximizeVisualFsm, MaximizeVisualPhase};
 use super::minimize_window_animation::MinimizeWindowAnimationRenderElement;
 use super::monitor::InsertPosition;
