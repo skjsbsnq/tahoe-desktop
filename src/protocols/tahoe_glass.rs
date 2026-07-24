@@ -240,11 +240,9 @@ fn mark_pending_dirty(surface: &WlSurface) {
 
             if changed {
                 crate::utils::lifecycle_diag::note_tahoe_region_commit();
-                if let Some(output) = state.niri.output_for_root(surface).cloned() {
-                    state.niri.queue_redraw(&output);
-                } else {
-                    state.niri.queue_redraw_all();
-                }
+                // R14: sole server lifecycle redraw owner (same as destroy/recreate).
+                // Targeted output when locatable; fallback all only when not.
+                state.queue_redraw_for_tahoe_glass_surface(surface);
             }
         });
     }
@@ -304,6 +302,19 @@ static TEST_FALLBACK_REDRAW_ALL: AtomicUsize = AtomicUsize::new(0);
 static TEST_DAMAGE_OLD_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static TEST_LAST_DAMAGED_OLD_RECTS: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
+/// Serializes integration tests that reset/assert the shared redraw counters so
+/// parallel libtest workers cannot interleave another test's reset between a
+/// production handler note and the assert.
+#[cfg(test)]
+static TEST_REDRAW_COUNTER_LOCK: Mutex<()> = Mutex::new(());
+
+/// Hold for the full reset → action → assert window of any counter-based test.
+#[cfg(test)]
+pub fn test_redraw_counter_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_REDRAW_COUNTER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Reset redraw/damage counters between tests.
 #[cfg(test)]

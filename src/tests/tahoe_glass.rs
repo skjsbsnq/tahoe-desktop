@@ -19,7 +19,8 @@ use super::*;
 use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_surface_v1::TahoeGlassSurfaceV1;
 use crate::protocols::tahoe_glass::{
     get_committed_regions, test_damage_old_region_count, test_fallback_redraw_all_count,
-    test_last_damaged_old_rects, test_reset_redraw_counters, test_targeted_redraw_count,
+    test_last_damaged_old_rects, test_redraw_counter_lock, test_reset_redraw_counters,
+    test_targeted_redraw_count,
 };
 use crate::render_helpers::shaders::Shaders;
 use crate::tests::client::LayerConfigureProps;
@@ -381,6 +382,8 @@ fn abnormal_client_disconnect_clears_committed_glass() {
 
     let server_surface = server_surface_for_client_layer(&mut f, &client_surface);
     assert_eq!(committed_count(&server_surface), 1);
+
+    let _counter_guard = test_redraw_counter_lock();
     test_reset_redraw_counters();
 
     // Drop the client without protocol Destroy — smithay runs resource
@@ -431,6 +434,7 @@ fn destroy_controller_queues_redraw_only_on_root_output() {
     let server_surface = server_surface_for_client_layer(&mut f, &client_surface);
     assert_eq!(committed_count(&server_surface), 1);
 
+    let _counter_guard = test_redraw_counter_lock();
     test_reset_redraw_counters();
     glass.destroy();
     f.client(id).connection.flush().unwrap();
@@ -455,6 +459,46 @@ fn destroy_controller_queues_redraw_only_on_root_output() {
     assert!(
         rects.iter().any(|r| *r == (8, 4, 128, 32)),
         "old committed rect must be in the damage record: {rects:?}"
+    );
+}
+
+/// R14: region commit (post-commit hook) must use the same redraw owner as
+/// destroy/recreate — targeted when root is locatable, never a parallel
+/// inline output_for_root branch that skips the counters.
+#[test]
+fn commit_queues_redraw_via_unified_handler_on_root_output() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let glass_manager = f.client(id).tahoe_glass_manager();
+    let qh = f.client(id).qh.clone();
+    let glass = glass_manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+
+    // Hold the counter lock for the full reset→commit→assert window so other
+    // counter-based tests cannot interleave a reset. Concurrent glass tests may
+    // still note redraws if they omit the lock; assert only the targeted path
+    // fired ( >= 1 ) and that this commit did not take the unlocatable fallback.
+    let _counter_guard = test_redraw_counter_lock();
+    test_reset_redraw_counters();
+    set_and_commit_region(&mut f, id, &client_surface, &glass, 1);
+
+    let server_surface = server_surface_for_client_layer(&mut f, &client_surface);
+    assert_eq!(committed_count(&server_surface), 1);
+    let targeted = test_targeted_redraw_count();
+    let fallback = test_fallback_redraw_all_count();
+    assert!(
+        targeted >= 1,
+        "glass commit must queue redraw via queue_redraw_for_tahoe_glass_surface (targeted={targeted}, fallback={fallback})"
+    );
+    // Fallback notes can only come from unlocatable roots. This mapped dual-output
+    // fixture must resolve via output_for_root; any fallback here means the old
+    // parallel post-commit branch or a broken owner.
+    assert_eq!(
+        fallback, 0,
+        "mapped root commit must not fall back to queue_redraw_all (targeted={targeted})"
     );
 }
 
@@ -497,6 +541,7 @@ fn clear_with_unlocatable_root_queues_all_outputs() {
 
     // Drive the same State method the protocol Destroy path uses when clear
     // requests a redraw for a still-alive but unmapped surface.
+    let _counter_guard = test_redraw_counter_lock();
     test_reset_redraw_counters();
     f.niri_state()
         .queue_redraw_for_tahoe_glass_surface(&server_surface);
