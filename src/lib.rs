@@ -18,6 +18,7 @@ pub mod layout;
 pub mod lifecycle_command;
 pub mod niri;
 pub mod protocols;
+pub mod redraw_attribution;
 pub mod render_helpers;
 pub mod rubber_band;
 #[cfg(feature = "xdp-gnome-screencast")]

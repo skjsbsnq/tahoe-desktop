@@ -7,6 +7,7 @@
 use smithay::desktop::Window;
 
 use crate::layout::MinimizeRect;
+use crate::redraw_attribution::RedrawAttribution;
 
 /// Direction of a window lifecycle transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,22 +91,29 @@ pub enum LifecycleCommandOutcome {
     NoOp,
 }
 
-/// Unified command result for adapters (protocol response + redraw).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Unified command result for adapters (protocol response + redraw attribution).
+///
+/// Adapters must apply [`Self::redraw`] via
+/// [`crate::niri::Niri::apply_redraw_attribution`] and must not invent a parallel
+/// `queue_redraw_all` path for lifecycle events.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleCommandResult {
     pub outcome: LifecycleCommandOutcome,
+    pub redraw: RedrawAttribution,
 }
 
 impl LifecycleCommandResult {
-    pub fn applied() -> Self {
+    pub fn applied(redraw: RedrawAttribution) -> Self {
         Self {
             outcome: LifecycleCommandOutcome::Applied,
+            redraw,
         }
     }
 
     pub fn no_op() -> Self {
         Self {
             outcome: LifecycleCommandOutcome::NoOp,
+            redraw: RedrawAttribution::none(),
         }
     }
 

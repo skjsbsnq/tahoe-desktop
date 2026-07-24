@@ -839,8 +839,8 @@ impl XdgShellHandler for State {
         ));
         if result.changed() {
             self.niri.layer_shell_on_demand_focus = None;
-            self.niri.queue_redraw_all();
         }
+        self.niri.apply_redraw_attribution(result.redraw);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {

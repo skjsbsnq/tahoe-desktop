@@ -154,8 +154,8 @@ fn r15_queue_redraw_all_marks_every_dual_output() {
     assert!((waste_ratio - 0.5).abs() < f64::EPSILON || waste_ratio >= 0.5);
 }
 
-/// R17: production foreign minimize (locatable window + known home output) still
-/// uses `queue_redraw_all` (not targeted `queue_redraw`).
+/// Historical R15 Go sample for foreign minimize (pre-R17 used queue_redraw_all).
+/// Post-R17 the same path is targeted; sample documents the improvement.
 #[test]
 fn r15_foreign_minimize_dual_output_redraw_all_waste() {
     lifecycle_diag::with_enabled_for_test(|| {
@@ -176,33 +176,28 @@ fn r15_foreign_minimize_dual_output_redraw_all_waste() {
         f.double_roundtrip(id);
 
         let diag = lifecycle_diag::snapshot();
-        // After roundtrip the present loop may clear Queued; attribute via diag.
-        // Multi-output waste is proven by r15_queue_redraw_all_marks_every_dual_output
-        // + this path calling queue_redraw_all ≥ 1 with home_outputs=1.
         let total_outputs = f.niri().output_state.len();
-        let waste_ratio_if_all = (total_outputs.saturating_sub(1)) as f64 / total_outputs as f64;
 
         eprintln!(
             "R15_SAMPLE kind=r17_foreign_minimize_dual_output \
              queue_redraw_all={} queue_redraw={} outputs_total={} home_outputs=1 \
-             implied_waste_ratio_if_redraw_all={waste_ratio_if_all:.3} \
-             genie_create={} snapshot_peak_bytes={}",
+             targeted_lifecycle={} \
+             genie_create={} snapshot_peak_bytes={} note=post_R17_targeted",
             diag.queue_redraw_all,
             diag.queue_redraw,
             total_outputs,
+            diag.redraw_targeted_lifecycle,
             diag.genie_create,
             diag.snapshot_peak_bytes
         );
 
-        assert!(
-            diag.queue_redraw_all >= 1,
-            "locatable foreign minimize must still call queue_redraw_all (got {})",
-            diag.queue_redraw_all
-        );
-        // Foreign minimize path must not use targeted queue_redraw as its primary
-        // attribution (adapter always redraw-alls on change).
+        // R17: foreign minimize adapter applies Lifecycle attribution (targeted).
+        // Incidental redraw-all from pointer refresh (outside cluster) may still appear
+        // during double_roundtrip; see r17_foreign_minimize_targets_home_output_only
+        // for zero-waste Queued-state proof on the attribution path alone.
+        assert!(diag.queue_redraw >= 1);
+        assert!(diag.redraw_targeted_lifecycle >= 1);
         assert_eq!(total_outputs, 2);
-        assert!(waste_ratio_if_all >= 0.5);
         assert!(
             f.niri().layout.windows().next().unwrap().1.is_minimized(),
             "minimize must apply"
@@ -210,7 +205,7 @@ fn r15_foreign_minimize_dual_output_redraw_all_waste() {
     });
 }
 
-/// R17: foreign restore after minimize also redraw-alls every output.
+/// Historical R15 sample; post-R17 foreign restore uses lifecycle attribution.
 #[test]
 fn r15_foreign_restore_dual_output_redraw_all_waste() {
     lifecycle_diag::with_enabled_for_test(|| {
@@ -235,22 +230,22 @@ fn r15_foreign_restore_dual_output_redraw_all_waste() {
 
         let diag = lifecycle_diag::snapshot();
         let total = f.niri().output_state.len();
-        let waste_ratio_if_all = (total.saturating_sub(1)) as f64 / total as f64;
 
         eprintln!(
             "R15_SAMPLE kind=r17_foreign_restore_dual_output \
              queue_redraw_all={} queue_redraw={} outputs_total={} \
-             implied_waste_ratio_if_redraw_all={waste_ratio_if_all:.3}",
-            diag.queue_redraw_all, diag.queue_redraw, total
+             targeted_lifecycle={} note=post_R17_targeted",
+            diag.queue_redraw_all, diag.queue_redraw, total, diag.redraw_targeted_lifecycle
         );
 
-        assert!(diag.queue_redraw_all >= 1);
+        assert!(diag.queue_redraw >= 1);
+        assert!(diag.redraw_targeted_lifecycle >= 1);
         assert_eq!(total, 2);
         assert!(!f.niri().layout.windows().next().unwrap().1.is_minimized());
     });
 }
 
-/// R17: foreign maximize (locatable) still queue_redraw_all.
+/// Historical R15 sample; post-R17 foreign maximize is targeted.
 #[test]
 fn r15_foreign_maximize_dual_output_redraw_all() {
     lifecycle_diag::with_enabled_for_test(|| {
@@ -271,14 +266,15 @@ fn r15_foreign_maximize_dual_output_redraw_all() {
         let total = f.niri().output_state.len();
         eprintln!(
             "R15_SAMPLE kind=r17_foreign_maximize_dual_output \
-             queue_redraw_all={} queue_redraw={} outputs_total={total}",
-            diag.queue_redraw_all, diag.queue_redraw
+             queue_redraw_all={} queue_redraw={} outputs_total={total} \
+             targeted_maximize={} note=post_R17_targeted",
+            diag.queue_redraw_all, diag.queue_redraw, diag.redraw_targeted_maximize
         );
 
-        assert!(
-            diag.queue_redraw_all >= 1,
-            "foreign maximize must queue_redraw_all"
-        );
+        assert!(diag.queue_redraw >= 1);
+        assert!(diag.redraw_targeted_maximize >= 1);
+        // Maximize typically does not re-point the cursor; cluster path itself is
+        // targeted (no adapter redraw-all).
         assert_eq!(total, 2);
     });
 }

@@ -92,6 +92,7 @@ use crate::protocols::virtual_pointer::{
     VirtualPointerInputBackend, VirtualPointerManagerState, VirtualPointerMotionAbsoluteEvent,
     VirtualPointerMotionEvent,
 };
+use crate::redraw_attribution::RedrawAttribution;
 use crate::utils::{output_size, send_scale_transform};
 use crate::window::mapped::{
     ForeignToplevelRect, ForeignToplevelRectHint, ForeignToplevelRectUnresolved,
@@ -561,9 +562,9 @@ impl ForeignToplevelHandler for State {
     fn activate(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            self.niri.layout.activate_window(&window);
+            let redraw = self.activate_window_attributed(&window);
             self.niri.layer_shell_on_demand_focus = None;
-            self.niri.queue_redraw_all();
+            self.niri.apply_redraw_attribution(redraw);
         }
     }
 
@@ -605,18 +606,16 @@ impl ForeignToplevelHandler for State {
     fn set_maximized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            self.niri.layout.set_maximized(&window, true);
-            self.niri.queue_redraw_all();
+            let redraw = self.set_maximized_attributed(&window, true);
+            self.niri.apply_redraw_attribution(redraw);
         }
     }
 
     fn unset_maximized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            if !self.niri.layout.snap_window_to_working_area(&window, false) {
-                self.niri.layout.set_maximized(&window, false);
-            }
-            self.niri.queue_redraw_all();
+            let redraw = self.unset_maximized_attributed(&window);
+            self.niri.apply_redraw_attribution(redraw);
         }
     }
 
@@ -630,8 +629,8 @@ impl ForeignToplevelHandler for State {
             ));
             if result.changed() {
                 self.niri.layer_shell_on_demand_focus = None;
-                self.niri.queue_redraw_all();
             }
+            self.niri.apply_redraw_attribution(result.redraw);
         }
     }
 
@@ -645,8 +644,8 @@ impl ForeignToplevelHandler for State {
             ));
             if result.changed() {
                 self.niri.layer_shell_on_demand_focus = None;
-                self.niri.queue_redraw_all();
             }
+            self.niri.apply_redraw_attribution(result.redraw);
         }
     }
 
@@ -1048,15 +1047,17 @@ delegate_mutter_x11_interop!(State);
 
 impl TahoeGlassHandler for State {
     fn queue_redraw_for_tahoe_glass_surface(&mut self, surface: &WlSurface) {
-        if let Some(output) = self.niri.output_for_root(surface).cloned() {
+        use crate::redraw_attribution::{RedrawFallbackReason, RedrawReason};
+        let attribution = if let Some(output) = self.niri.output_for_root(surface).cloned() {
             #[cfg(test)]
             crate::protocols::tahoe_glass::test_note_targeted_redraw();
-            self.niri.queue_redraw(&output);
+            RedrawAttribution::outputs([output], RedrawReason::Glass)
         } else {
             #[cfg(test)]
             crate::protocols::tahoe_glass::test_note_fallback_redraw_all();
-            self.niri.queue_redraw_all();
-        }
+            RedrawAttribution::all(RedrawFallbackReason::Unlocatable)
+        };
+        self.niri.apply_redraw_attribution(attribution);
     }
 }
 delegate_tahoe_glass!(State);

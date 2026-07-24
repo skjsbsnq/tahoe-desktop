@@ -158,6 +158,7 @@ use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::tahoe_glass::TahoeGlassManagerState;
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
+use crate::redraw_attribution::{RedrawAttribution, RedrawReason};
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
@@ -2165,11 +2166,78 @@ impl State {
         });
     }
 
+    /// Activate a window and return the redraw affect set (home + previous focus).
+    ///
+    /// Protocol adapters must only parse the request, call this owner, then
+    /// [`Niri::apply_redraw_attribution`] — they must not invent output lists.
+    pub fn activate_window_attributed(&mut self, window: &Window) -> RedrawAttribution {
+        let mut window_output = None;
+        self.niri
+            .layout
+            .with_windows(|mapped, mapped_output, _, _| {
+                if mapped.window == *window {
+                    window_output = mapped_output.cloned();
+                }
+            });
+        let prev_active = self.niri.layout.active_output().cloned();
+        self.niri.layout.activate_window(window);
+        RedrawAttribution::window_and_related(
+            window_output.as_ref(),
+            prev_active,
+            RedrawReason::Activate,
+        )
+    }
+
+    /// Maximize/unmaximize a window and return the workspace/output affect set.
+    ///
+    /// Expanded-mode layout mutation is owned here for foreign/cluster redraw
+    /// attribution; adapters must not build parallel output lists.
+    pub fn set_maximized_attributed(
+        &mut self,
+        window: &Window,
+        maximize: bool,
+    ) -> RedrawAttribution {
+        let mut window_output = None;
+        self.niri
+            .layout
+            .with_windows(|mapped, mapped_output, _, _| {
+                if mapped.window == *window {
+                    window_output = mapped_output.cloned();
+                }
+            });
+        self.niri.layout.set_maximized(window, maximize);
+        RedrawAttribution::window_output_or_unlocatable(
+            window_output.as_ref(),
+            RedrawReason::Maximize,
+        )
+    }
+
+    /// Unmaximize via snap-to-working-area when possible, else layout unmaximize.
+    /// Returns the same workspace/output affect set as maximize.
+    pub fn unset_maximized_attributed(&mut self, window: &Window) -> RedrawAttribution {
+        let mut window_output = None;
+        self.niri
+            .layout
+            .with_windows(|mapped, mapped_output, _, _| {
+                if mapped.window == *window {
+                    window_output = mapped_output.cloned();
+                }
+            });
+        if !self.niri.layout.snap_window_to_working_area(window, false) {
+            self.niri.layout.set_maximized(window, false);
+        }
+        RedrawAttribution::window_output_or_unlocatable(
+            window_output.as_ref(),
+            RedrawReason::Maximize,
+        )
+    }
+
     /// Single compositor-internal minimize/restore strategy owner.
     ///
     /// Protocol adapters only parse the request into a [`LifecycleCommand`]. This method owns:
     /// window/output lookup, cached-or-explicit anchor resolution (current-output filter),
-    /// snapshot attempt, renderer-unavailable fallback, and the unified change result.
+    /// snapshot attempt, renderer-unavailable fallback, unified change result, and
+    /// [`RedrawAttribution`] for the affected output set (current / related focus).
     pub fn execute_lifecycle_command(
         &mut self,
         command: LifecycleCommand,
@@ -2200,6 +2268,11 @@ impl State {
         if !found {
             return LifecycleCommandResult::no_op();
         }
+
+        // Capture focus output before restore, which may switch the active monitor.
+        let prev_active = matches!(command.direction, LifecycleDirection::Restore)
+            .then(|| self.niri.layout.active_output().cloned())
+            .flatten();
 
         let animation_rect = match command.anchor {
             LifecycleAnchorInput::Explicit(rect) => Some(rect),
@@ -2299,11 +2372,21 @@ impl State {
             self.niri.clear_xray_elements(output);
         }
 
-        if changed {
-            LifecycleCommandResult::applied()
-        } else {
-            LifecycleCommandResult::no_op()
+        if !changed {
+            return LifecycleCommandResult::no_op();
         }
+
+        // Home output always redraws. Restore may also move focus off a previous output.
+        let related = match command.direction {
+            LifecycleDirection::Restore => prev_active.into_iter().collect::<Vec<_>>(),
+            LifecycleDirection::Minimize => Vec::new(),
+        };
+        let redraw = RedrawAttribution::window_and_related(
+            window_output.as_ref(),
+            related,
+            RedrawReason::Lifecycle,
+        );
+        LifecycleCommandResult::applied(redraw)
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]
@@ -3913,6 +3996,29 @@ impl Niri {
         crate::utils::lifecycle_diag::note_queue_redraw();
         let state = self.output_state.get_mut(output).unwrap();
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
+    }
+
+    /// Apply a cluster [`RedrawAttribution`] from a lifecycle/foreign/glass owner.
+    ///
+    /// This is the only place those clusters schedule frames. Targeted paths never
+    /// call [`Self::queue_redraw_all`]; fallback paths record a reviewed reason first.
+    pub fn apply_redraw_attribution(&mut self, attribution: RedrawAttribution) {
+        match attribution {
+            RedrawAttribution::None => {}
+            RedrawAttribution::Outputs { outputs, reason } => {
+                crate::redraw_attribution::note_targeted_reason(reason);
+                for output in &outputs {
+                    // Skip outputs that disappeared between attribution and apply.
+                    if self.output_state.contains_key(output) {
+                        self.queue_redraw(output);
+                    }
+                }
+            }
+            RedrawAttribution::All { reason } => {
+                crate::redraw_attribution::note_fallback_reason(reason);
+                self.queue_redraw_all();
+            }
+        }
     }
 
     fn schedule_animation_redraw(&mut self, output: &Output, deadline: Option<Instant>) {
