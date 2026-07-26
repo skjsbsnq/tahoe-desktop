@@ -183,6 +183,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         cache: &UserDataMap,
     ) -> Result<(), GlesError> {
         let _span = tracy_client::span!("FramebufferEffectElement::capture_framebuffer");
+        crate::utils::lifecycle_diag::note_fb_effect_capture();
         let location = gpu_span_location!("FramebufferEffectElement::capture_framebuffer");
         frame.with_gpu_span(location, |frame| {
             let output_rect = Rectangle::from_size(frame.output_size());
@@ -506,8 +507,9 @@ impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use smithay::utils::{Point, Size};
+
+    use super::*;
 
     #[test]
     fn draw_clip_is_relative_to_clamped_destination() {

@@ -346,7 +346,8 @@ fn render_region(
     let has_blur_region = region.flags.blur;
     let visual =
         ResolvedEffectPlan::visual_key(blur_kernel, effect, has_blur_region, visible_radius);
-    renderer.background_effect.note_plan_visual(visual);
+    let capture = ResolvedEffectPlan::capture_key(blur_kernel, effect, has_blur_region);
+    renderer.background_effect.note_plan_keys(visual, capture);
 
     if let Some(plan) =
         ResolvedEffectPlan::build(blur_kernel, effect, has_blur_region, visible_radius, params)

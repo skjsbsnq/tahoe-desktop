@@ -5027,6 +5027,7 @@ impl Niri {
 
     fn redraw(&mut self, backend: &mut Backend, output: &Output) {
         let _span = tracy_client::span!("Niri::redraw");
+        crate::utils::lifecycle_diag::maybe_log_periodic();
 
         // Verify our invariant.
         let state = self.output_state.get_mut(output).unwrap();

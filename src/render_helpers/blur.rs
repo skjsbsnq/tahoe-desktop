@@ -168,6 +168,7 @@ impl Blur {
         options: BlurOptions,
     ) -> anyhow::Result<GlesTexture> {
         let _span = tracy_client::span!("Blur::render");
+        crate::utils::lifecycle_diag::note_blur_render();
         trace!("rendering blur");
 
         ensure!(

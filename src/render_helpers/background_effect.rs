@@ -10,7 +10,9 @@ use crate::handlers::background_effect::get_cached_blur_region;
 use crate::niri_render_elements;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
-use crate::render_helpers::resolved_effect_plan::{ResolvedEffectPlan, ResolvedEffectVisualKey};
+use crate::render_helpers::resolved_effect_plan::{
+    ResolvedEffectCaptureKey, ResolvedEffectPlan, ResolvedEffectVisualKey,
+};
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::region::TransformedRegion;
@@ -20,10 +22,17 @@ use crate::utils::surface_geo;
 pub struct BackgroundEffect {
     nonxray: FramebufferEffect,
     /// Damage when resolved plan visuals change.
+    ///
+    /// On the live path this element is pushed directly above the framebuffer
+    /// effect, so draw-only material changes repaint the effect without
+    /// bumping its commit — the cached blurred texture is reused (P03).
     damage: ExtraDamage,
     /// Last resolved visual fingerprint (R12). Geometry is not included;
     /// only material/blur/radius changes need ExtraDamage on the effect.
     last_visual: Option<ResolvedEffectVisualKey>,
+    /// Last resolved capture fingerprint (P03). Only changes here bump the
+    /// live effect commit and force a re-blit + blur pyramid re-run.
+    last_capture: Option<ResolvedEffectCaptureKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -161,6 +170,7 @@ impl BackgroundEffect {
             nonxray: FramebufferEffect::new(),
             damage: ExtraDamage::new(),
             last_visual: None,
+            last_capture: None,
         }
     }
 
@@ -170,16 +180,30 @@ impl BackgroundEffect {
         self.nonxray.damage();
     }
 
-    /// Track damage when the resolved visual fingerprint changes. Does not store
+    /// Track damage when the resolved plan fingerprints change. Does not store
     /// a parallel mutable options owner — the immutable plan is the only source
     /// of visual parameters at render time (R12).
-    pub fn note_plan_visual(&mut self, key: ResolvedEffectVisualKey) {
-        if self.last_visual.as_ref() == Some(&key) {
-            return;
+    ///
+    /// The two fingerprints drive two invalidation channels (P03):
+    /// - any visual change damages the ExtraDamage element so the effect is repainted with fresh
+    ///   uniforms;
+    /// - only capture-key changes (blur kernel/on-off/xray) additionally bump the live effect
+    ///   commit, which is what forces the damage tracker to re-run `capture_framebuffer` (blit +
+    ///   blur pyramid). Draw-only material animation (interaction / material_alpha easing)
+    ///   therefore reuses the cached blurred texture.
+    pub fn note_plan_keys(
+        &mut self,
+        visual: ResolvedEffectVisualKey,
+        capture: ResolvedEffectCaptureKey,
+    ) {
+        if self.last_visual.as_ref() != Some(&visual) {
+            self.last_visual = Some(visual);
+            self.damage.damage_all();
         }
-        self.last_visual = Some(key);
-        self.damage.damage_all();
-        self.nonxray.damage();
+        if self.last_capture.as_ref() != Some(&capture) {
+            self.last_capture = Some(capture);
+            self.nonxray.damage();
+        }
     }
 
     /// Render using an immutable plan only. No config fallback or radius rewrite.
@@ -214,16 +238,31 @@ impl BackgroundEffect {
                 &mut |elem| push(elem.into()),
             );
         } else {
-            let elem = self.nonxray.render(
-                ns,
-                plan.params.clone(),
-                plan.blur_options,
-                plan.noise,
-                plan.saturation,
-                plan.glass,
-            );
-            push(elem.into());
+            self.render_live(ns, plan, damage, push);
         }
+    }
+
+    /// Live (non-xray) path. The ExtraDamage element goes in first so it sits
+    /// *above* the framebuffer effect: its damage repaints the effect but is
+    /// excluded from the damage tracker's below-the-effect overlap test, so it
+    /// never forces a re-capture on its own (P03).
+    fn render_live(
+        &self,
+        ns: Option<usize>,
+        plan: &ResolvedEffectPlan,
+        damage: ExtraDamage,
+        push: &mut dyn FnMut(BackgroundEffectElement),
+    ) {
+        push(damage.into());
+        let elem = self.nonxray.render(
+            ns,
+            plan.params.clone(),
+            plan.blur_options,
+            plan.noise,
+            plan.saturation,
+            plan.glass,
+        );
+        push(elem.into());
     }
 }
 
@@ -469,7 +508,8 @@ pub fn render_for_tile(
 
         // R12: single resolve before GPU path — no update_config / radius rewrite order.
         let visual = ResolvedEffectPlan::visual_key(blur_config, effect, has_blur_region, radius);
-        background_effect.note_plan_visual(visual);
+        let capture = ResolvedEffectPlan::capture_key(blur_config, effect, has_blur_region);
+        background_effect.note_plan_keys(visual, capture);
 
         let Some(plan) =
             ResolvedEffectPlan::build(blur_config, effect, has_blur_region, radius, params)
@@ -484,8 +524,171 @@ pub fn render_for_tile(
 
 #[cfg(test)]
 mod tests {
-    use super::{blur_region_bounding_box, transformed_blur_region_bounding_box};
+    use smithay::backend::renderer::element::Element as _;
     use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+
+    use super::{blur_region_bounding_box, transformed_blur_region_bounding_box, *};
+    use crate::render_helpers::resolved_effect_plan::ResolvedEffectPlan;
+
+    /// A live (non-xray) tahoe-like effect config: blur on, xray explicitly off.
+    fn live_effect() -> niri_config::BackgroundEffect {
+        niri_config::BackgroundEffect {
+            blur: Some(true),
+            xray: Some(false),
+            tint_amount: Some(0.3),
+            refraction: Some(0.2),
+            ..Default::default()
+        }
+    }
+
+    fn live_params() -> RenderParams {
+        RenderParams {
+            geometry: Rectangle::new(Point::from((10., 20.)), Size::from((200., 100.))),
+            alpha: 1.,
+            subregion: None,
+            clip: Some((
+                Rectangle::new(Point::from((14., 24.)), Size::from((192., 92.))),
+                CornerRadius::default(),
+            )),
+            scale: 1.,
+            draw_clip: None,
+        }
+    }
+
+    fn commits(effect: &BackgroundEffect) -> (CommitCounterProbe, CommitCounterProbe) {
+        let fb = effect
+            .nonxray
+            .render(None, live_params(), None, 0., 1., GlassOptions::default())
+            .current_commit();
+        let damage = effect
+            .damage
+            .render(live_params().geometry)
+            .current_commit();
+        (CommitCounterProbe(fb), CommitCounterProbe(damage))
+    }
+
+    struct CommitCounterProbe(smithay::backend::renderer::utils::CommitCounter);
+
+    impl CommitCounterProbe {
+        fn advanced_by(&self, later: &Self) -> Option<usize> {
+            later.0.distance(Some(self.0))
+        }
+    }
+
+    /// P03: draw-only material changes (interaction / material_alpha easing)
+    /// must repaint via ExtraDamage but must not bump the live effect commit,
+    /// so the damage tracker reuses the cached blurred texture.
+    #[test]
+    fn draw_only_material_change_damages_without_recapture() {
+        let mut effect = BackgroundEffect::new();
+        let blur = niri_config::Blur::default();
+
+        let base = live_effect();
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, CornerRadius::default()),
+            ResolvedEffectPlan::capture_key(blur, base, true),
+        );
+        let (fb0, dmg0) = commits(&effect);
+
+        // Simulate one frame of compositor-side material easing: interaction
+        // boosts the refractive scalars, material_alpha fades tint.
+        let mut eased = base;
+        eased.tint_amount = Some(0.15);
+        eased.refraction = Some(0.31);
+        eased.contrast = Some(1.05);
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, eased, true, CornerRadius::default()),
+            ResolvedEffectPlan::capture_key(blur, eased, true),
+        );
+        let (fb1, dmg1) = commits(&effect);
+
+        assert_eq!(
+            fb0.advanced_by(&fb1),
+            Some(0),
+            "draw-only change must not force a framebuffer re-capture"
+        );
+        assert_eq!(
+            dmg0.advanced_by(&dmg1),
+            Some(1),
+            "draw-only change must still repaint via ExtraDamage"
+        );
+    }
+
+    /// P03: blur-kernel changes alter the pyramid output, so they must bump
+    /// the live effect commit (re-blit + re-blur) as well as repaint.
+    #[test]
+    fn blur_kernel_change_forces_recapture() {
+        let mut effect = BackgroundEffect::new();
+        let base = live_effect();
+        let blur = niri_config::Blur::default();
+
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, CornerRadius::default()),
+            ResolvedEffectPlan::capture_key(blur, base, true),
+        );
+        let (fb0, dmg0) = commits(&effect);
+
+        let stronger = niri_config::Blur {
+            passes: blur.passes + 1,
+            ..blur
+        };
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(stronger, base, true, CornerRadius::default()),
+            ResolvedEffectPlan::capture_key(stronger, base, true),
+        );
+        let (fb1, dmg1) = commits(&effect);
+
+        assert_eq!(
+            fb0.advanced_by(&fb1),
+            Some(1),
+            "kernel change must force a re-capture"
+        );
+        assert_eq!(dmg0.advanced_by(&dmg1), Some(1));
+    }
+
+    /// External damage (blur subregion changes) stays conservative on both
+    /// channels.
+    #[test]
+    fn explicit_damage_hits_both_channels() {
+        let mut effect = BackgroundEffect::new();
+        let (fb0, dmg0) = commits(&effect);
+        effect.damage();
+        let (fb1, dmg1) = commits(&effect);
+        assert_eq!(fb0.advanced_by(&fb1), Some(1));
+        assert_eq!(dmg0.advanced_by(&dmg1), Some(1));
+    }
+
+    /// P03: on the live path the ExtraDamage element must be pushed before
+    /// (above) the framebuffer effect so its damage never enters the damage
+    /// tracker's below-the-effect overlap test.
+    #[test]
+    fn live_path_pushes_extra_damage_above_framebuffer_effect() {
+        let effect = BackgroundEffect::new();
+        let blur = niri_config::Blur::default();
+        let plan = ResolvedEffectPlan::build(
+            blur,
+            live_effect(),
+            true,
+            CornerRadius::default(),
+            live_params(),
+        )
+        .expect("live plan must be visible");
+        assert!(!plan.xray, "test config must resolve to the live path");
+
+        let damage = effect.damage.render(plan.params.geometry);
+        let mut elements = Vec::new();
+        effect.render_live(None, &plan, damage, &mut |elem| elements.push(elem));
+
+        assert_eq!(elements.len(), 2);
+        assert!(
+            matches!(elements[0], BackgroundEffectElement::ExtraDamage(_)),
+            "ExtraDamage must be above the effect"
+        );
+        assert!(
+            matches!(elements[1], BackgroundEffectElement::FramebufferEffect(_)),
+            "framebuffer effect must be below the ExtraDamage element"
+        );
+    }
 
     #[test]
     fn blur_region_bbox_ignores_empty_and_overflowing_rects() {

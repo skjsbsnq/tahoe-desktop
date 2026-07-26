@@ -39,6 +39,33 @@ pub struct ResolvedEffectVisualKey {
     pub corner_radius: CornerRadius,
 }
 
+/// Inputs that determine the framebuffer-capture half of a plan (P03).
+///
+/// Only changes here alter the blit + blur-pyramid output, so only they may
+/// bump the live `FramebufferEffect` commit and force a re-capture. Draw-only
+/// material changes (glass uniforms, noise, saturation, corner radius) must
+/// stay out of this key: they invalidate drawn pixels through the ExtraDamage
+/// element above the effect, while the cached blurred texture in the effect
+/// cache is reused. (`params.alpha` is not tracked by either key — as before
+/// P03 it repaints via the co-fading surface content above the effect or the
+/// glass scalars that change with it.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedEffectCaptureKey {
+    /// Whether blur passes run (same resolution as [`ResolvedEffectPlan::blur`]).
+    pub blur: bool,
+    /// Kernel when `blur` is true; `None` when blur is off.
+    pub blur_options: Option<BlurOptions>,
+    /// Whether the xray path is taken instead of the live framebuffer path.
+    pub xray: bool,
+}
+
+/// Resolve the blur on/off flag and kernel exactly once, shared between
+/// [`ResolvedEffectPlan::build`] and [`ResolvedEffectPlan::capture_key`].
+fn resolve_blur(options: &Options, blur_config: niri_config::Blur) -> (bool, Option<BlurOptions>) {
+    let blur = options.blur && !blur_config.off;
+    (blur, blur.then_some(BlurOptions::from(blur_config)))
+}
+
 impl ResolvedEffectPlan {
     pub fn is_visible(&self) -> bool {
         self.xray
@@ -99,8 +126,7 @@ impl ResolvedEffectPlan {
         }
         params.fit_clip_radius();
 
-        let blur = options.blur && !blur_config.off;
-        let blur_options = blur.then_some(BlurOptions::from(blur_config));
+        let (blur, blur_options) = resolve_blur(&options, blur_config);
         let noise = if blur { blur_config.noise } else { 0. };
         let noise = options.noise.unwrap_or(noise) as f32;
         let saturation = if blur { blur_config.saturation } else { 1. };
@@ -127,6 +153,20 @@ impl ResolvedEffectPlan {
             options: Self::resolve_options(blur_config, effect, has_blur_region),
             blur_config,
             corner_radius,
+        }
+    }
+
+    pub fn capture_key(
+        blur_config: niri_config::Blur,
+        effect: niri_config::BackgroundEffect,
+        has_blur_region: bool,
+    ) -> ResolvedEffectCaptureKey {
+        let options = Self::resolve_options(blur_config, effect, has_blur_region);
+        let (blur, blur_options) = resolve_blur(&options, blur_config);
+        ResolvedEffectCaptureKey {
+            blur,
+            blur_options,
+            xray: options.xray,
         }
     }
 }
@@ -163,9 +203,10 @@ impl From<&ResolvedEffectPlan> for ResolvedEffectPlanGolden {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use niri_config::{BackgroundEffect, Blur, Color};
     use smithay::utils::{Point, Size};
+
+    use super::*;
 
     fn base_params(geo: Rectangle<f64, Logical>, clip: bool) -> RenderParams {
         RenderParams {
@@ -301,6 +342,174 @@ mod tests {
             ),
         );
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn capture_key_is_stable_under_material_fade_and_interaction_boost() {
+        // Mirrors tahoe_glass::render_region material easing: material_alpha
+        // fades tint/contrast/refraction/…, interaction boosts them. None of
+        // that may alter the capture key — only draw uniforms change.
+        let blur = Blur::default();
+        let mut base = BackgroundEffect::default();
+        base.blur = Some(true);
+        base.xray = Some(false);
+        base.tint_amount = Some(0.4);
+        base.contrast = Some(1.2);
+        base.edge_highlight = Some(0.3);
+        base.refraction = Some(0.25);
+        base.inner_shadow = Some(0.1);
+        base.chromatic = Some(0.05);
+        base.lens_depth = Some(0.15);
+
+        let key_base = ResolvedEffectPlan::capture_key(blur, base, true);
+
+        // material_alpha = 0.5 fade.
+        let mut faded = base;
+        faded.tint_amount = Some(0.2);
+        faded.contrast = Some(1.1);
+        faded.edge_highlight = Some(0.15);
+        faded.refraction = Some(0.125);
+        faded.inner_shadow = Some(0.05);
+        faded.chromatic = Some(0.025);
+        faded.lens_depth = Some(0.075);
+        assert_eq!(key_base, ResolvedEffectPlan::capture_key(blur, faded, true));
+
+        // interaction = 0.4 boost on top.
+        let mut boosted = base;
+        boosted.contrast = Some(1.28);
+        boosted.edge_highlight = Some(0.42);
+        boosted.refraction = Some(0.35);
+        boosted.inner_shadow = Some(0.14);
+        boosted.chromatic = Some(0.07);
+        boosted.lens_depth = Some(0.21);
+        assert_eq!(
+            key_base,
+            ResolvedEffectPlan::capture_key(blur, boosted, true)
+        );
+
+        // The visual key must still see every one of those changes.
+        let radius = CornerRadius::default();
+        let visual_base = ResolvedEffectPlan::visual_key(blur, base, true, radius);
+        assert_ne!(
+            visual_base,
+            ResolvedEffectPlan::visual_key(blur, faded, true, radius)
+        );
+        assert_ne!(
+            visual_base,
+            ResolvedEffectPlan::visual_key(blur, boosted, true, radius)
+        );
+    }
+
+    #[test]
+    fn capture_key_tracks_blur_kernel_but_not_draw_side_blur_config() {
+        let mut effect = BackgroundEffect::default();
+        effect.blur = Some(true);
+        effect.xray = Some(false);
+        let blur = Blur::default();
+        let key = ResolvedEffectPlan::capture_key(blur, effect, true);
+
+        // passes / offset / off feed the pyramid — key must change.
+        assert_ne!(
+            key,
+            ResolvedEffectPlan::capture_key(
+                Blur {
+                    passes: blur.passes + 1,
+                    ..blur
+                },
+                effect,
+                true,
+            )
+        );
+        assert_ne!(
+            key,
+            ResolvedEffectPlan::capture_key(
+                Blur {
+                    offset: blur.offset + 1.,
+                    ..blur
+                },
+                effect,
+                true,
+            )
+        );
+        assert_ne!(
+            key,
+            ResolvedEffectPlan::capture_key(Blur { off: true, ..blur }, effect, true)
+        );
+
+        // noise / saturation only feed draw uniforms — key must not change.
+        assert_eq!(
+            key,
+            ResolvedEffectPlan::capture_key(
+                Blur {
+                    noise: blur.noise + 0.1,
+                    saturation: blur.saturation + 0.2,
+                    ..blur
+                },
+                effect,
+                true,
+            )
+        );
+
+        // Blur on/off through the effect flag must change the key.
+        let mut no_blur = effect;
+        no_blur.blur = Some(false);
+        no_blur.tint_amount = Some(0.2);
+        assert_ne!(key, ResolvedEffectPlan::capture_key(blur, no_blur, true));
+    }
+
+    #[test]
+    fn capture_key_tracks_xray_toggle() {
+        let mut live = BackgroundEffect::default();
+        live.blur = Some(true);
+        live.xray = Some(false);
+        let mut xray = live;
+        xray.xray = Some(true);
+
+        let blur = Blur::default();
+        assert_ne!(
+            ResolvedEffectPlan::capture_key(blur, live, true),
+            ResolvedEffectPlan::capture_key(blur, xray, true)
+        );
+    }
+
+    #[test]
+    fn capture_key_matches_plan_blur_resolution() {
+        // The key and the plan must resolve blur identically (shared helper).
+        let mut effect = BackgroundEffect::default();
+        effect.blur = Some(true);
+        effect.xray = Some(false);
+        // Keep the plan visible even when the global blur kernel is off.
+        effect.tint_amount = Some(0.2);
+        effect.tint_color = Some(Color::new_unpremul(1., 1., 1., 1.));
+
+        for blur in [
+            Blur::default(),
+            Blur {
+                off: true,
+                ..Blur::default()
+            },
+            Blur {
+                passes: 5,
+                offset: 7.,
+                ..Blur::default()
+            },
+        ] {
+            let key = ResolvedEffectPlan::capture_key(blur, effect, true);
+            let plan = ResolvedEffectPlan::build(
+                blur,
+                effect,
+                true,
+                CornerRadius::default(),
+                base_params(
+                    Rectangle::new(Point::from((0., 0.)), Size::from((100., 100.))),
+                    true,
+                ),
+            )
+            .expect("blurred effect stays visible");
+            assert_eq!(key.blur, plan.blur);
+            assert_eq!(key.blur_options, plan.blur_options);
+            assert_eq!(key.xray, plan.xray);
+        }
     }
 
     #[test]

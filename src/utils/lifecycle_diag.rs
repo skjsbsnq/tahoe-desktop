@@ -10,6 +10,7 @@
 
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 const ENV: &str = "NIRI_LIFECYCLE_DIAG";
 
@@ -25,6 +26,11 @@ static TAHOE_REGION_REQUEST: AtomicU64 = AtomicU64::new(0);
 static TAHOE_REGION_COMMIT: AtomicU64 = AtomicU64::new(0);
 static TAHOE_REGION_CAPTURE: AtomicU64 = AtomicU64::new(0);
 
+// P03 live-blur cache observation: how often the framebuffer effect actually
+// re-blits the framebuffer, and how often a blur pyramid runs (live + xray).
+static FB_EFFECT_CAPTURE: AtomicU64 = AtomicU64::new(0);
+static BLUR_RENDER: AtomicU64 = AtomicU64::new(0);
+
 // R17 redraw-attribution reason counters (cluster apply path only).
 static REDRAW_TARGETED_LIFECYCLE: AtomicU64 = AtomicU64::new(0);
 static REDRAW_TARGETED_ACTIVATE: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +41,10 @@ static REDRAW_FALLBACK_OUTPUT_TEARDOWN: AtomicU64 = AtomicU64::new(0);
 static REDRAW_FALLBACK_GLOBAL_CONFIG: AtomicU64 = AtomicU64::new(0);
 
 fn ensure_init() {
+    // Fast path: avoid the atomic RMW on every hot-path is_enabled() call.
+    if INIT.load(Ordering::Relaxed) {
+        return;
+    }
     if INIT.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -69,6 +79,8 @@ pub fn reset() {
     TAHOE_REGION_REQUEST.store(0, Ordering::Relaxed);
     TAHOE_REGION_COMMIT.store(0, Ordering::Relaxed);
     TAHOE_REGION_CAPTURE.store(0, Ordering::Relaxed);
+    FB_EFFECT_CAPTURE.store(0, Ordering::Relaxed);
+    BLUR_RENDER.store(0, Ordering::Relaxed);
     REDRAW_TARGETED_LIFECYCLE.store(0, Ordering::Relaxed);
     REDRAW_TARGETED_ACTIVATE.store(0, Ordering::Relaxed);
     REDRAW_TARGETED_MAXIMIZE.store(0, Ordering::Relaxed);
@@ -127,6 +139,22 @@ pub fn note_tahoe_region_capture() {
     TAHOE_REGION_CAPTURE.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record an actual framebuffer blit in `FramebufferEffectElement::capture_framebuffer`.
+pub fn note_fb_effect_capture() {
+    if !is_enabled() {
+        return;
+    }
+    FB_EFFECT_CAPTURE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a full blur pyramid run in `Blur::render` (live and xray paths).
+pub fn note_blur_render() {
+    if !is_enabled() {
+        return;
+    }
+    BLUR_RENDER.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Targeted lifecycle redraw apply (one apply may queue one or more outputs).
 pub fn note_redraw_targeted_lifecycle() {
     if is_enabled() {
@@ -180,6 +208,8 @@ pub struct Snapshot {
     pub tahoe_region_request: u64,
     pub tahoe_region_commit: u64,
     pub tahoe_region_capture: u64,
+    pub fb_effect_capture: u64,
+    pub blur_render: u64,
     pub redraw_targeted_lifecycle: u64,
     pub redraw_targeted_activate: u64,
     pub redraw_targeted_maximize: u64,
@@ -199,6 +229,8 @@ pub fn snapshot() -> Snapshot {
         tahoe_region_request: TAHOE_REGION_REQUEST.load(Ordering::Relaxed),
         tahoe_region_commit: TAHOE_REGION_COMMIT.load(Ordering::Relaxed),
         tahoe_region_capture: TAHOE_REGION_CAPTURE.load(Ordering::Relaxed),
+        fb_effect_capture: FB_EFFECT_CAPTURE.load(Ordering::Relaxed),
+        blur_render: BLUR_RENDER.load(Ordering::Relaxed),
         redraw_targeted_lifecycle: REDRAW_TARGETED_LIFECYCLE.load(Ordering::Relaxed),
         redraw_targeted_activate: REDRAW_TARGETED_ACTIVATE.load(Ordering::Relaxed),
         redraw_targeted_maximize: REDRAW_TARGETED_MAXIMIZE.load(Ordering::Relaxed),
@@ -220,6 +252,56 @@ pub fn with_test_lock<R>(f: impl FnOnce() -> R) -> R {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     f()
+}
+
+/// Log a per-interval counter delta line, at most once every 5 seconds.
+///
+/// Called from the redraw hot path; when diagnostics are disabled this costs
+/// two relaxed atomic loads. The log line is the P03 acceptance signal: on a
+/// static desktop `fb_capture` and `blur` must stay flat between intervals
+/// while `redraw` may still advance (draw-only repaints reuse the cache).
+pub fn maybe_log_periodic() {
+    if !is_enabled() {
+        return;
+    }
+
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    static LAST: Mutex<Option<Snapshot>> = Mutex::new(None);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    // Monotonic clock so a wall-clock jump can never suppress the log.
+    let now_ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let last_ms = LAST_LOG_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) < 5_000 && last_ms != 0 {
+        return;
+    }
+    if LAST_LOG_MS
+        .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    let current = snapshot();
+    let mut guard = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(prev) = *guard {
+        info!(
+            "lifecycle-diag 5s delta: redraw_all +{} redraw +{} tahoe_capture +{} \
+             fb_capture +{} blur +{}",
+            current
+                .queue_redraw_all
+                .saturating_sub(prev.queue_redraw_all),
+            current.queue_redraw.saturating_sub(prev.queue_redraw),
+            current
+                .tahoe_region_capture
+                .saturating_sub(prev.tahoe_region_capture),
+            current
+                .fb_effect_capture
+                .saturating_sub(prev.fb_effect_capture),
+            current.blur_render.saturating_sub(prev.blur_render),
+        );
+    }
+    *guard = Some(current);
 }
 
 /// Enable, reset, run `f`, then always disable+reset — under [`with_test_lock`].
