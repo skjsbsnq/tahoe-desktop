@@ -167,12 +167,14 @@ impl MappedLayer {
             open_animation: None,
             presentation_transform: PresentationAffine::IDENTITY,
             transform_animation: None,
-            // Start at zero rather than absorbing the current epoch: smithay
-            // runs post-commit hooks before CompositorHandler::commit, so a
-            // directive carried by the mapping commit itself is already
-            // published when this constructor runs and must still be applied.
-            // Anti-replay across map cycles is handled by clearing the
-            // directive on unmap (clear_transform_directive_on_unmap).
+            // Start at zero rather than absorbing the current epoch:
+            // tahoe_glass::on_surface_commit runs at the top of
+            // CompositorHandler::commit, before layer_shell_handle_commit
+            // reaches this constructor, so a directive carried by the mapping
+            // commit itself is already published when this constructor runs
+            // and must still be applied. Anti-replay across map cycles is
+            // handled by clearing the directive on unmap
+            // (clear_transform_directive_on_unmap).
             seen_transform_epoch: 0,
             unmap_snapshot: None,
             close_tahoe_glass_regions: None,
@@ -612,11 +614,6 @@ impl MappedLayer {
         // P05: a running presentation-transform animation moves the blit
         // region the same way; steady non-identity transforms (e.g. a hidden
         // dock) are static and stay on the full-quality tier.
-        // Edge-reveal keeps the tier too: the sample band is anchored at rest
-        // (`sample_offset` below) so the *content* is stable, but the element
-        // still moves every frame, so the damage tracker re-captures each
-        // frame regardless — the tier keeps those captures on the cheap path,
-        // and its disengage flip forces the full-quality re-capture at rest.
         let transform_animating = presentation.is_some()
             && self
                 .transform_animation
@@ -628,30 +625,13 @@ impl MappedLayer {
         let location = base_location + open_offset;
         let moving_surface_rect =
             crop_rect.map(|_| Rectangle::new(location, open_size).to_physical_precise_round(scale));
-        // Edge-reveal is a pure translation: draw the glass with the moving
-        // panel but keep the backdrop sample band anchored at the rest
-        // position. The retracting/revealing panel then carries the backdrop
-        // it settles on instead of sweeping through the screen-top content or
-        // clamp-stretching once the moving band pokes off-screen.
-        //
-        // Any scaling wrap disqualifies the anchor (see the helper): an
-        // inherited popin scale, or a presentation transform that scales.
-        // Pure-translation presentation transforms commute with the shift and
-        // keep the anchor exact.
-        let glass_wrapped = open_state.is_some_and(|state| state.should_wrap())
-            || presentation
-                .filter(|affine| !affine.is_identity())
-                .is_some_and(|affine| {
-                    (affine.scale_x - 1.).abs() > 1e-4 || (affine.scale_y - 1.).abs() > 1e-4
-                });
-        let glass_sample_offset =
-            edge_reveal_glass_sample_offset(crop_rect, open_offset, scale, glass_wrapped);
-        let moving_xray_pos = xray_pos.offset(bob_offset + open_offset);
-        let glass_xray_pos = if crop_rect.is_some() {
-            xray_pos.offset(bob_offset)
-        } else {
-            moving_xray_pos
-        };
+        // The glass samples the backdrop at its drawn position every frame:
+        // moving panels refract what is actually behind them right now, never
+        // content from where they will settle. Per-frame consistency is owned
+        // by ResolvedEffectCaptureKey.capture_geometry — any band move forces
+        // a same-frame re-capture, so a cached blur can never be stretched
+        // onto a different destination (the old settle-residency artifact).
+        let xray_pos = xray_pos.offset(bob_offset + open_offset);
         let anchor = self.surface.cached_state().anchor;
         let open_wrap = open_state
             .filter(|state| state.should_wrap())
@@ -714,9 +694,8 @@ impl MappedLayer {
                 &self.tahoe_glass_config,
                 open_alpha,
                 crop_rect,
-                glass_xray_pos,
+                xray_pos,
                 geometry_animating,
-                glass_sample_offset,
                 &mut |elem| push_opening(elem.into()),
             )
         } else {
@@ -750,9 +729,8 @@ impl MappedLayer {
                 radius,
                 self.rules.background_effect,
                 should_block_out,
-                glass_xray_pos,
+                xray_pos,
                 geometry_animating,
-                glass_sample_offset,
                 &mut |elem| push_opening(elem.into()),
             );
         }
@@ -800,29 +778,14 @@ impl MappedLayer {
         // P06: same rule as the open path — only close styles that move or
         // scale the surface (slide/pop/edge-reveal frames with a live offset)
         // engage the blur downsample tier; fade-style closes keep the full
-        // tier since their captured pixels stay valid. Edge-reveal keeps the
-        // tier even though its sample band is anchored (`sample_offset`
-        // below): the element still moves every frame, so the damage tracker
-        // re-captures each frame regardless.
+        // tier since their captured pixels stay valid.
         let geometry_animating =
             close_state.should_wrap() || close_state.offset != Point::from((0., 0.));
-        // Edge-reveal: draw the glass with the retracting panel but keep the
-        // backdrop sample band anchored at the rest position (see the open
-        // path). Without this the sample band sweeps up through the top-bar /
-        // screen-top content and the panel visibly darkens as it retracts.
-        let glass_sample_offset = edge_reveal_glass_sample_offset(
-            crop_rect,
-            close_state.offset,
-            scale,
-            close_state.should_wrap(),
-        );
-        let moving_xray_pos = xray_pos.offset(close_state.offset);
-        let glass_xray_pos = if crop_rect.is_some() {
-            xray_pos
-        } else {
-            moving_xray_pos
-        };
-        let xray_pos = glass_xray_pos;
+        // The glass samples at its drawn position every frame (see the open
+        // path): the retracting panel refracts what is actually behind it
+        // right now, with capture_geometry keying forcing the same-frame
+        // re-capture that keeps each frame self-consistent.
+        let xray_pos = xray_pos.offset(close_state.offset);
         let moving_surface_rect = crop_rect.map(|_| {
             Rectangle::new(location, self.block_out_buffer.size()).to_physical_precise_round(scale)
         });
@@ -867,7 +830,6 @@ impl MappedLayer {
             xray_pos,
             regions,
             geometry_animating,
-            glass_sample_offset,
             &mut |elem| {
                 let elem = LayerSurfaceRenderElement::TahoeGlass(elem);
                 if let Some(origin) = origin {
@@ -935,7 +897,6 @@ impl MappedLayer {
             false,
             xray_pos,
             geometry_animating,
-            glass_sample_offset,
             &mut |elem| {
                 let elem = LayerSurfaceRenderElement::BackgroundEffect(elem);
                 if let Some(origin) = origin {
@@ -1073,7 +1034,6 @@ impl MappedLayer {
                 false,
                 xray_pos,
                 geometry_animating,
-                Point::from((0, 0)),
                 &mut |elem| push_opening(elem.into()),
             );
         }
@@ -1315,34 +1275,6 @@ fn rescale_physical_rect(
     rect
 }
 
-/// Capture-sample shift for glass during edge-reveal open/close frames.
-///
-/// Edge-reveal (`crop_rect` present) is a pure translation of the surface:
-/// the glass draws at the moving position while its backdrop sample band
-/// stays anchored at the rest position, so the blurred content neither
-/// sweeps through the screen-top content nor clamp-stretches when the moving
-/// band pokes off-screen. All other styles keep sampling at the drawn
-/// position.
-///
-/// `wrapped` (an inherited non-1.0 scale from an interrupted popin, applied
-/// through a rescale wrapper) disables the anchor: the damage tracker hands
-/// the capture the post-scale geometry, and subtracting an unscaled offset
-/// from it would anchor the band at neither the rest nor the moving
-/// position. Those frames fall back to sampling at the drawn position
-/// (pre-anchor behavior, correct per frame).
-fn edge_reveal_glass_sample_offset(
-    crop_rect: Option<Rectangle<i32, Physical>>,
-    animation_offset: Point<f64, Logical>,
-    scale: Scale<f64>,
-    wrapped: bool,
-) -> Point<i32, Physical> {
-    if crop_rect.is_some() && !wrapped {
-        animation_offset.to_physical_precise_round(scale)
-    } else {
-        Point::from((0, 0))
-    }
-}
-
 fn crop_layer_element<R: NiriRenderer>(
     elem: LayerSurfaceRenderElement<R>,
     scale: Scale<f64>,
@@ -1524,42 +1456,6 @@ mod tests {
     use smithay::utils::Buffer;
 
     use super::*;
-
-    /// Edge-reveal frames (crop present) anchor the glass sample band at the
-    /// rest position: the sample shift equals the animation offset, rounded
-    /// to physical pixels. All other styles sample at the drawn position, and
-    /// an inherited rescale wrap disables the anchor (the capture sees
-    /// post-scale geometry an unscaled offset cannot anchor).
-    #[test]
-    fn edge_reveal_anchors_glass_sample_band_at_rest() {
-        let scale = Scale::from(1.25);
-        let crop = Some(Rectangle::new(
-            Point::from((100, 45)),
-            Size::from((450, 680)),
-        ));
-        let offset = Point::from((0., -123.4));
-
-        assert_eq!(
-            edge_reveal_glass_sample_offset(crop, offset, scale, false),
-            Point::from((0, -154)),
-            "edge-reveal must shift the capture band back to the rest position"
-        );
-        assert_eq!(
-            edge_reveal_glass_sample_offset(None, offset, scale, false),
-            Point::from((0, 0)),
-            "styles without a reveal crop keep sampling at the drawn position"
-        );
-        assert_eq!(
-            edge_reveal_glass_sample_offset(crop, Point::from((0., 0.)), scale, false),
-            Point::from((0, 0)),
-            "at rest the sample band and the drawn band coincide"
-        );
-        assert_eq!(
-            edge_reveal_glass_sample_offset(crop, offset, scale, true),
-            Point::from((0, 0)),
-            "an inherited rescale wrap falls back to drawn-position sampling"
-        );
-    }
 
     /// Minimal Element used to exercise rescale + crop composition without a GPU.
     #[derive(Debug)]

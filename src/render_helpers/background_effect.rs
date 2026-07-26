@@ -134,14 +134,6 @@ pub struct RenderParams {
     /// bounds for blur/refraction padding, while the panel itself must remain
     /// clipped to the reveal edge.
     pub draw_clip: Option<Rectangle<i32, smithay::utils::Physical>>,
-    /// Shift of the capture blit source relative to the draw destination.
-    ///
-    /// Edge-reveal layer animations move the drawn panel while the backdrop
-    /// sample band stays anchored at the rest position: the retracting glass
-    /// keeps showing the backdrop it settled on instead of sweeping through
-    /// the screen-top content or clamp-stretching once the moving destination
-    /// pokes off-screen. Zero everywhere else.
-    pub sample_offset: Point<i32, smithay::utils::Physical>,
 }
 
 /// Geometry to use when the client supplied an explicit blur region.
@@ -284,7 +276,6 @@ fn render_params_for_tile(
     client_blur_region_geometry: ClientBlurRegionGeometry,
     surface_geo: Rectangle<f64, Logical>,
     surface_anim_scale: Scale<f64>,
-    sample_offset: Point<i32, smithay::utils::Physical>,
 ) -> Option<RenderParams> {
     // Effects not requested by the surface itself are drawn to match the geometry.
     let mut clip = true;
@@ -345,7 +336,6 @@ fn render_params_for_tile(
         clip,
         scale,
         draw_clip: None,
-        sample_offset,
     })
 }
 
@@ -491,7 +481,6 @@ pub fn render_for_tile(
     should_block_out: bool,
     xray_pos: XrayPos,
     geometry_animating: bool,
-    sample_offset: Point<i32, smithay::utils::Physical>,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
     with_states(surface, |states| {
@@ -514,7 +503,6 @@ pub fn render_for_tile(
             client_blur_region_geometry,
             surface_geo,
             surface_anim_scale,
-            sample_offset,
         ) else {
             return;
         };
@@ -522,7 +510,6 @@ pub fn render_for_tile(
         // R12: single resolve before GPU path — no update_config / radius rewrite order.
         let visual = ResolvedEffectPlan::visual_key(blur_config, effect, has_blur_region, radius);
         let capture_band = params.geometry.to_physical_precise_round(scale);
-        let capture_band = Rectangle::new(capture_band.loc - sample_offset, capture_band.size);
         let capture = ResolvedEffectPlan::capture_key(
             blur_config,
             effect,
@@ -578,7 +565,6 @@ mod tests {
             )),
             scale: 1.,
             draw_clip: None,
-            sample_offset: Point::from((0, 0)),
         }
     }
 

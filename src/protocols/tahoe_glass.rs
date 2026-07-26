@@ -9,7 +9,7 @@ use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
 };
 use smithay::utils::{Logical, Point, Rectangle, Size};
-use smithay::wayland::compositor::{add_post_commit_hook, with_states, SurfaceData};
+use smithay::wayland::compositor::{with_states, SurfaceData};
 
 use super::raw::tahoe_glass::v1::server::tahoe_glass_manager_v1::{self, TahoeGlassManagerV1};
 use super::raw::tahoe_glass::v1::server::tahoe_glass_surface_v1::{self, TahoeGlassSurfaceV1};
@@ -119,7 +119,7 @@ enum PendingTransformRequest {
 
 /// A committed transform directive for the layer machinery to consume.
 ///
-/// Published by the post-commit hook (or by controller destroy, which resets
+/// Published by [`on_surface_commit`] (or by controller destroy, which resets
 /// to identity) together with a monotonically increasing epoch. Consumers
 /// compare epochs and act once per directive.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,7 +191,6 @@ struct TahoeGlassSurfaceInner {
     pending: Vec<TahoeGlassRegion>,
     committed: Arc<Vec<TahoeGlassRegion>>,
     pending_dirty: bool,
-    hook_registered: bool,
     /// Monotonic owner token for the active `tahoe_glass_surface_v1`.
     /// Only the controller with this generation may clear surface state.
     controller_generation: u64,
@@ -361,11 +360,12 @@ pub fn get_transform_directive(
 ///
 /// A new mapping starts untransformed by definition; clearing here (instead of
 /// absorbing the epoch at map time) is what lets a directive carried by the
-/// mapping commit itself still be applied — smithay runs post-commit hooks
-/// before `CompositorHandler::commit`, so at `MappedLayer::new` time that
-/// directive is already published. Pending (uncommitted) requests are left
-/// untouched: they are regular double-buffered protocol state. The epoch is
-/// not rewound, so the next published directive is always seen as fresh.
+/// mapping commit itself still be applied — [`on_surface_commit`] runs at the
+/// top of `CompositorHandler::commit`, before the layer-shell commit handling,
+/// so at `MappedLayer::new` time that directive is already published. Pending
+/// (uncommitted) requests are left untouched: they are regular double-buffered
+/// protocol state. The epoch is not rewound, so the next published directive
+/// is always seen as fresh.
 pub fn clear_transform_directive_on_unmap(surface: &WlSurface) {
     if !surface.is_alive() {
         return;
@@ -380,39 +380,44 @@ pub fn clear_transform_directive_on_unmap(surface: &WlSurface) {
 }
 
 fn mark_pending_dirty(surface: &WlSurface) {
-    with_inner_and_commit_hook(surface, |inner| inner.pending_dirty = true);
+    with_inner(surface, |inner| inner.pending_dirty = true);
 }
 
-/// Run `f` on the surface glass state, then make sure the post-commit hook
-/// that applies pending regions and transform requests is registered.
-fn with_inner_and_commit_hook<R>(
-    surface: &WlSurface,
-    f: impl FnOnce(&mut TahoeGlassSurfaceInner) -> R,
-) -> R {
-    let (rv, register_hook) = with_states(surface, |states| {
+/// Run `f` on the surface glass state, creating it on first touch. The state
+/// is applied on each commit by [`on_surface_commit`], which the compositor
+/// commit handler calls directly — no per-surface hook registration needed.
+fn with_inner<R>(surface: &WlSurface, f: impl FnOnce(&mut TahoeGlassSurfaceInner) -> R) -> R {
+    with_states(surface, |states| {
         let state = states
             .data_map
             .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
         let mut guard = state.0.lock().unwrap();
-        let rv = f(&mut guard);
-
-        let register = if guard.hook_registered {
-            false
-        } else {
-            guard.hook_registered = true;
-            true
-        };
-        (rv, register)
-    });
-
-    if register_hook {
-        add_post_commit_hook::<State, _>(surface, tahoe_glass_post_commit_hook);
-    }
-
-    rv
+        f(&mut guard)
+    })
 }
 
-fn tahoe_glass_post_commit_hook(state: &mut State, _dh: &DisplayHandle, surface: &WlSurface) {
+/// Apply pending Tahoe glass state (regions + transform requests) riding a
+/// surface commit.
+///
+/// Called from `CompositorHandler::commit` right after
+/// `on_commit_buffer_handler`, NOT from a smithay post-commit hook: post-commit
+/// hooks run before the buffer handler updates `RendererSurfaceState`, so
+/// region validation there would see the *previous* commit's surface geometry.
+/// During an animated grow that off-by-one rejects the final commit (buffer
+/// caught up, stale geometry still small) and no further commit arrives to
+/// heal it — the grown band stays without glass until the next unrelated poke.
+/// Running after the buffer handler validates against the geometry that this
+/// very commit attached.
+///
+/// (Sync subsurfaces are the one exception: `on_commit_buffer_handler` skips
+/// them and their view refreshes only during the parent's pass, so a glass
+/// region on a sync subsurface still validates against the previous geometry
+/// — same as before this reordering, self-healing on the next parent commit.
+/// Glass panels are layer-shell root surfaces, so this stays theoretical.)
+///
+/// It must still run before `layer_shell_handle_commit`: a transform directive
+/// riding the mapping commit has to be published before `MappedLayer::new`.
+pub fn on_surface_commit(state: &mut State, surface: &WlSurface) {
     let (regions_changed, transform_published) = with_states(surface, |states| {
         let Some(data) = states.data_map.get::<TahoeGlassSurfaceData>() else {
             return (false, false);
@@ -707,10 +712,11 @@ fn validate_regions(
 ///
 /// `complete = false` only for *geometry-healable* rejections: the region's
 /// origin lies inside the surface but its extent overflows it. That is the
-/// animated-grow window — the region rides a commit whose buffer still has
-/// the old (smaller) size, and the client-side diff cache never re-sends an
-/// unchanged region, so the commit hook keeps `pending_dirty` set and the
-/// commit attaching the caught-up buffer revalidates the same pending set.
+/// region-ahead-of-buffer window — the region rides a commit whose buffer
+/// still has the old (smaller) size, and the client-side diff cache never
+/// re-sends an unchanged region, so [`on_surface_commit`] keeps
+/// `pending_dirty` set and the commit attaching the caught-up buffer
+/// revalidates the same pending set.
 /// While waiting, the previously committed entry for that id is carried over
 /// (when it still fits) so the panel keeps its old glass — and a pending
 /// region-morph keeps its old-rect anchor — instead of flashing through the
@@ -884,7 +890,7 @@ fn make_transform_curve(
 /// Store a wire transform request for the surface, pending until commit.
 /// Stale controllers are silent no-ops, matching region writes.
 fn queue_transform_request(surface: &WlSurface, generation: u64, request: PendingTransformRequest) {
-    let stored = with_inner_and_commit_hook(surface, |inner| {
+    let stored = with_inner(surface, |inner| {
         inner.set_pending_transform_if_owner(generation, request)
     });
 
@@ -1235,7 +1241,6 @@ mod tests {
             pending: regions.clone(),
             committed: Arc::new(regions),
             pending_dirty: true,
-            hook_registered: true,
             ..Default::default()
         }
     }
@@ -1268,11 +1273,12 @@ mod tests {
         );
     }
 
-    /// Animated grow: the region rides a commit whose buffer still has the old
-    /// (smaller) size and is rejected. The rejection must be reported as
-    /// incomplete so the commit hook keeps `pending_dirty` set — the commit
-    /// attaching the caught-up buffer then revalidates the same pending set
-    /// and the region materializes without any client retransmission.
+    /// Region ahead of buffer: the region rides a commit whose buffer still
+    /// has the old (smaller) size and is rejected. The rejection must be
+    /// reported as incomplete so on_surface_commit keeps `pending_dirty` set —
+    /// the commit attaching the caught-up buffer then revalidates the same
+    /// pending set and the region materializes without any client
+    /// retransmission.
     #[test]
     fn oversized_region_revalidates_once_surface_geometry_catches_up() {
         let grown = region(1, 0, 0, 360, 480);

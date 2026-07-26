@@ -57,8 +57,8 @@ pub struct ResolvedEffectCaptureKey {
     pub blur_options: Option<BlurOptions>,
     /// Whether the xray path is taken instead of the live framebuffer path.
     pub xray: bool,
-    /// Physical band identity of the capture blit (element dst minus sample
-    /// offset, rounded, before any screen clamp). A cached blurred texture is
+    /// Physical band identity of the capture blit (rounded element dst,
+    /// before any screen clamp). A cached blurred texture is
     /// only valid for the band it was blitted from; any band change (layer
     /// animations moving the element, panel resizes, settling springs
     /// crossing a physical pixel) must bump the live effect commit and
@@ -213,7 +213,7 @@ impl ResolvedEffectPlan {
     /// live effect commit even on otherwise damage-free frames.
     ///
     /// `capture_geometry` is the rounded physical band the blit will read
-    /// this frame (element dst minus sample offset). Including it makes the
+    /// this frame (the element dst). Including it makes the
     /// cached blurred texture valid only for the band it came from.
     pub fn capture_key(
         blur_config: niri_config::Blur,
@@ -280,7 +280,6 @@ mod tests {
             clip: clip.then_some((geo, CornerRadius::default())),
             scale: 1.0,
             draw_clip: None,
-            sample_offset: Point::from((0, 0)),
         }
     }
 

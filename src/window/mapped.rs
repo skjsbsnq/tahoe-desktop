@@ -881,7 +881,6 @@ impl LayoutElement for Mapped {
                 // P06 scope: only layer surfaces report geometry animations;
                 // window (and window popup) blur stays on the static tier.
                 false,
-                Point::from((0, 0)),
                 &mut |elem| push(elem.into()),
             );
         }
@@ -918,7 +917,6 @@ impl LayoutElement for Mapped {
             // P06 scope: only layer surfaces report geometry animations;
             // window blur stays on the static tier.
             false,
-            Point::from((0, 0)),
             push,
         );
     }

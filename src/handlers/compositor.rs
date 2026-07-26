@@ -62,6 +62,12 @@ impl CompositorHandler for State {
         on_commit_buffer_handler::<Self>(surface);
         self.backend.early_import(surface);
 
+        // After on_commit_buffer_handler so region validation sees the surface
+        // geometry attached by THIS commit (a post-commit hook would see the
+        // previous one); before layer_shell_handle_commit so a transform
+        // directive riding a mapping commit is published for MappedLayer::new.
+        crate::protocols::tahoe_glass::on_surface_commit(self, surface);
+
         let mut root_surface = surface.clone();
         while let Some(parent) = get_parent(&root_surface) {
             root_surface = parent;
