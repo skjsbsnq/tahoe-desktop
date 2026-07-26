@@ -133,6 +133,7 @@ pub fn render_for_layer(
     draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
     geometry_animating: bool,
+    sample_offset: Point<i32, Physical>,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
     let regions = with_states(surface, get_committed_regions);
@@ -149,6 +150,7 @@ pub fn render_for_layer(
         xray_pos,
         regions,
         geometry_animating,
+        sample_offset,
         push,
     )
 }
@@ -167,6 +169,7 @@ pub fn render_frozen_regions_for_layer(
     xray_pos: XrayPos,
     regions: Arc<Vec<TahoeGlassRegion>>,
     geometry_animating: bool,
+    sample_offset: Point<i32, Physical>,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
     render_regions_for_layer(
@@ -182,6 +185,7 @@ pub fn render_frozen_regions_for_layer(
         xray_pos,
         regions,
         geometry_animating,
+        sample_offset,
         push,
     )
 }
@@ -200,6 +204,7 @@ fn render_regions_for_layer(
     xray_pos: XrayPos,
     regions: Arc<Vec<TahoeGlassRegion>>,
     geometry_animating: bool,
+    sample_offset: Point<i32, Physical>,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
     let _span = tracy_client::span!("TahoeGlass::render_regions_for_layer");
@@ -255,6 +260,7 @@ fn render_regions_for_layer(
                 draw_clip,
                 xray_pos,
                 geometry_animating,
+                sample_offset,
                 push,
             );
         }
@@ -276,6 +282,7 @@ fn render_region(
     draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
     geometry_animating: bool,
+    sample_offset: Point<i32, Physical>,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) {
     let _span = tracy_client::span!("TahoeGlass::render_region");
@@ -333,6 +340,7 @@ fn render_region(
         material_alpha,
         scale,
         draw_clip,
+        sample_offset,
     );
     let visible_radius = params
         .clip
@@ -353,8 +361,15 @@ fn render_region(
     let has_blur_region = region.flags.blur;
     let visual =
         ResolvedEffectPlan::visual_key(blur_kernel, effect, has_blur_region, visible_radius);
-    let capture =
-        ResolvedEffectPlan::capture_key(blur_kernel, effect, has_blur_region, geometry_animating);
+    let capture_band = params.geometry.to_physical_precise_round(scale);
+    let capture_band = Rectangle::new(capture_band.loc - sample_offset, capture_band.size);
+    let capture = ResolvedEffectPlan::capture_key(
+        blur_kernel,
+        effect,
+        has_blur_region,
+        geometry_animating,
+        capture_band,
+    );
     renderer.background_effect.note_plan_keys(visual, capture);
 
     if let Some(plan) = ResolvedEffectPlan::build(
@@ -433,6 +448,7 @@ fn glass_region_render_params(
     alpha: f32,
     scale: f64,
     draw_clip: Option<Rectangle<i32, Physical>>,
+    sample_offset: Point<i32, Physical>,
 ) -> RenderParams {
     let corner = if clip {
         radius
@@ -446,6 +462,7 @@ fn glass_region_render_params(
         clip: Some((visible_geometry, corner)),
         scale,
         draw_clip,
+        sample_offset,
     }
 }
 
@@ -594,6 +611,7 @@ mod tests {
             clip: clip.then_some((visible, radius)),
             scale,
             draw_clip,
+            sample_offset: Point::from((0, 0)),
         }
     }
 
@@ -626,8 +644,16 @@ mod tests {
             Point::from((90, 40)),
             Size::from((220, 100)),
         ));
-        let params =
-            glass_region_render_params(visible, sample, false, radius, 0.85, 1.25, draw_clip);
+        let params = glass_region_render_params(
+            visible,
+            sample,
+            false,
+            radius,
+            0.85,
+            1.25,
+            draw_clip,
+            Point::from((0, 0)),
+        );
 
         assert_eq!(params.geometry, sample, "capture stays on expanded sample");
         let (clip_geo, clip_radius) = params
@@ -663,7 +689,16 @@ mod tests {
             bottom_left: 2.0,
         };
         let sample = expand_rect(visible, 16.0);
-        let params = glass_region_render_params(visible, sample, true, radius, 1.0, 1.0, None);
+        let params = glass_region_render_params(
+            visible,
+            sample,
+            true,
+            radius,
+            1.0,
+            1.0,
+            None,
+            Point::from((0, 0)),
+        );
 
         assert_eq!(params.geometry, sample);
         let (clip_geo, clip_radius) = params.clip.expect("clip always Some");
@@ -683,8 +718,16 @@ mod tests {
             "documents the pre-fix wiring that painted sample padding"
         );
 
-        let fixed =
-            glass_region_render_params(visible, sample, false, rounded_radius(), 1.0, 1.0, None);
+        let fixed = glass_region_render_params(
+            visible,
+            sample,
+            false,
+            rounded_radius(),
+            1.0,
+            1.0,
+            None,
+            Point::from((0, 0)),
+        );
         assert!(
             fixed.clip.is_some(),
             "fixed wiring must always supply a visible clip"
@@ -742,6 +785,7 @@ mod tests {
             1.0,
             1.0,
             None,
+            Point::from((0, 0)),
         );
 
         assert_eq!(params.geometry, sample);
@@ -768,6 +812,7 @@ mod tests {
             1.0,
             2.0,
             draw_clip,
+            Point::from((0, 0)),
         );
         assert_eq!(params.draw_clip, draw_clip);
         assert_eq!(params.scale, 2.0);

@@ -5465,6 +5465,7 @@ impl<W: LayoutElement> Layout<W> {
                 clip: Some((rect, radius)),
                 scale,
                 draw_clip: None,
+                sample_offset: Point::from((0, 0)),
             };
             let elem = move_.snap_preview.effect.render(
                 None,

@@ -6,7 +6,7 @@
 //! or depends on `update_config` / corner-radius setter ordering.
 
 use niri_config::CornerRadius;
-use smithay::utils::{Logical, Rectangle};
+use smithay::utils::{Logical, Physical, Rectangle};
 
 use crate::render_helpers::background_effect::{GlassOptions, Options, RenderParams};
 use crate::render_helpers::blur::{self, BlurOptions};
@@ -57,6 +57,19 @@ pub struct ResolvedEffectCaptureKey {
     pub blur_options: Option<BlurOptions>,
     /// Whether the xray path is taken instead of the live framebuffer path.
     pub xray: bool,
+    /// Physical band identity of the capture blit (element dst minus sample
+    /// offset, rounded, before any screen clamp). A cached blurred texture is
+    /// only valid for the band it was blitted from; any band change (layer
+    /// animations moving the element, panel resizes, settling springs
+    /// crossing a physical pixel) must bump the live effect commit and
+    /// re-capture, or the stale texture gets stretched onto the new
+    /// destination.
+    ///
+    /// For elements later wrapped in crop/rescale wrappers the actual blit
+    /// band can differ (cropped or post-scale geometry); there this key is a
+    /// conservative approximation and correctness is backstopped by the
+    /// damage tracker's per-frame instance damage for moving elements.
+    pub capture_geometry: Rectangle<i32, Physical>,
 }
 
 /// Resolve the blur on/off flag and kernel exactly once, shared between
@@ -198,11 +211,16 @@ impl ResolvedEffectPlan {
     /// for this frame: the P06 downsample tier is part of the resolved kernel,
     /// so a tier flip changes this key and forces a re-capture through the
     /// live effect commit even on otherwise damage-free frames.
+    ///
+    /// `capture_geometry` is the rounded physical band the blit will read
+    /// this frame (element dst minus sample offset). Including it makes the
+    /// cached blurred texture valid only for the band it came from.
     pub fn capture_key(
         blur_config: niri_config::Blur,
         effect: niri_config::BackgroundEffect,
         has_blur_region: bool,
         geometry_animating: bool,
+        capture_geometry: Rectangle<i32, Physical>,
     ) -> ResolvedEffectCaptureKey {
         let options = Self::resolve_options(blur_config, effect, has_blur_region);
         let (blur, blur_options) = resolve_blur(&options, blur_config, geometry_animating);
@@ -210,6 +228,7 @@ impl ResolvedEffectPlan {
             blur,
             blur_options,
             xray: options.xray,
+            capture_geometry,
         }
     }
 }
@@ -261,7 +280,12 @@ mod tests {
             clip: clip.then_some((geo, CornerRadius::default())),
             scale: 1.0,
             draw_clip: None,
+            sample_offset: Point::from((0, 0)),
         }
+    }
+
+    fn test_capture_band() -> Rectangle<i32, Physical> {
+        Rectangle::new(Point::from((0, 0)), Size::from((200, 100)))
     }
 
     #[test]
@@ -410,7 +434,8 @@ mod tests {
         base.chromatic = Some(0.05);
         base.lens_depth = Some(0.15);
 
-        let key_base = ResolvedEffectPlan::capture_key(blur, base, true, false);
+        let key_base =
+            ResolvedEffectPlan::capture_key(blur, base, true, false, test_capture_band());
 
         // material_alpha = 0.5 fade.
         let mut faded = base;
@@ -423,7 +448,7 @@ mod tests {
         faded.lens_depth = Some(0.075);
         assert_eq!(
             key_base,
-            ResolvedEffectPlan::capture_key(blur, faded, true, false)
+            ResolvedEffectPlan::capture_key(blur, faded, true, false, test_capture_band())
         );
 
         // interaction = 0.4 boost on top.
@@ -436,7 +461,7 @@ mod tests {
         boosted.lens_depth = Some(0.21);
         assert_eq!(
             key_base,
-            ResolvedEffectPlan::capture_key(blur, boosted, true, false)
+            ResolvedEffectPlan::capture_key(blur, boosted, true, false, test_capture_band())
         );
 
         // The visual key must still see every one of those changes.
@@ -458,7 +483,7 @@ mod tests {
         effect.blur = Some(true);
         effect.xray = Some(false);
         let blur = Blur::default();
-        let key = ResolvedEffectPlan::capture_key(blur, effect, true, false);
+        let key = ResolvedEffectPlan::capture_key(blur, effect, true, false, test_capture_band());
 
         // passes / offset / off feed the pyramid — key must change.
         assert_ne!(
@@ -471,6 +496,7 @@ mod tests {
                 effect,
                 true,
                 false,
+                test_capture_band()
             )
         );
         assert_ne!(
@@ -483,11 +509,18 @@ mod tests {
                 effect,
                 true,
                 false,
+                test_capture_band()
             )
         );
         assert_ne!(
             key,
-            ResolvedEffectPlan::capture_key(Blur { off: true, ..blur }, effect, true, false)
+            ResolvedEffectPlan::capture_key(
+                Blur { off: true, ..blur },
+                effect,
+                true,
+                false,
+                test_capture_band(),
+            )
         );
 
         // noise / saturation only feed draw uniforms — key must not change.
@@ -502,6 +535,7 @@ mod tests {
                 effect,
                 true,
                 false,
+                test_capture_band()
             )
         );
 
@@ -511,7 +545,7 @@ mod tests {
         no_blur.tint_amount = Some(0.2);
         assert_ne!(
             key,
-            ResolvedEffectPlan::capture_key(blur, no_blur, true, false)
+            ResolvedEffectPlan::capture_key(blur, no_blur, true, false, test_capture_band())
         );
     }
 
@@ -525,8 +559,8 @@ mod tests {
 
         let blur = Blur::default();
         assert_ne!(
-            ResolvedEffectPlan::capture_key(blur, live, true, false),
-            ResolvedEffectPlan::capture_key(blur, xray, true, false)
+            ResolvedEffectPlan::capture_key(blur, live, true, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, xray, true, false, test_capture_band())
         );
     }
 
@@ -543,8 +577,10 @@ mod tests {
             ..Blur::default()
         };
 
-        let static_key = ResolvedEffectPlan::capture_key(blur, effect, true, false);
-        let anim_key = ResolvedEffectPlan::capture_key(blur, effect, true, true);
+        let static_key =
+            ResolvedEffectPlan::capture_key(blur, effect, true, false, test_capture_band());
+        let anim_key =
+            ResolvedEffectPlan::capture_key(blur, effect, true, true, test_capture_band());
         assert_ne!(static_key, anim_key);
         assert_eq!(
             static_key.blur_options.expect("blur on").downsample_shift,
@@ -557,8 +593,8 @@ mod tests {
 
         let off = Blur { off: true, ..blur };
         assert_eq!(
-            ResolvedEffectPlan::capture_key(off, effect, true, false),
-            ResolvedEffectPlan::capture_key(off, effect, true, true),
+            ResolvedEffectPlan::capture_key(off, effect, true, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(off, effect, true, true, test_capture_band()),
         );
     }
 
@@ -590,7 +626,13 @@ mod tests {
             },
         ] {
             for geometry_animating in [false, true] {
-                let key = ResolvedEffectPlan::capture_key(blur, effect, true, geometry_animating);
+                let key = ResolvedEffectPlan::capture_key(
+                    blur,
+                    effect,
+                    true,
+                    geometry_animating,
+                    test_capture_band(),
+                );
                 let plan = ResolvedEffectPlan::build(
                     blur,
                     effect,

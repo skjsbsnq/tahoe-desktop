@@ -13,7 +13,7 @@ use smithay::backend::renderer::{
 };
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::{GlassOptions, RenderParams};
@@ -45,6 +45,11 @@ pub struct FramebufferEffectElement {
     glass: GlassOptions,
     alpha: f32,
     draw_clip: Option<Rectangle<i32, Physical>>,
+    /// Shift applied to the capture blit source relative to the draw
+    /// destination. Edge-reveal layer animations draw the glass at the moving
+    /// surface position while sampling the backdrop at the rest position, so
+    /// the blurred content stays put (and on-screen) while the panel travels.
+    sample_offset: Point<i32, Physical>,
 }
 
 #[derive(Debug)]
@@ -101,6 +106,7 @@ impl FramebufferEffect {
             glass,
             alpha: params.alpha,
             draw_clip: params.draw_clip,
+            sample_offset: params.sample_offset,
         }
     }
 }
@@ -208,8 +214,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             // seems to skip out-of-bounds pixels, even though my reading of the docs suggests
             // otherwise (we use GL_LINEAR filter). So, clamp dst to the framebuffer bounds
             // ourselves.
-            let clamped_dst = match dst.intersection(output_rect) {
-                Some(clamped) => clamped,
+            let clamped_dst = match capture_blit_band(dst, self.sample_offset, output_rect) {
+                Some(band) => band,
                 None => return Ok(()),
             };
             let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
@@ -460,6 +466,34 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
     }
 }
 
+/// Rows the capture blit reads for a given draw destination.
+///
+/// `draw()` paints `dst ∩ output` with the whole intermediate texture, so the
+/// blit must read exactly those rows. With a `sample_offset` (edge-reveal
+/// anchoring) the rows are taken from the rest position instead: clamp FIRST,
+/// then shift the on-screen band back by the offset — this keeps the
+/// texture-rows ↔ drawn-rows mapping 1:1 while the content comes from the
+/// anchored band. The shifted band lies within the rest-position band, which
+/// is on-screen whenever the panel rests on-screen; the defensive re-clamp
+/// only triggers when the rest band itself crosses the far screen edge
+/// (screen-spanning panels), where it shrinks the band by at most the
+/// overhang — a slight stretch — or skips the capture entirely for a fully
+/// out-of-band terminal sliver (drawn without glass rather than with wrong
+/// content).
+fn capture_blit_band(
+    dst: Rectangle<i32, Physical>,
+    sample_offset: Point<i32, Physical>,
+    output_rect: Rectangle<i32, Physical>,
+) -> Option<Rectangle<i32, Physical>> {
+    let clamped_dst = dst.intersection(output_rect)?;
+    if sample_offset == Point::from((0, 0)) {
+        return Some(clamped_dst);
+    }
+
+    let shifted = Rectangle::new(clamped_dst.loc - sample_offset, clamped_dst.size);
+    shifted.intersection(output_rect)
+}
+
 fn clip_damage(
     damage: &mut Vec<Rectangle<i32, Physical>>,
     dst: Rectangle<i32, Physical>,
@@ -522,6 +556,54 @@ mod tests {
 
     use super::*;
 
+    /// The blit band must always match the rows draw() paints: draw clamps the
+    /// moving dst against the output and maps the whole texture onto it, so
+    /// the capture must read a band of exactly that size — shifted to the rest
+    /// position when a sample offset is set (edge-reveal anchoring).
+    #[test]
+    fn capture_blit_band_matches_drawn_rows() {
+        let output = Rectangle::new(Point::from((0, 0)), Size::from((2560, 1600)));
+        let zero = Point::from((0, 0));
+
+        // No offset: plain clamp, unchanged legacy behavior.
+        let dst = Rectangle::new(Point::from((1800, -80)), Size::from((480, 700)));
+        assert_eq!(
+            capture_blit_band(dst, zero, output),
+            Some(Rectangle::new(
+                Point::from((1800, 0)),
+                Size::from((480, 620))
+            ))
+        );
+
+        // Edge-reveal close, mid retract: the moving band pokes 80px above the
+        // screen while the rest band starts at y=45. The blit must read the
+        // same 620 rows draw() will paint, taken from the rest position
+        // (shifted down by the 125px travel), and stay fully on-screen.
+        let offset = Point::from((0, -125));
+        let band = capture_blit_band(dst, offset, output).unwrap();
+        let drawn = dst.intersection(output).unwrap();
+        assert_eq!(band.size, drawn.size, "texture rows must equal drawn rows");
+        assert_eq!(band.loc, Point::from((1800, 125)));
+        assert_eq!(
+            band.loc + offset,
+            drawn.loc,
+            "band rows correspond 1:1 to drawn rows at the rest position"
+        );
+
+        // Fully off-screen destination: nothing to capture.
+        let gone = Rectangle::new(Point::from((0, -800)), Size::from((480, 700)));
+        assert_eq!(capture_blit_band(gone, zero, output), None);
+
+        // Degenerate: shifting lands entirely outside (panel taller than the
+        // output retracting past it) → skip the capture instead of blitting
+        // out-of-bounds rows.
+        let tall = Rectangle::new(Point::from((0, 0)), Size::from((480, 1600)));
+        assert_eq!(
+            capture_blit_band(tall, Point::from((0, -1600)), output),
+            None
+        );
+    }
+
     #[test]
     fn draw_clip_is_relative_to_clamped_destination() {
         let dst = Rectangle::new(Point::from((90, 80)), Size::from((240, 160)));
@@ -564,6 +646,7 @@ mod tests {
                 clip: None,
                 scale: 1.25,
                 draw_clip: Some(draw_clip),
+                sample_offset: Point::from((0, 0)),
             },
             None,
             0.,
@@ -632,6 +715,7 @@ mod tests {
                 clip: None,
                 scale: 1.25,
                 draw_clip: None,
+                sample_offset: Point::from((0, 0)),
             },
             None,
             0.,
@@ -668,6 +752,7 @@ mod tests {
                 clip: Some((visible, radius)),
                 scale: 1.25,
                 draw_clip: None,
+                sample_offset: Point::from((0, 0)),
             },
             None,
             0.,
