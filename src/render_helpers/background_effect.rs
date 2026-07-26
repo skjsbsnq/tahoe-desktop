@@ -480,6 +480,7 @@ pub fn render_for_tile(
     effect: niri_config::BackgroundEffect,
     should_block_out: bool,
     xray_pos: XrayPos,
+    geometry_animating: bool,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
     with_states(surface, |states| {
@@ -508,12 +509,22 @@ pub fn render_for_tile(
 
         // R12: single resolve before GPU path — no update_config / radius rewrite order.
         let visual = ResolvedEffectPlan::visual_key(blur_config, effect, has_blur_region, radius);
-        let capture = ResolvedEffectPlan::capture_key(blur_config, effect, has_blur_region);
+        let capture = ResolvedEffectPlan::capture_key(
+            blur_config,
+            effect,
+            has_blur_region,
+            geometry_animating,
+        );
         background_effect.note_plan_keys(visual, capture);
 
-        let Some(plan) =
-            ResolvedEffectPlan::build(blur_config, effect, has_blur_region, radius, params)
-        else {
+        let Some(plan) = ResolvedEffectPlan::build(
+            blur_config,
+            effect,
+            has_blur_region,
+            radius,
+            params,
+            geometry_animating,
+        ) else {
             return;
         };
 
@@ -586,7 +597,7 @@ mod tests {
         let base = live_effect();
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, CornerRadius::default()),
-            ResolvedEffectPlan::capture_key(blur, base, true),
+            ResolvedEffectPlan::capture_key(blur, base, true, false),
         );
         let (fb0, dmg0) = commits(&effect);
 
@@ -598,7 +609,7 @@ mod tests {
         eased.contrast = Some(1.05);
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, eased, true, CornerRadius::default()),
-            ResolvedEffectPlan::capture_key(blur, eased, true),
+            ResolvedEffectPlan::capture_key(blur, eased, true, false),
         );
         let (fb1, dmg1) = commits(&effect);
 
@@ -624,7 +635,7 @@ mod tests {
 
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, CornerRadius::default()),
-            ResolvedEffectPlan::capture_key(blur, base, true),
+            ResolvedEffectPlan::capture_key(blur, base, true, false),
         );
         let (fb0, dmg0) = commits(&effect);
 
@@ -634,7 +645,7 @@ mod tests {
         };
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(stronger, base, true, CornerRadius::default()),
-            ResolvedEffectPlan::capture_key(stronger, base, true),
+            ResolvedEffectPlan::capture_key(stronger, base, true, false),
         );
         let (fb1, dmg1) = commits(&effect);
 
@@ -671,6 +682,7 @@ mod tests {
             true,
             CornerRadius::default(),
             live_params(),
+            false,
         )
         .expect("live plan must be visible");
         assert!(!plan.xray, "test config must resolve to the live path");
@@ -687,6 +699,73 @@ mod tests {
         assert!(
             matches!(elements[1], BackgroundEffectElement::FramebufferEffect(_)),
             "framebuffer effect must be below the ExtraDamage element"
+        );
+    }
+
+    /// P06: a geometry-animation tier flip changes the capture key, so both
+    /// the engage and the disengage frame bump the live effect commit even
+    /// when nothing else damages the region. Without this, spring sub-pixel
+    /// tails or alpha-only animation endings would strand a half-resolution
+    /// capture on an otherwise static panel.
+    #[test]
+    fn downsample_tier_flip_forces_recapture_both_ways() {
+        let mut effect = BackgroundEffect::new();
+        let base = live_effect();
+        let blur = niri_config::Blur {
+            passes: 3,
+            ..niri_config::Blur::default()
+        };
+        let radius = CornerRadius::default();
+
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            ResolvedEffectPlan::capture_key(blur, base, true, false),
+        );
+        let (fb0, dmg0) = commits(&effect);
+
+        // Engage frame: the open animation starts moving the surface.
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            ResolvedEffectPlan::capture_key(blur, base, true, true),
+        );
+        let (fb1, dmg1) = commits(&effect);
+        assert_eq!(
+            fb0.advanced_by(&fb1),
+            Some(1),
+            "engage frame must force a re-capture at the animation tier"
+        );
+
+        // Disengage frame: rest state after the animation completes.
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            ResolvedEffectPlan::capture_key(blur, base, true, false),
+        );
+        let (fb2, dmg2) = commits(&effect);
+        assert_eq!(
+            fb1.advanced_by(&fb2),
+            Some(1),
+            "disengage frame must force a re-capture at the full tier"
+        );
+
+        // The visual fingerprint is untouched by the tier: repaint flows from
+        // the effect element's own commit bump, not from ExtraDamage.
+        assert_eq!(dmg0.advanced_by(&dmg1), Some(0));
+        assert_eq!(dmg1.advanced_by(&dmg2), Some(0));
+    }
+
+    /// P06: single-pass kernels cannot trade a pass for resolution, so a
+    /// geometry animation must leave their capture key untouched (no tier, no
+    /// spurious re-captures).
+    #[test]
+    fn single_pass_kernel_never_engages_downsample_tier() {
+        let base = live_effect();
+        let blur = niri_config::Blur {
+            passes: 1,
+            ..niri_config::Blur::default()
+        };
+        assert_eq!(
+            ResolvedEffectPlan::capture_key(blur, base, true, false),
+            ResolvedEffectPlan::capture_key(blur, base, true, true),
         );
     }
 

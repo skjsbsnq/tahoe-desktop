@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use niri_config::utils::MergeWith as _;
 use niri_config::{Config, LayerRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -8,7 +10,6 @@ use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 use smithay::wayland::compositor::{remove_pre_commit_hook, with_states, HookId};
 use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
-use std::sync::Arc;
 
 use super::ResolvedLayerRules;
 use crate::animation::Clock;
@@ -473,6 +474,15 @@ impl MappedLayer {
         let open_offset = open_state.map_or(Point::from((0., 0.)), |state| {
             state.offset_for_size(open_size)
         });
+        // P06: while the open animation moves or scales the surface, the
+        // glass blit region shifts every frame and the blur pyramid re-runs;
+        // run it one downsample tier lower for exactly those frames.
+        // Alpha-only tails (fade style, opacity delay) report false so the
+        // resting appearance is restored at full quality. `bob_offset` is
+        // deliberately excluded: baba-is-float bobs forever and must not
+        // permanently soften a panel's blur.
+        let geometry_animating = open_state.is_some_and(|state| state.should_wrap())
+            || open_offset != Point::from((0., 0.));
         let bob_offset = self.bob_offset();
         let base_location = location + bob_offset;
         let crop_rect = open_state
@@ -543,6 +553,7 @@ impl MappedLayer {
                 open_alpha,
                 crop_rect,
                 xray_pos,
+                geometry_animating,
                 &mut |elem| push_opening(elem.into()),
             )
         } else {
@@ -577,6 +588,7 @@ impl MappedLayer {
                 self.rules.background_effect,
                 should_block_out,
                 xray_pos,
+                geometry_animating,
                 &mut |elem| push_opening(elem.into()),
             );
         }
@@ -619,6 +631,12 @@ impl MappedLayer {
         let base_location = location;
         let location = location + close_state.offset;
         let xray_pos = xray_pos.offset(close_state.offset);
+        // P06: same rule as the open path — only close styles that move or
+        // scale the surface (slide/pop/edge-reveal frames with a live offset)
+        // engage the blur downsample tier; fade-style closes keep the full
+        // tier since their captured pixels stay valid.
+        let geometry_animating =
+            close_state.should_wrap() || close_state.offset != Point::from((0., 0.));
         let crop_rect =
             close_state.edge_reveal_crop_rect(base_location, self.block_out_buffer.size(), scale);
         let moving_surface_rect = crop_rect.map(|_| {
@@ -664,6 +682,7 @@ impl MappedLayer {
             crop_rect,
             xray_pos,
             regions,
+            geometry_animating,
             &mut |elem| {
                 let elem = LayerSurfaceRenderElement::TahoeGlass(elem);
                 if let Some(origin) = origin {
@@ -730,6 +749,7 @@ impl MappedLayer {
             self.rules.background_effect,
             false,
             xray_pos,
+            geometry_animating,
             &mut |elem| {
                 let elem = LayerSurfaceRenderElement::BackgroundEffect(elem);
                 if let Some(origin) = origin {
@@ -774,6 +794,11 @@ impl MappedLayer {
         let open_offset = open_state.map_or(Point::from((0., 0.)), |state| {
             state.offset_for_size(open_size)
         });
+        // P06: popups ride along with the layer during its open animation, so
+        // their effect geometry moves with the same offsets/scale — mirror the
+        // main surface's geometry-animation predicate (bob excluded likewise).
+        let geometry_animating = open_state.is_some_and(|state| state.should_wrap())
+            || open_offset != Point::from((0., 0.));
         let bob_offset = self.bob_offset();
         let location = location + bob_offset + open_offset;
         let xray_pos = xray_pos.offset(bob_offset + open_offset);
@@ -843,6 +868,7 @@ impl MappedLayer {
                 effect,
                 false,
                 xray_pos,
+                geometry_animating,
                 &mut |elem| push_opening(elem.into()),
             );
         }
@@ -1008,17 +1034,17 @@ fn push_opening_element<R: NiriRenderer>(
     push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
 ) {
     // Coordinate contract (edge-reveal + optional inherited popin scale):
-    // 1. crop_rect / draw_clip: absolute physical, reveal viewport at rest
-    //    (base_location, unscaled size).
-    // 2. Element geometry before wrap: absolute physical of the *moving*
-    //    surface (base_location + open_offset).
-    // 3. Rescale wraps around a pivot in absolute physical space; geometry
-    //    after wrap is still absolute physical (post-scale destination).
+    // 1. crop_rect / draw_clip: absolute physical, reveal viewport at rest (base_location, unscaled
+    //    size).
+    // 2. Element geometry before wrap: absolute physical of the *moving* surface (base_location +
+    //    open_offset).
+    // 3. Rescale wraps around a pivot in absolute physical space; geometry after wrap is still
+    //    absolute physical (post-scale destination).
     // 4. Crop after wrap so crop_rect and destination share one space.
-    // 5. Internal draw_clip stays absolute physical and is applied against
-    //    the post-scale dst by FramebufferEffectElement::draw.
-    // 6. moving_surface_rect used for shadow excess must be transformed with
-    //    the same rescale so excess is measured in post-scale space.
+    // 5. Internal draw_clip stays absolute physical and is applied against the post-scale dst by
+    //    FramebufferEffectElement::draw.
+    // 6. moving_surface_rect used for shadow excess must be transformed with the same rescale so
+    //    excess is measured in post-scale space.
     let (elem, moving_surface_rect) = if let Some((state, origin, offset)) =
         open_origin.filter(|(state, _, _)| state.should_wrap())
     {
@@ -1236,13 +1262,14 @@ fn clamp_i64_to_i32(value: i64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use smithay::backend::renderer::element::utils::{
         Relocate, RelocateRenderElement, RescaleRenderElement,
     };
     use smithay::backend::renderer::element::{Element, Id, Kind};
     use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
     use smithay::utils::Buffer;
+
+    use super::*;
 
     /// Minimal Element used to exercise rescale + crop composition without a GPU.
     #[derive(Debug)]

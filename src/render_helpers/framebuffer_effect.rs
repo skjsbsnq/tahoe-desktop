@@ -243,6 +243,17 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
 
             let size = size.to_logical(1).to_buffer(1, Transform::Normal);
 
+            // P06: during geometry animations the blur pyramid starts one
+            // tier down — the framebuffer blit below performs that extra
+            // downsample for free into a smaller capture texture, while
+            // draw() keeps mapping the (smaller) blurred result onto the
+            // same destination. Blur-off captures stay at full resolution:
+            // their texture is shown unfiltered.
+            let size = match &self.blur_options {
+                Some(options) => options.capture_size(size),
+                None => size,
+            };
+
             // Recreate framebuffer if needed.
             if inner.framebuffer.as_ref().is_some_and(|fb| {
                 !texture_cache_matches(fb.size(), fb.format(), size, Fourcc::Abgr8888)

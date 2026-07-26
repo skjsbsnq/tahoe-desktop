@@ -878,6 +878,9 @@ impl LayoutElement for Mapped {
                 effect,
                 false,
                 xray_pos,
+                // P06 scope: only layer surfaces report geometry animations;
+                // window (and window popup) blur stays on the static tier.
+                false,
                 &mut |elem| push(elem.into()),
             );
         }
@@ -911,6 +914,9 @@ impl LayoutElement for Mapped {
             self.rules.background_effect,
             should_block_out,
             xray_pos,
+            // P06 scope: only layer surfaces report geometry animations;
+            // window blur stays on the static tier.
+            false,
             push,
         );
     }

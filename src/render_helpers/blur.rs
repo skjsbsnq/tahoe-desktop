@@ -27,6 +27,34 @@ pub struct Blur {
 pub struct BlurOptions {
     pub passes: u8,
     pub offset: f64,
+    /// Animation-period downsample tier (P06).
+    ///
+    /// Each step halves the capture resolution feeding the pyramid and trades
+    /// away one blur pass, so the effective blur radius stays aligned with the
+    /// static tier while the pyramid processes a quarter of the pixels.
+    /// 0 = full quality (static surfaces).
+    pub downsample_shift: u8,
+}
+
+/// Depth of the animation-period downsample tier: one step (P06).
+///
+/// A named policy constant so plan resolution and tests agree on the tier.
+pub const ANIM_DOWNSAMPLE_SHIFT: u8 = 1;
+
+/// Hard bound on `downsample_shift`; a 1/256-area capture is far past any
+/// sensible quality/perf trade and only guards programmatic misuse.
+const MAX_DOWNSAMPLE_SHIFT: u8 = 4;
+
+/// `NIRI_DISABLE_ANIM_BLUR_DOWNSAMPLE=1` disables the animation-period blur
+/// downsample tier for A/B measurement, mirroring the `NIRI_LIFECYCLE_DIAG`
+/// diagnostics idiom. Checked once per process.
+pub fn anim_downsample_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var_os("NIRI_DISABLE_ANIM_BLUR_DOWNSAMPLE")
+            .is_some_and(|value| !value.is_empty() && value != "0")
+    })
 }
 
 impl From<niri_config::Blur> for BlurOptions {
@@ -34,7 +62,30 @@ impl From<niri_config::Blur> for BlurOptions {
         Self {
             passes: config.passes,
             offset: config.offset,
+            downsample_shift: 0,
         }
+    }
+}
+
+impl BlurOptions {
+    fn shift(&self) -> u8 {
+        self.downsample_shift.min(MAX_DOWNSAMPLE_SHIFT)
+    }
+
+    /// Pass count actually run: one pass is traded per downsample step so the
+    /// effective blur radius matches the static tier.
+    pub fn effective_passes(&self) -> u8 {
+        self.passes.clamp(1, 31).saturating_sub(self.shift()).max(1)
+    }
+
+    /// Shrink a capture texture size by the downsample tier. The capture blit
+    /// into the smaller texture performs the actual downsampling for free.
+    pub fn capture_size(&self, size: Size<i32, Buffer>) -> Size<i32, Buffer> {
+        let shift = self.shift();
+        if shift == 0 {
+            return size;
+        }
+        Size::new(max(1, size.w >> shift), max(1, size.h >> shift))
     }
 }
 
@@ -123,11 +174,11 @@ impl Blur {
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Blur::prepare_textures");
 
-        let passes = options.passes.clamp(1, 31) as usize;
+        let passes = options.effective_passes() as usize;
         let size = source.size();
 
         // Reuse the complete texture pyramid while size, format and pass count stay compatible.
-        for (i, size) in texture_sizes(size, options.passes).enumerate() {
+        for (i, size) in texture_sizes(size, options.effective_passes()).enumerate() {
             if let Some(texture) = self.textures.get_mut(i) {
                 let actual_size = texture.size();
                 let actual_format = texture.format();
@@ -176,7 +227,7 @@ impl Blur {
             "wrong renderer"
         );
 
-        let passes = options.passes.clamp(1, 31) as usize;
+        let passes = options.effective_passes() as usize;
         let size = source.size();
 
         ensure!(
@@ -350,7 +401,131 @@ impl Blur {
 mod tests {
     use smithay::utils::Size;
 
-    use super::texture_sizes;
+    use super::{texture_sizes, BlurOptions, ANIM_DOWNSAMPLE_SHIFT};
+
+    #[test]
+    fn anim_tier_trades_one_pass_per_downsample_step() {
+        let base = BlurOptions {
+            passes: 3,
+            offset: 4.,
+            downsample_shift: 0,
+        };
+        assert_eq!(base.effective_passes(), 3);
+
+        let tier = BlurOptions {
+            downsample_shift: ANIM_DOWNSAMPLE_SHIFT,
+            ..base
+        };
+        assert_eq!(tier.effective_passes(), 2);
+
+        // Never below one pass, even for minimal kernels.
+        let minimal = BlurOptions {
+            passes: 1,
+            offset: 4.,
+            downsample_shift: ANIM_DOWNSAMPLE_SHIFT,
+        };
+        assert_eq!(minimal.effective_passes(), 1);
+
+        // passes = 0 clamps up to one pass first.
+        let zero = BlurOptions {
+            passes: 0,
+            offset: 4.,
+            downsample_shift: ANIM_DOWNSAMPLE_SHIFT,
+        };
+        assert_eq!(zero.effective_passes(), 1);
+    }
+
+    #[test]
+    fn capture_size_halves_per_step_and_never_hits_zero() {
+        let base = BlurOptions {
+            passes: 3,
+            offset: 4.,
+            downsample_shift: 0,
+        };
+        assert_eq!(
+            base.capture_size(Size::from((1920, 1080))),
+            Size::from((1920, 1080))
+        );
+
+        let tier = BlurOptions {
+            downsample_shift: ANIM_DOWNSAMPLE_SHIFT,
+            ..base
+        };
+        assert_eq!(
+            tier.capture_size(Size::from((1920, 1080))),
+            Size::from((960, 540))
+        );
+        assert_eq!(tier.capture_size(Size::from((1, 1))), Size::from((1, 1)));
+
+        // Excessive programmatic shifts are clamped, not amplified.
+        let wild = BlurOptions {
+            downsample_shift: 200,
+            ..base
+        };
+        assert_eq!(
+            wild.capture_size(Size::from((1920, 1080))),
+            Size::from((120, 67))
+        );
+    }
+
+    /// Radius parity between tiers, structurally: the deepest pyramid level
+    /// (which sets the coarsest blur octave and thus the perceived radius)
+    /// must be identical between the static tier and the animation tier.
+    #[test]
+    fn anim_tier_keeps_deepest_pyramid_level() {
+        let base = BlurOptions {
+            passes: 3,
+            offset: 4.,
+            downsample_shift: 0,
+        };
+        let tier = BlurOptions {
+            downsample_shift: ANIM_DOWNSAMPLE_SHIFT,
+            ..base
+        };
+
+        let source = Size::from((1920, 1080));
+        let full: Vec<_> = texture_sizes(source, base.effective_passes()).collect();
+        let low: Vec<_> =
+            texture_sizes(tier.capture_size(source), tier.effective_passes()).collect();
+
+        assert_eq!(full.last(), Some(&Size::from((240, 135))));
+        assert_eq!(low.last(), Some(&Size::from((240, 135))));
+        assert_eq!(low.len() + 1, full.len());
+    }
+
+    /// The animation tier must process roughly a quarter of the pyramid
+    /// pixels (down + up pass writes), before even counting the smaller blit.
+    #[test]
+    fn anim_tier_processes_about_a_quarter_of_the_pixels() {
+        fn pyramid_write_pixels(sizes: &[Size<i32, smithay::utils::Buffer>]) -> i64 {
+            let area = |s: &Size<i32, smithay::utils::Buffer>| i64::from(s.w) * i64::from(s.h);
+            let down: i64 = sizes[1..].iter().map(area).sum();
+            let up: i64 = sizes[..sizes.len() - 1].iter().map(area).sum();
+            down + up
+        }
+
+        let base = BlurOptions {
+            passes: 3,
+            offset: 4.,
+            downsample_shift: 0,
+        };
+        let tier = BlurOptions {
+            downsample_shift: ANIM_DOWNSAMPLE_SHIFT,
+            ..base
+        };
+
+        let source = Size::from((1920, 1080));
+        let full: Vec<_> = texture_sizes(source, base.effective_passes()).collect();
+        let low: Vec<_> =
+            texture_sizes(tier.capture_size(source), tier.effective_passes()).collect();
+
+        let full_pixels = pyramid_write_pixels(&full);
+        let low_pixels = pyramid_write_pixels(&low);
+        assert!(
+            low_pixels * 4 <= full_pixels + full_pixels / 10,
+            "animation tier must cut pyramid work ~4x: {low_pixels} vs {full_pixels}"
+        );
+    }
 
     #[test]
     fn texture_pyramid_tracks_size_and_pass_count() {

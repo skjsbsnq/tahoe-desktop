@@ -132,6 +132,7 @@ pub fn render_for_layer(
     layer_alpha: f32,
     draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
+    geometry_animating: bool,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
     let regions = with_states(surface, get_committed_regions);
@@ -147,6 +148,7 @@ pub fn render_for_layer(
         draw_clip,
         xray_pos,
         regions,
+        geometry_animating,
         push,
     )
 }
@@ -164,6 +166,7 @@ pub fn render_frozen_regions_for_layer(
     draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
     regions: Arc<Vec<TahoeGlassRegion>>,
+    geometry_animating: bool,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
     render_regions_for_layer(
@@ -178,6 +181,7 @@ pub fn render_frozen_regions_for_layer(
         draw_clip,
         xray_pos,
         regions,
+        geometry_animating,
         push,
     )
 }
@@ -195,6 +199,7 @@ fn render_regions_for_layer(
     draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
     regions: Arc<Vec<TahoeGlassRegion>>,
+    geometry_animating: bool,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) -> bool {
     let _span = tracy_client::span!("TahoeGlass::render_regions_for_layer");
@@ -249,6 +254,7 @@ fn render_regions_for_layer(
                 layer_alpha,
                 draw_clip,
                 xray_pos,
+                geometry_animating,
                 push,
             );
         }
@@ -269,6 +275,7 @@ fn render_region(
     layer_alpha: f32,
     draw_clip: Option<Rectangle<i32, Physical>>,
     xray_pos: XrayPos,
+    geometry_animating: bool,
     push: &mut dyn FnMut(TahoeGlassElement),
 ) {
     let _span = tracy_client::span!("TahoeGlass::render_region");
@@ -346,12 +353,18 @@ fn render_region(
     let has_blur_region = region.flags.blur;
     let visual =
         ResolvedEffectPlan::visual_key(blur_kernel, effect, has_blur_region, visible_radius);
-    let capture = ResolvedEffectPlan::capture_key(blur_kernel, effect, has_blur_region);
+    let capture =
+        ResolvedEffectPlan::capture_key(blur_kernel, effect, has_blur_region, geometry_animating);
     renderer.background_effect.note_plan_keys(visual, capture);
 
-    if let Some(plan) =
-        ResolvedEffectPlan::build(blur_kernel, effect, has_blur_region, visible_radius, params)
-    {
+    if let Some(plan) = ResolvedEffectPlan::build(
+        blur_kernel,
+        effect,
+        has_blur_region,
+        visible_radius,
+        params,
+        geometry_animating,
+    ) {
         let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
         renderer
             .background_effect
