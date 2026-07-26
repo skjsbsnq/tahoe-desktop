@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
@@ -5,7 +7,6 @@ use smithay::backend::renderer::element::utils::{
 use smithay::backend::renderer::element::Element;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 use smithay::wayland::shell::wlr_layer::Anchor;
-use std::time::Duration;
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::solid_color::SolidColorRenderElement;
@@ -226,19 +227,10 @@ impl OpenAnimationState {
     }
 }
 
-pub fn wrap<E: Element>(
-    element: E,
-    state: OpenAnimationState,
-    origin: Point<i32, Physical>,
-    offset: Point<i32, Physical>,
-) -> RelocateRenderElement<RescaleRenderElement<E>> {
-    wrap_with_transform(element, origin, state.scale(), offset)
-}
-
 pub fn wrap_with_transform<E: Element>(
     element: E,
     origin: Point<i32, Physical>,
-    scale: f64,
+    scale: impl Into<Scale<f64>>,
     offset: Point<i32, Physical>,
 ) -> RelocateRenderElement<RescaleRenderElement<E>> {
     let elem = RescaleRenderElement::from_element(element, origin, scale);

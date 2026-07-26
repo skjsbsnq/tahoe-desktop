@@ -71,6 +71,9 @@ impl WlrLayerShellHandler for State {
             let geo = map.layer_geometry(&layer);
 
             if let Some(mapped) = self.niri.mapped_layer_surfaces.remove(&layer) {
+                crate::protocols::tahoe_glass::clear_transform_directive_on_unmap(
+                    layer.wl_surface(),
+                );
                 if let Some(geo) = geo {
                     self.start_close_animation_for_layer(&output, &layer, geo, mapped);
                 }
@@ -223,6 +226,7 @@ impl State {
         } else {
             // The surface is unmapped.
             if let Some(mut mapped) = self.niri.mapped_layer_surfaces.remove(&layer) {
+                crate::protocols::tahoe_glass::clear_transform_directive_on_unmap(surface);
                 self.clear_foreign_toplevel_rects_for_source(surface);
                 needs_output_resize = true;
 

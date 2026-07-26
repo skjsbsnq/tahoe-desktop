@@ -14,11 +14,15 @@
     all copies or substantial portions of the Software.
   </copyright>
 
-  <interface name="tahoe_glass_manager_v1" version="1">
+  <interface name="tahoe_glass_manager_v1" version="4">
     <description summary="Tahoe compositor-owned glass manager">
       This private protocol lets a client describe exact rounded glass regions
       for a wl_surface. The compositor owns blur, tint, refraction, clipping,
       and shadow rendering for those regions.
+
+      The manager version is kept in lockstep with tahoe_glass_surface_v1 so
+      that surface objects (which inherit the manager's bound version) can
+      negotiate the presentation-transform requests added in version 4.
     </description>
 
     <request name="destroy" type="destructor">
@@ -36,10 +40,17 @@
     </request>
   </interface>
 
-  <interface name="tahoe_glass_surface_v1" version="3">
+  <interface name="tahoe_glass_surface_v1" version="4">
     <description summary="per-surface Tahoe glass regions">
       Regions are double-buffered and committed with the associated wl_surface.
       Region coordinates are surface-local logical coordinates.
+
+      Since version 4 the surface also carries an optional presentation
+      transform: a translate + per-axis scale the compositor applies when
+      rendering the surface and its glass regions. The transform is
+      presentation-only — it never affects input, layout, or the protocol
+      region geometry itself, and the compositor may restrict it to
+      layer-shell surfaces.
     </description>
 
     <enum name="error">
@@ -91,6 +102,87 @@
 
     <request name="clear_regions">
       <description summary="remove all pending regions"/>
+    </request>
+
+    <enum name="transform_curve" since="4">
+      <entry name="spring" value="0" summary="damped spring curve"/>
+      <entry name="eased" value="1" summary="cubic-bezier easing curve"/>
+    </enum>
+
+    <request name="set_transform" since="4">
+      <description summary="set the presentation transform immediately">
+        Double-buffered; applied on the next wl_surface commit. Sets the
+        presentation transform to translate (x, y) + per-axis scale
+        (scale_x, scale_y), cancelling any running transform animation.
+        (0, 0, 1, 1) restores the identity transform.
+
+        The transform maps surface-local logical coordinates: a surface point
+        p renders at surface_position + (x, y) + (scale_x * p.x,
+        scale_y * p.y). Scales are clamped into [0.05, 20] and translations
+        into [-16384, 16384].
+
+        At most one transform request (set_transform, set_transform_target or
+        set_region_morph) takes effect per commit; the last one wins.
+      </description>
+      <arg name="x" type="fixed" summary="translation x in logical px"/>
+      <arg name="y" type="fixed" summary="translation y in logical px"/>
+      <arg name="scale_x" type="fixed" summary="horizontal scale factor"/>
+      <arg name="scale_y" type="fixed" summary="vertical scale factor"/>
+    </request>
+
+    <request name="set_transform_target" since="4">
+      <description summary="animate the presentation transform to a target">
+        Double-buffered; applied on the next wl_surface commit. Starts a
+        compositor-side animation of the presentation transform from its
+        current value to the given target. Spring curves carry over velocity
+        when retargeting a running animation; eased curves restart from the
+        current value without velocity. Once the animation settles on the
+        identity transform the surface renders untransformed again.
+
+        curve selects the animation curve. For spring, params are
+        p1 = damping ratio, p2 = stiffness, p3 = epsilon (progress space);
+        p4 and p5 are reserved and must be 0. For eased, params are
+        p1 = duration in ms and p2..p5 = cubic-bezier control points
+        x1, y1, x2, y2.
+
+        Value ranges and the last-one-wins rule match set_transform.
+      </description>
+      <arg name="x" type="fixed" summary="target translation x in logical px"/>
+      <arg name="y" type="fixed" summary="target translation y in logical px"/>
+      <arg name="scale_x" type="fixed" summary="target horizontal scale factor"/>
+      <arg name="scale_y" type="fixed" summary="target vertical scale factor"/>
+      <arg name="curve" type="uint" enum="transform_curve" summary="animation curve kind"/>
+      <arg name="p1" type="fixed" summary="spring damping ratio, or eased duration ms"/>
+      <arg name="p2" type="fixed" summary="spring stiffness, or bezier x1"/>
+      <arg name="p3" type="fixed" summary="spring epsilon, or bezier y1"/>
+      <arg name="p4" type="fixed" summary="reserved 0, or bezier x2"/>
+      <arg name="p5" type="fixed" summary="reserved 0, or bezier y2"/>
+    </request>
+
+    <request name="set_region_morph" since="4">
+      <description summary="animate a region geometry change as a container morph">
+        Double-buffered; applied on the next wl_surface commit. When that
+        commit changes the rectangle of the region with the given id from
+        R_old to R_new, the compositor starts a presentation-transform
+        animation from the affine that maps R_new onto the current visual
+        footprint of R_old (its rectangle under the presentation transform in
+        effect just before the commit) and animates to identity.
+
+        This lets a client commit content laid out for the new geometry in a
+        single atomic commit while the compositor performs the morph,
+        including correct continuation when a morph is retargeted mid-flight.
+
+        If the region does not exist on both sides of the commit, or its
+        rectangle is unchanged, the request is discarded. Curve arguments
+        match set_transform_target; the last-one-wins rule applies.
+      </description>
+      <arg name="region_id" type="uint" summary="glass region id to anchor the morph on"/>
+      <arg name="curve" type="uint" enum="transform_curve" summary="animation curve kind"/>
+      <arg name="p1" type="fixed" summary="spring damping ratio, or eased duration ms"/>
+      <arg name="p2" type="fixed" summary="spring stiffness, or bezier x1"/>
+      <arg name="p3" type="fixed" summary="spring epsilon, or bezier y1"/>
+      <arg name="p4" type="fixed" summary="reserved 0, or bezier x2"/>
+      <arg name="p5" type="fixed" summary="reserved 0, or bezier y2"/>
     </request>
   </interface>
 </protocol>

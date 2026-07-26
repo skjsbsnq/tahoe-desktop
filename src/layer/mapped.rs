@@ -20,9 +20,13 @@ use crate::layer::opening_layer::{
     self, OpenAnimation, OpenAnimationStartState, OpenAnimationState, OpeningLayerRenderElement,
     OpeningLayerSolidColorRenderElement, OpeningLayerWaylandRenderElement,
 };
+use crate::layer::transform_animation::PresentationTransformAnimation;
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
-use crate::protocols::tahoe_glass::{get_committed_regions, TahoeGlassRegion};
+use crate::protocols::tahoe_glass::{
+    get_committed_regions, get_transform_directive, PresentationAffine, TahoeGlassRegion,
+    TahoeGlassTransformDirective,
+};
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -70,6 +74,19 @@ pub struct MappedLayer {
 
     /// The animation upon opening this layer.
     open_animation: Option<OpenAnimation>,
+
+    /// Steady-state presentation transform driven by the tahoe-glass protocol
+    /// (v4). Identity when the surface renders untransformed.
+    presentation_transform: PresentationAffine,
+
+    /// Running presentation-transform animation, if any.
+    transform_animation: Option<PresentationTransformAnimation>,
+
+    /// Last consumed tahoe-glass transform directive epoch. Starts at zero;
+    /// stale-directive replay across map cycles is prevented by clearing the
+    /// published directive on unmap, not by absorbing the epoch here (the
+    /// mapping commit itself may legitimately carry a directive).
+    seen_transform_epoch: u64,
 
     /// Snapshot to use if this layer is unmapped with a close animation.
     unmap_snapshot: Option<LayerSurfaceUnmapSnapshot>,
@@ -148,6 +165,15 @@ impl MappedLayer {
             blur_config: config.blur,
             tahoe_glass_config: config.tahoe_glass.clone(),
             open_animation: None,
+            presentation_transform: PresentationAffine::IDENTITY,
+            transform_animation: None,
+            // Start at zero rather than absorbing the current epoch: smithay
+            // runs post-commit hooks before CompositorHandler::commit, so a
+            // directive carried by the mapping commit itself is already
+            // published when this constructor runs and must still be applied.
+            // Anti-replay across map cycles is handled by clearing the
+            // directive on unmap (clear_transform_directive_on_unmap).
+            seen_transform_epoch: 0,
             unmap_snapshot: None,
             close_tahoe_glass_regions: None,
             clock,
@@ -192,6 +218,10 @@ impl MappedLayer {
         self.open_animation
             .as_ref()
             .is_some_and(|open| !open.is_done())
+            || self
+                .transform_animation
+                .as_ref()
+                .is_some_and(|anim| !anim.is_done())
     }
 
     pub fn should_animate_close(&self) -> bool {
@@ -264,6 +294,94 @@ impl MappedLayer {
         {
             self.open_animation = None;
         }
+
+        self.consume_transform_directive();
+
+        if let Some(anim) = &self.transform_animation {
+            if anim.is_done() {
+                self.presentation_transform = anim.to();
+                self.transform_animation = None;
+            }
+        }
+    }
+
+    /// Current presentation affine (running animation or steady state).
+    pub fn presentation_affine(&self) -> PresentationAffine {
+        self.transform_animation
+            .as_ref()
+            .map_or(self.presentation_transform, |anim| anim.current())
+    }
+
+    /// Apply a newly committed tahoe-glass transform directive, if any.
+    ///
+    /// Runs once per event-loop cycle from [`Self::advance_animations`]; a
+    /// mutex lock plus an epoch compare per mapped layer, so the idle cost is
+    /// negligible. Each directive is applied exactly once.
+    fn consume_transform_directive(&mut self) {
+        let directive = with_states(self.surface.wl_surface(), |states| {
+            get_transform_directive(states)
+        });
+        let Some((epoch, directive)) = directive else {
+            return;
+        };
+        if epoch == self.seen_transform_epoch {
+            return;
+        }
+        self.seen_transform_epoch = epoch;
+
+        match directive {
+            TahoeGlassTransformDirective::Set(affine) => {
+                self.transform_animation = None;
+                self.presentation_transform = affine;
+            }
+            TahoeGlassTransformDirective::Target(target, curve) => {
+                let from = self.presentation_affine();
+                self.start_transform_animation(from, target, curve);
+            }
+            TahoeGlassTransformDirective::Morph {
+                old_rect,
+                new_rect,
+                curve,
+            } => {
+                // Map the new geometry onto the old geometry's current visual
+                // footprint, then animate back to identity. Evaluating the
+                // running animation here is what makes mid-flight retargeting
+                // land exactly where the previous morph currently is.
+                let visual = self.presentation_affine().apply_rect(old_rect);
+                let Some(from) = PresentationAffine::mapping_rect(new_rect, visual) else {
+                    return;
+                };
+                self.start_transform_animation(from, PresentationAffine::IDENTITY, curve);
+            }
+        }
+    }
+
+    fn start_transform_animation(
+        &mut self,
+        from: PresentationAffine,
+        to: PresentationAffine,
+        curve: crate::protocols::tahoe_glass::TahoeTransformCurve,
+    ) {
+        // The animation settles on `to`; record it as the steady state so a
+        // dropped animation can never leave a stale transform behind.
+        self.presentation_transform = to;
+
+        if from == to {
+            self.transform_animation = None;
+            return;
+        }
+
+        let velocity = self
+            .transform_animation
+            .as_ref()
+            .map_or(0., |anim| anim.velocity_toward(&from, &to));
+        self.transform_animation = Some(PresentationTransformAnimation::new(
+            self.clock.clone(),
+            from,
+            to,
+            velocity,
+            curve,
+        ));
     }
 
     pub fn start_open_animation(
@@ -330,6 +448,7 @@ impl MappedLayer {
             Point::from((0., 0.)),
             XrayPos::default(),
             None,
+            None,
             render_close_effects_in_snapshot,
             &mut |elem| contents.push(elem),
         );
@@ -342,6 +461,7 @@ impl MappedLayer {
             None,
             Point::from((0., 0.)),
             XrayPos::default(),
+            None,
             None,
             &mut |elem| contents.push(elem),
         );
@@ -357,6 +477,7 @@ impl MappedLayer {
             Point::from((0., 0.)),
             XrayPos::default(),
             None,
+            None,
             render_close_effects_in_snapshot,
             &mut |elem| blocked_out_contents.push(elem),
         );
@@ -369,6 +490,7 @@ impl MappedLayer {
             None,
             Point::from((0., 0.)),
             XrayPos::default(),
+            None,
             None,
             &mut |elem| blocked_out_contents.push(elem),
         );
@@ -450,6 +572,7 @@ impl MappedLayer {
             location,
             xray_pos,
             self.open_animation_state(),
+            Some(self.presentation_affine()),
             true,
             push,
         );
@@ -462,6 +585,7 @@ impl MappedLayer {
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
         open_state: Option<OpenAnimationState>,
+        presentation: Option<PresentationAffine>,
         render_close_effects: bool,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
@@ -481,8 +605,17 @@ impl MappedLayer {
         // resting appearance is restored at full quality. `bob_offset` is
         // deliberately excluded: baba-is-float bobs forever and must not
         // permanently soften a panel's blur.
+        // P05: a running presentation-transform animation moves the blit
+        // region the same way; steady non-identity transforms (e.g. a hidden
+        // dock) are static and stay on the full-quality tier.
+        let transform_animating = presentation.is_some()
+            && self
+                .transform_animation
+                .as_ref()
+                .is_some_and(|anim| !anim.is_done());
         let geometry_animating = open_state.is_some_and(|state| state.should_wrap())
-            || open_offset != Point::from((0., 0.));
+            || open_offset != Point::from((0., 0.))
+            || transform_animating;
         let bob_offset = self.bob_offset();
         let base_location = location + bob_offset;
         let crop_rect = open_state
@@ -492,22 +625,23 @@ impl MappedLayer {
             crop_rect.map(|_| Rectangle::new(location, open_size).to_physical_precise_round(scale));
         let xray_pos = xray_pos.offset(bob_offset + open_offset);
         let anchor = self.surface.cached_state().anchor;
-        let open_origin = open_state.map(|state| {
-            (
-                state,
-                state.origin(location, open_size, anchor, scale),
-                Point::from((0, 0)),
-            )
-        });
+        let open_wrap = open_state
+            .filter(|state| state.should_wrap())
+            .map(|state| WrapSpec {
+                scale: Scale::from(state.scale()),
+                origin: state.origin(location, open_size, anchor, scale),
+                offset: Point::from((0, 0)),
+            });
+        let transform_wrap = presentation
+            .filter(|affine| !affine.is_identity())
+            .map(|affine| WrapSpec::from_affine(&affine, location, scale));
+        // Transform outer, open inner: the protocol transform must hold exactly
+        // in the final presentation (a hidden dock stays fully hidden while its
+        // layer-open animation plays inside the translated space); composing
+        // the other way would scale the protocol translation by the open scale.
+        let wrap = compose_wrap_specs(open_wrap, transform_wrap);
         let mut push_opening = |elem| {
-            push_opening_element(
-                elem,
-                open_origin,
-                scale,
-                crop_rect,
-                moving_surface_rect,
-                push,
-            );
+            push_opening_element(elem, wrap, scale, crop_rect, moving_surface_rect, push);
         };
 
         let surface = self.surface.wl_surface();
@@ -608,6 +742,7 @@ impl MappedLayer {
             location,
             xray_pos,
             self.open_animation_state(),
+            Some(self.presentation_affine()),
             push,
         );
     }
@@ -666,7 +801,7 @@ impl MappedLayer {
         // is measured in post-wrap absolute physical space.
         let post_wrap_moving_surface_rect = match origin {
             Some(origin) => moving_surface_rect
-                .map(|rect| rescale_physical_rect(rect, origin, close_state.scale)),
+                .map(|rect| rescale_physical_rect(rect, origin, Scale::from(close_state.scale))),
             None => moving_surface_rect,
         };
 
@@ -689,7 +824,7 @@ impl MappedLayer {
                     push_close_effect_element(
                         wrap_render_element_with_transform(
                             elem,
-                            close_state.scale,
+                            Scale::from(close_state.scale),
                             origin,
                             Point::from((0, 0)),
                         ),
@@ -719,7 +854,7 @@ impl MappedLayer {
                 push_close_effect_element(
                     wrap_render_element_with_transform(
                         elem,
-                        close_state.scale,
+                        Scale::from(close_state.scale),
                         origin,
                         Point::from((0, 0)),
                     ),
@@ -756,7 +891,7 @@ impl MappedLayer {
                     push_close_effect_element(
                         wrap_render_element_with_transform(
                             elem,
-                            close_state.scale,
+                            Scale::from(close_state.scale),
                             origin,
                             Point::from((0, 0)),
                         ),
@@ -779,6 +914,7 @@ impl MappedLayer {
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
         open_state: Option<OpenAnimationState>,
+        presentation: Option<PresentationAffine>,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
@@ -797,24 +933,41 @@ impl MappedLayer {
         // P06: popups ride along with the layer during its open animation, so
         // their effect geometry moves with the same offsets/scale — mirror the
         // main surface's geometry-animation predicate (bob excluded likewise).
+        let transform_animating = presentation.is_some()
+            && self
+                .transform_animation
+                .as_ref()
+                .is_some_and(|anim| !anim.is_done());
         let geometry_animating = open_state.is_some_and(|state| state.should_wrap())
-            || open_offset != Point::from((0., 0.));
+            || open_offset != Point::from((0., 0.))
+            || transform_animating;
         let bob_offset = self.bob_offset();
         let location = location + bob_offset + open_offset;
         let xray_pos = xray_pos.offset(bob_offset + open_offset);
         let anchor = self.surface.cached_state().anchor;
-        let open_origin = open_state.map(|state| {
-            (
-                state,
-                state.origin(location, self.block_out_buffer.size(), anchor, scale),
-                Point::from((0, 0)),
-            )
-        });
+        let open_wrap = open_state
+            .filter(|state| state.should_wrap())
+            .map(|state| WrapSpec {
+                scale: Scale::from(state.scale()),
+                origin: state.origin(location, self.block_out_buffer.size(), anchor, scale),
+                offset: Point::from((0, 0)),
+            });
+        let transform_wrap = presentation
+            .filter(|affine| !affine.is_identity())
+            .map(|affine| WrapSpec::from_affine(&affine, location, scale));
+        // Transform outer, open inner: the protocol transform must hold exactly
+        // in the final presentation (a hidden dock stays fully hidden while its
+        // layer-open animation plays inside the translated space); composing
+        // the other way would scale the protocol translation by the open scale.
+        let wrap = compose_wrap_specs(open_wrap, transform_wrap);
         let mut push_opening = |elem| {
-            if let Some((state, origin, offset)) =
-                open_origin.filter(|(state, _, _)| state.should_wrap())
-            {
-                push(wrap_opening_render_element(elem, state, origin, offset));
+            if let Some(spec) = wrap {
+                push(wrap_render_element_with_transform(
+                    elem,
+                    spec.scale,
+                    spec.origin,
+                    spec.offset,
+                ));
             } else {
                 push(elem);
             }
@@ -914,56 +1067,79 @@ fn anchor_axis_origin(loc: f64, size: f64, anchored_min: bool, anchored_max: boo
     }
 }
 
-fn wrap_opening_render_element<R: NiriRenderer>(
-    elem: LayerSurfaceRenderElement<R>,
-    state: OpenAnimationState,
+/// A single Rescale+Relocate wrap in absolute physical space.
+///
+/// Realizes `W(g) = origin + scale ⊙ (g − origin) + offset` for element
+/// geometry `g`. Both the layer open animation and the tahoe-glass
+/// presentation transform reduce to this form, and two of them compose into
+/// one (see [`compose_wrap_specs`]), so the render elements never need nested
+/// wrappers.
+#[derive(Debug, Clone, Copy)]
+struct WrapSpec {
+    scale: Scale<f64>,
     origin: Point<i32, smithay::utils::Physical>,
     offset: Point<i32, smithay::utils::Physical>,
-) -> LayerSurfaceRenderElement<R> {
-    match elem {
-        LayerSurfaceRenderElement::Wayland(elem) => {
-            opening_layer::wrap(elem, state, origin, offset).into()
+}
+
+impl WrapSpec {
+    /// Wrap realizing a presentation affine for a surface at `location`:
+    /// per-axis scale about the surface origin, then translate.
+    fn from_affine(
+        affine: &PresentationAffine,
+        location: Point<f64, Logical>,
+        scale: Scale<f64>,
+    ) -> Self {
+        Self {
+            scale: Scale {
+                x: affine.scale_x,
+                y: affine.scale_y,
+            },
+            origin: location.to_physical_precise_round(scale),
+            offset: Point::<f64, Logical>::from((affine.x, affine.y))
+                .to_physical_precise_round(scale),
         }
-        LayerSurfaceRenderElement::SolidColor(elem) => {
-            opening_layer::wrap(elem, state, origin, offset).into()
+    }
+
+    /// Offset form `W(g) = scale ⊙ g + C`, with `C` in f64 physical.
+    fn canonical_offset(&self) -> Point<f64, smithay::utils::Physical> {
+        Point::from((
+            f64::from(self.origin.x) * (1. - self.scale.x) + f64::from(self.offset.x),
+            f64::from(self.origin.y) * (1. - self.scale.y) + f64::from(self.offset.y),
+        ))
+    }
+}
+
+/// Compose two optional wraps into `outer ∘ inner`.
+///
+/// Single-wrap cases pass through untouched so the pure open-animation and
+/// pure presentation-transform paths keep their exact rounding behavior.
+fn compose_wrap_specs(inner: Option<WrapSpec>, outer: Option<WrapSpec>) -> Option<WrapSpec> {
+    match (inner, outer) {
+        (None, None) => None,
+        (Some(spec), None) | (None, Some(spec)) => Some(spec),
+        (Some(inner), Some(outer)) => {
+            let ci = inner.canonical_offset();
+            let co = outer.canonical_offset();
+            let scale = Scale {
+                x: outer.scale.x * inner.scale.x,
+                y: outer.scale.y * inner.scale.y,
+            };
+            let offset = Point::from((
+                (outer.scale.x * ci.x + co.x).round() as i32,
+                (outer.scale.y * ci.y + co.y).round() as i32,
+            ));
+            Some(WrapSpec {
+                scale,
+                origin: Point::from((0, 0)),
+                offset,
+            })
         }
-        LayerSurfaceRenderElement::Shadow(elem) => {
-            opening_layer::wrap(elem, state, origin, offset).into()
-        }
-        LayerSurfaceRenderElement::BackgroundEffect(elem) => {
-            opening_layer::wrap(elem, state, origin, offset).into()
-        }
-        // Peel Tahoe glass shadow into OpeningShadow so post-wrap crop can
-        // expand for shadow excess without treating padded glass content as
-        // shadow (would widen the reveal viewport).
-        LayerSurfaceRenderElement::TahoeGlass(TahoeGlassElement::Shadow(elem)) => {
-            opening_layer::wrap(elem, state, origin, offset).into()
-        }
-        LayerSurfaceRenderElement::TahoeGlass(elem) => {
-            opening_layer::wrap(elem, state, origin, offset).into()
-        }
-        elem @ LayerSurfaceRenderElement::CroppedWayland(_)
-        | elem @ LayerSurfaceRenderElement::CroppedSolidColor(_)
-        | elem @ LayerSurfaceRenderElement::CroppedShadow(_)
-        | elem @ LayerSurfaceRenderElement::CroppedBackgroundEffect(_)
-        | elem @ LayerSurfaceRenderElement::CroppedTahoeGlass(_)
-        | elem @ LayerSurfaceRenderElement::CroppedOpeningWayland(_)
-        | elem @ LayerSurfaceRenderElement::CroppedOpeningSolidColor(_)
-        | elem @ LayerSurfaceRenderElement::CroppedOpeningShadow(_)
-        | elem @ LayerSurfaceRenderElement::CroppedOpeningBackgroundEffect(_)
-        | elem @ LayerSurfaceRenderElement::CroppedOpeningTahoeGlass(_)
-        | elem @ LayerSurfaceRenderElement::OpeningWayland(_)
-        | elem @ LayerSurfaceRenderElement::OpeningSolidColor(_)
-        | elem @ LayerSurfaceRenderElement::OpeningShadow(_)
-        | elem @ LayerSurfaceRenderElement::OpeningBackgroundEffect(_)
-        | elem @ LayerSurfaceRenderElement::OpeningTahoeGlass(_)
-        | elem @ LayerSurfaceRenderElement::Closing(_) => elem,
     }
 }
 
 fn wrap_render_element_with_transform<R: NiriRenderer>(
     elem: LayerSurfaceRenderElement<R>,
-    scale: f64,
+    scale: Scale<f64>,
     origin: Point<i32, smithay::utils::Physical>,
     offset: Point<i32, smithay::utils::Physical>,
 ) -> LayerSurfaceRenderElement<R> {
@@ -980,6 +1156,9 @@ fn wrap_render_element_with_transform<R: NiriRenderer>(
         LayerSurfaceRenderElement::BackgroundEffect(elem) => {
             opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
         }
+        // Peel Tahoe glass shadow into OpeningShadow so post-wrap crop can
+        // expand for shadow excess without treating padded glass content as
+        // shadow (would widen the reveal viewport).
         LayerSurfaceRenderElement::TahoeGlass(TahoeGlassElement::Shadow(elem)) => {
             opening_layer::wrap_with_transform(elem, origin, scale, offset).into()
         }
@@ -1023,17 +1202,14 @@ fn tahoe_glass_uses_internal_draw_clip(elem: &TahoeGlassElement) -> bool {
 
 fn push_opening_element<R: NiriRenderer>(
     elem: LayerSurfaceRenderElement<R>,
-    open_origin: Option<(
-        OpenAnimationState,
-        Point<i32, smithay::utils::Physical>,
-        Point<i32, smithay::utils::Physical>,
-    )>,
+    wrap: Option<WrapSpec>,
     scale: Scale<f64>,
     crop_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
     moving_surface_rect: Option<Rectangle<i32, smithay::utils::Physical>>,
     push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
 ) {
-    // Coordinate contract (edge-reveal + optional inherited popin scale):
+    // Coordinate contract (edge-reveal + optional inherited popin scale and/or
+    // tahoe-glass presentation transform, pre-composed into one WrapSpec):
     // 1. crop_rect / draw_clip: absolute physical, reveal viewport at rest (base_location, unscaled
     //    size).
     // 2. Element geometry before wrap: absolute physical of the *moving* surface (base_location +
@@ -1045,13 +1221,11 @@ fn push_opening_element<R: NiriRenderer>(
     //    FramebufferEffectElement::draw.
     // 6. moving_surface_rect used for shadow excess must be transformed with the same rescale so
     //    excess is measured in post-scale space.
-    let (elem, moving_surface_rect) = if let Some((state, origin, offset)) =
-        open_origin.filter(|(state, _, _)| state.should_wrap())
-    {
-        let elem = wrap_opening_render_element(elem, state, origin, offset);
+    let (elem, moving_surface_rect) = if let Some(spec) = wrap {
+        let elem = wrap_render_element_with_transform(elem, spec.scale, spec.origin, spec.offset);
         let moving_surface_rect = moving_surface_rect.map(|rect| {
-            let mut rect = rescale_physical_rect(rect, origin, state.scale());
-            rect.loc += offset;
+            let mut rect = rescale_physical_rect(rect, spec.origin, spec.scale);
+            rect.loc += spec.offset;
             rect
         });
         (elem, moving_surface_rect)
@@ -1081,10 +1255,10 @@ fn push_close_effect_element<R: NiriRenderer>(
 fn rescale_physical_rect(
     mut rect: Rectangle<i32, Physical>,
     origin: Point<i32, Physical>,
-    scale: f64,
+    scale: Scale<f64>,
 ) -> Rectangle<i32, Physical> {
     rect.loc -= origin;
-    rect = rect.to_f64().upscale(Scale::from(scale)).to_i32_round();
+    rect = rect.to_f64().upscale(scale).to_i32_round();
     rect.loc += origin;
     rect
 }
@@ -1363,7 +1537,7 @@ mod tests {
         let expected = wrapped.geometry(output_scale);
 
         assert_eq!(
-            rescale_physical_rect(pre, origin, anim_scale),
+            rescale_physical_rect(pre, origin, Scale::from(anim_scale)),
             expected,
             "helper must mirror RescaleRenderElement geometry transform"
         );
@@ -1425,8 +1599,8 @@ mod tests {
 
         // Shadow extends 12px past the pre-scale surface on each side.
         let pre_shadow = expand_rect_i32(pre_surface, 12, 12, 12, 12);
-        let post_surface = rescale_physical_rect(pre_surface, origin, anim_scale);
-        let post_shadow = rescale_physical_rect(pre_shadow, origin, anim_scale);
+        let post_surface = rescale_physical_rect(pre_surface, origin, Scale::from(anim_scale));
+        let post_shadow = rescale_physical_rect(pre_shadow, origin, Scale::from(anim_scale));
 
         let expanded = shadow_crop_rect(crop, Some(post_surface), post_shadow);
 
@@ -1442,7 +1616,7 @@ mod tests {
         let crop = Rectangle::new(Point::from((100, 100)), Size::from((200, 100)));
         let pre = Rectangle::new(Point::from((100, 40)), Size::from((200, 100)));
         let origin = Point::from((200, 90));
-        let post = rescale_physical_rect(pre, origin, 0.5);
+        let post = rescale_physical_rect(pre, origin, Scale::from(0.5));
 
         // Old bug: wrap and push without crop → full post geometry drawn.
         let uncropped = crop_policy_geometry(post, None, Some(post), CropPolicyKind::Content);
@@ -1512,6 +1686,57 @@ mod tests {
             cropped.geometry(output_scale),
             post_geo.intersection(crop_rect).unwrap()
         );
+    }
+
+    /// Composed wrap must equal applying inner then outer wraps sequentially
+    /// (i.e. what nesting two Rescale+Relocate layers would render).
+    #[test]
+    fn composed_wrap_spec_matches_nested_application() {
+        fn apply(spec: WrapSpec, p: (f64, f64)) -> (f64, f64) {
+            (
+                f64::from(spec.origin.x)
+                    + spec.scale.x * (p.0 - f64::from(spec.origin.x))
+                    + f64::from(spec.offset.x),
+                f64::from(spec.origin.y)
+                    + spec.scale.y * (p.1 - f64::from(spec.origin.y))
+                    + f64::from(spec.offset.y),
+            )
+        }
+
+        // Open popin (uniform, about its own origin) as inner; anisotropic
+        // presentation transform (about the surface origin, translated) outer.
+        let inner = WrapSpec {
+            scale: Scale { x: 0.85, y: 0.85 },
+            origin: Point::from((960, 22)),
+            offset: Point::from((0, 0)),
+        };
+        let outer = WrapSpec {
+            scale: Scale { x: 0.3, y: 0.2 },
+            origin: Point::from((744, 4)),
+            offset: Point::from((120, -6)),
+        };
+
+        let composed = compose_wrap_specs(Some(inner), Some(outer)).unwrap();
+
+        for p in [(0., 0.), (744., 4.), (1176., 176.), (1920., 220.)] {
+            let nested = apply(outer, apply(inner, p));
+            let direct = apply(composed, p);
+            // The composed offset rounds once to i32 physical; allow 1px.
+            assert!(
+                (nested.0 - direct.0).abs() <= 1. && (nested.1 - direct.1).abs() <= 1.,
+                "composed wrap diverged at {p:?}: nested {nested:?} vs direct {direct:?}"
+            );
+        }
+
+        // Single-wrap cases pass the spec through untouched (exact rounding
+        // preservation for the pure open / pure transform paths).
+        assert!(compose_wrap_specs(None, None).is_none());
+        let only = compose_wrap_specs(Some(inner), None).unwrap();
+        assert_eq!(only.origin, inner.origin);
+        assert_eq!(only.offset, inner.offset);
+        let only = compose_wrap_specs(None, Some(outer)).unwrap();
+        assert_eq!(only.origin, outer.origin);
+        assert_eq!(only.offset, outer.offset);
     }
 }
 
