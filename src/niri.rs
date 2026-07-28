@@ -134,7 +134,7 @@ use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
-    mods_with_tablet_stylus_binds, mods_with_wheel_binds, TabletData,
+    mods_with_tablet_stylus_binds, mods_with_wheel_binds, BindRepeatState, TabletData,
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::closing_layer::ClosingLayer;
@@ -340,7 +340,8 @@ pub struct Niri {
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
-    pub bind_repeat_timer: Option<RegistrationToken>,
+    /// Single bind-repeat timer owned by the last-pressed repeatable key (T-07).
+    pub bind_repeat: Option<BindRepeatState>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -2865,7 +2866,7 @@ impl Niri {
             suppressed_keys: HashSet::new(),
             suppressed_buttons: HashSet::new(),
             bind_cooldown_timers: HashMap::new(),
-            bind_repeat_timer: Option::default(),
+            bind_repeat: None,
             presentation_state,
             security_context_state,
             gamma_control_manager_state,

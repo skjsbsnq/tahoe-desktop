@@ -71,6 +71,55 @@ use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
 
+/// Ownership of the single bind-repeat timer (F-06 / T-07).
+///
+/// Only one bind can auto-repeat at a time — the most recently pressed
+/// repeatable key owns the timer. Releasing a *different* still-held key
+/// must not cancel that owner (the historical bug stopped every repeat on
+/// any key-up).
+///
+/// `owner` is the pure decision table (also unit-tested); `token` is the
+/// calloop source. Production always drives cancel/start through `owner`.
+#[derive(Debug)]
+pub struct BindRepeatState {
+    pub owner: BindRepeatOwner,
+    pub token: calloop::RegistrationToken,
+}
+
+/// Pure decision helper for bind-repeat ownership. Last pressed key wins;
+/// release only cancels the owner. Shared by production and unit tests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BindRepeatOwner {
+    active: Option<Keycode>,
+}
+
+impl BindRepeatOwner {
+    pub fn active(&self) -> Option<Keycode> {
+        self.active
+    }
+
+    /// Record that `key` now owns the repeat timer (replacing any previous owner).
+    pub fn start(&mut self, key: Keycode) {
+        self.active = Some(key);
+    }
+
+    /// Whether releasing `key` would cancel the active repeat (does not mutate).
+    #[inline]
+    pub fn is_owner(&self, key: Keycode) -> bool {
+        self.active == Some(key)
+    }
+
+    /// Handle a key release. Returns `true` if the active repeat must stop.
+    pub fn on_release(&mut self, key: Keycode) -> bool {
+        if self.is_owner(key) {
+            self.active = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
     pub aspect_ratio: f64,
@@ -401,16 +450,19 @@ impl State {
         let time = Event::time_msec(&event);
         let pressed = event.state() == KeyState::Pressed;
 
-        // Stop bind key repeat on any release. This won't work 100% correctly in cases like:
-        // 1. Press Mod
-        // 2. Press Left (repeat starts)
-        // 3. Press PgDown (new repeat starts)
-        // 4. Release Left (PgDown repeat stops)
-        // But it's good enough for now.
-        // FIXME: handle this properly.
+        // Stop bind key repeat only when the *owner* key is released. Last
+        // pressed repeatable key owns the single timer (BindRepeatOwner).
         if !pressed {
-            if let Some(token) = self.niri.bind_repeat_timer.take() {
-                self.niri.event_loop.remove(token);
+            let key = event.key_code();
+            let stop = self
+                .niri
+                .bind_repeat
+                .as_mut()
+                .is_some_and(|r| r.owner.on_release(key));
+            if stop {
+                if let Some(repeat) = self.niri.bind_repeat.take() {
+                    self.niri.event_loop.remove(repeat.token);
+                }
             }
         }
 
@@ -582,17 +634,17 @@ impl State {
 
         self.handle_bind(bind.clone());
 
-        self.start_key_repeat(bind);
+        self.start_key_repeat(event.key_code(), bind);
     }
 
-    fn start_key_repeat(&mut self, bind: Bind) {
+    fn start_key_repeat(&mut self, key: Keycode, bind: Bind) {
         if !bind.repeat {
             return;
         }
 
-        // Stop the previous key repeat if any.
-        if let Some(token) = self.niri.bind_repeat_timer.take() {
-            self.niri.event_loop.remove(token);
+        // Last pressed repeatable key becomes the sole owner; drop any prior timer.
+        if let Some(prev) = self.niri.bind_repeat.take() {
+            self.niri.event_loop.remove(prev.token);
         }
 
         let config = self.niri.config.borrow();
@@ -616,7 +668,9 @@ impl State {
             })
             .unwrap();
 
-        self.niri.bind_repeat_timer = Some(token);
+        let mut owner = BindRepeatOwner::default();
+        owner.start(key);
+        self.niri.bind_repeat = Some(BindRepeatState { owner, token });
     }
 
     fn hide_cursor_if_needed(&mut self) {
@@ -5224,6 +5278,66 @@ mod tests {
 
     use super::*;
     use crate::animation::Clock;
+
+    /// F-06 / T-07: dual-key hold and alternating release must keep the
+    /// last-pressed key's repeat alive.
+    #[test]
+    fn bind_repeat_owner_last_pressed_wins() {
+        let left = Keycode::from(105u32); // arbitrary distinct codes
+        let pgdown = Keycode::from(109u32);
+
+        let mut owner = BindRepeatOwner::default();
+        assert_eq!(owner.active(), None);
+
+        // 1. Press Left → Left owns repeat.
+        owner.start(left);
+        assert_eq!(owner.active(), Some(left));
+
+        // 2. Press PgDown → PgDown steals ownership (last pressed wins).
+        owner.start(pgdown);
+        assert_eq!(owner.active(), Some(pgdown));
+
+        // 3. Release Left → must NOT cancel PgDown's repeat.
+        assert!(!owner.on_release(left));
+        assert_eq!(owner.active(), Some(pgdown));
+
+        // 4. Release PgDown → now cancel.
+        assert!(owner.on_release(pgdown));
+        assert_eq!(owner.active(), None);
+    }
+
+    #[test]
+    fn bind_repeat_owner_release_owner_then_other() {
+        let a = Keycode::from(30u32);
+        let b = Keycode::from(48u32);
+
+        let mut owner = BindRepeatOwner::default();
+        owner.start(a);
+        owner.start(b);
+
+        // Release owner first.
+        assert!(owner.on_release(b));
+        assert_eq!(owner.active(), None);
+
+        // Later release of the non-owner is a no-op (no restart of a's repeat;
+        // niri does not transfer ownership back on release).
+        assert!(!owner.on_release(a));
+        assert_eq!(owner.active(), None);
+    }
+
+    #[test]
+    fn bind_repeat_owner_same_key_repress() {
+        let k = Keycode::from(42u32);
+        let mut owner = BindRepeatOwner::default();
+        owner.start(k);
+        // Re-press same key (e.g. after synthetic events) still owns.
+        owner.start(k);
+        assert_eq!(owner.active(), Some(k));
+        assert!(owner.on_release(k));
+        assert_eq!(owner.active(), None);
+        // Double-release must not panic or re-cancel.
+        assert!(!owner.on_release(k));
+    }
 
     #[test]
     fn bindings_suppress_keys() {
