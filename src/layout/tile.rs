@@ -757,6 +757,10 @@ impl<W: LayoutElement> Tile<W> {
         // with render_offset = from * value; convert absolute velocity to the
         // new unit scale so C1 holds across chained moves. `velocity` is an
         // extra absolute kick (interactive-move fling); from≈0 skips it.
+        //
+        // Note `config` is deliberately ignored on the restart path: interrupting a move that was
+        // created with, say, `window_resize.anim` continues on that curve rather than switching
+        // mid-flight. Continuity wins over curve identity here.
         let anim = match self.move_x_animation.take() {
             Some(move_) => {
                 let v_abs = combined_move_velocity(move_.from, &move_.anim, velocity);

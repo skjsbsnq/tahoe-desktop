@@ -1626,8 +1626,8 @@ impl Op {
                     Point::from((dx, dy)),
                     output,
                     Point::from((px, py)),
-        std::time::Duration::ZERO,
-    );
+                    std::time::Duration::ZERO,
+                );
             }
             Op::InteractiveMoveEnd { window } => {
                 layout.interactive_move_end(&window);
@@ -4634,6 +4634,86 @@ fn workspace_render_geo_at_fractional_scale() {
         "active workspace must be at y = 0 exactly, \
          otherwise a pointer against the screen edge at y = 0 won't hit it"
     );
+}
+
+/// T-16/A-9: overview geometry must quantize to physical pixels with a *consistent* rounding.
+///
+/// Workspace locations, the gap and the insert hint all `round` to the physical grid, but the
+/// workspace size used to `ceil`. Ceiling is a biased quantizer: it only ever grows the box, by up
+/// to a full physical pixel, so the workspace rectangle drifted wider/taller than the grid its
+/// own contents were snapped to. As the zoom animates, that error walks between 0 and 1 px and the
+/// edge seam flickers. With a shared `round` the error is bounded to a half pixel either way.
+///
+/// The steady-state zoom (0.5) happens to land exactly on the grid, so this has to sample
+/// *mid-animation* zooms to see the difference at all.
+#[test]
+fn overview_render_geo_rounds_size_like_position() {
+    // `view_size` is `mode / scale`, so `view_size * scale` is scale-independent and the size
+    // assertion below is identical at every scale. The scale loop is here for the *location*
+    // assertion, which does vary. msec_delta must be nonzero: at zoom 1 the size is exact and
+    // both roundings agree, so a zero sample asserts nothing.
+    for scale in [1., 1.25, 1.5, 1.75, 2.] {
+        for msec_delta in [30, 60, 90, 120, 200] {
+            let ops = [
+                Op::AddScaledOutput {
+                    id: 1,
+                    scale,
+                    layout_config: None,
+                },
+                Op::AddWindow {
+                    params: TestWindowParams::new(1),
+                },
+                Op::AddWindow {
+                    params: TestWindowParams::new(2),
+                },
+                Op::CompleteAnimations,
+                Op::ToggleOverview,
+                Op::AdvanceAnimations { msec_delta },
+            ];
+
+            let layout = check_ops(ops);
+
+            let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+                unreachable!()
+            };
+
+            let mon = &monitors[0];
+            let zoom = mon.overview_zoom();
+            let view_size = mon.view_size();
+
+            for (idx, geo) in mon.workspaces_render_geo().enumerate() {
+                // Everything lands on the physical grid.
+                for (name, logical) in [
+                    ("loc.x", geo.loc.x),
+                    ("loc.y", geo.loc.y),
+                    ("size.w", geo.size.w),
+                    ("size.h", geo.size.h),
+                ] {
+                    let physical = logical * scale;
+                    assert!(
+                        (physical - physical.round()).abs() < 1e-6,
+                        "scale {scale}, +{msec_delta}ms, workspace {idx}: {name} = {logical} \
+                         logical is {physical} physical, not on the pixel grid"
+                    );
+                }
+
+                // And the size is the *nearest* grid point to the true zoomed size, not the one
+                // above it. This is what `ceil` violated.
+                for (name, quantized, exact) in [
+                    ("size.w", geo.size.w, view_size.w * zoom),
+                    ("size.h", geo.size.h, view_size.h * zoom),
+                ] {
+                    let err = (quantized - exact) * scale;
+                    assert!(
+                        err.abs() <= 0.5 + 1e-6,
+                        "scale {scale}, +{msec_delta}ms, workspace {idx}: {name} is {err:+} \
+                         physical px off the true zoomed size; rounding must not be biased \
+                         (ceil gave up to +1)"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn parent_id_causes_loop(layout: &Layout<TestWindow>, id: usize, mut parent_id: usize) -> bool {

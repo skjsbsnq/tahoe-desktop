@@ -607,6 +607,7 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_tile_to_column(
         &mut self,
         workspace_idx: usize,
@@ -616,10 +617,11 @@ impl<W: LayoutElement> Monitor<W> {
         activate: bool,
         // FIXME: Refactor ActivateWindow enum to make this better.
         allow_to_activate_workspace: bool,
+        suppress_move_anim_for: Option<&W::Id>,
     ) {
         let workspace = &mut self.workspaces[workspace_idx];
 
-        workspace.add_tile_to_column(column_idx, tile_idx, tile, activate);
+        workspace.add_tile_to_column(column_idx, tile_idx, tile, activate, suppress_move_anim_for);
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
@@ -1167,8 +1169,13 @@ impl<W: LayoutElement> Monitor<W> {
                     let hint_size = Size::from((hint_width, hint_height));
 
                     // Sometimes the hint ends up 1 px wider than necessary and/or 1 px
-                    // narrower than necessary. The values here seem correct. Might have to do with
-                    // how zooming out currently doesn't round to output scale properly.
+                    // narrower than necessary. The values here seem correct.
+                    //
+                    // A-9 note: this is *not* the workspace_size rounding, which now rounds like
+                    // everything else. The residual comes from the render-time
+                    // `RescaleRenderElement(zoom)`, which is not snapped to the physical grid.
+                    // A-9 does shift hint_width/hint_x by up to 1 physical px, so if the values
+                    // above were tuned empirically they are worth re-checking.
 
                     // Compute view rect as if we're above the next workspace (rather than below
                     // the previous one).
@@ -1359,10 +1366,18 @@ impl<W: LayoutElement> Monitor<W> {
         self.active_workspace_ref().active_window_visual_rectangle()
     }
 
+    /// Size of one workspace in the overview, quantized to physical pixels.
+    ///
+    /// A-9: this rounds rather than ceils, matching the gap and the locations derived from it.
+    /// Ceiling is a biased quantizer — it only ever grows the box, by up to a full physical pixel
+    /// — so the inter-workspace pitch (`size + gap`) and the horizontal centering carried a
+    /// systematic +0..1 px error that walked as the zoom animated. Rounding bounds it to ±0.5 px
+    /// either way. Note the workspace *contents* are not snapped by this: they go through an
+    /// unquantized `RescaleRenderElement(zoom)` at render time.
     fn workspace_size(&self, zoom: f64) -> Size<f64, Logical> {
         let ws_size = self.view_size.upscale(zoom);
         let scale = self.scale.fractional_scale();
-        ws_size.to_physical_precise_ceil(scale).to_logical(scale)
+        ws_size.to_physical_precise_round(scale).to_logical(scale)
     }
 
     fn workspace_gap(&self, zoom: f64) -> f64 {

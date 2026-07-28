@@ -15,7 +15,18 @@ use smithay::wayland::compositor::{Blocker, BlockerState};
 /// Default time limit, after which the transaction completes.
 ///
 /// Serves to avoid hanging when a client fails to respond to a configure promptly.
-const TIME_LIMIT: Duration = Duration::from_millis(300);
+///
+/// A-8: this also bounds the worst-case stall before a close animation starts playing, since the
+/// closing snapshot hangs motionless in `AnimationState::Waiting` until the transaction releases.
+/// 300 ms was well past the point where that reads as frozen rather than deliberate.
+///
+/// What the budget actually has to cover is not just a configure round-trip: `xdg_shell` holds the
+/// transaction until the client's dmabuf fence signals, so this is also a client GPU-time budget
+/// for the first frame after a resize (buffer reallocation, shader compile, large surfaces). If it
+/// fires early the transaction force-completes and siblings apply their new sizes while the slow
+/// window still presents its old buffer — a transient, self-correcting intra-column size desync.
+/// 150 ms trades a rarer instance of that against never stalling a close for a fifth of a second.
+const TIME_LIMIT: Duration = Duration::from_millis(150);
 
 /// Transaction between Wayland clients.
 ///
@@ -189,5 +200,43 @@ impl Inner {
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_is_short_enough_for_a_close_animation() {
+        // A-8. This is a change detector on the constant, not a behavioural test: the deadline
+        // timer body is `#[cfg(not(test))]`, so a transaction *firing* on its deadline cannot be
+        // exercised from here at all. What it guards is the budget either side.
+        //
+        // Upper bound: a closing window's snapshot hangs motionless until its transaction
+        // releases, so a regression back toward 300 ms is a visible stall, not a config tweak.
+        assert!(
+            TIME_LIMIT <= Duration::from_millis(150),
+            "TIME_LIMIT is the worst-case delay before a close animation plays; {TIME_LIMIT:?} \
+             exceeds the 150 ms budget"
+        );
+
+        // Lower bound: the transaction also waits on the client's dmabuf fence, so cutting this
+        // much further starts force-completing legitimately-slow first frames after a resize.
+        assert!(
+            TIME_LIMIT >= Duration::from_millis(100),
+            "TIME_LIMIT {TIME_LIMIT:?} leaves too little room for a slow client's first frame"
+        );
+
+        // And a fresh transaction's deadline really is derived from the constant.
+        let transaction = Transaction::new();
+        let Deadline::NotRegistered(deadline) = *transaction.deadline.borrow() else {
+            panic!("a fresh transaction must have an unregistered deadline");
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= TIME_LIMIT && remaining + Duration::from_millis(50) >= TIME_LIMIT,
+            "fresh transaction deadline is {remaining:?} away, expected ≈{TIME_LIMIT:?}"
+        );
     }
 }

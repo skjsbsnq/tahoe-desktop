@@ -1545,3 +1545,84 @@ fn resize_tracking_keeps_tiles_below_glued() {
         );
     }
 }
+
+/// T-16/A-7: consecutive swaps must stay continuous.
+///
+/// `swap_window_in_direction` used to `stop_move_animations()` on the tile arriving from the
+/// target column, as a workaround for the push `add_tile_to_column` applied when inserting above
+/// the tile it was about to remove. That workaround also killed the tile's *legitimate* in-flight
+/// animation, so a second swap issued mid-flight teleported the tile to the previous swap's
+/// endpoint before starting the new one. With the insertion push suppressed for that one tile, no
+/// cancellation is needed and the second swap composes with the first.
+#[test]
+fn consecutive_swaps_stay_continuous() {
+    // Two columns of two tiles each, so swap takes the tile-swap path (not move_column_to).
+    let mut layout = check_ops_with_options(
+        make_options(),
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::FocusColumnLeft,
+            Op::ConsumeWindowIntoColumn,
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(4),
+            },
+            Op::FocusColumnLeft,
+            Op::ConsumeWindowIntoColumn,
+            Op::CompleteAnimations,
+        ],
+    );
+
+    let render_x = |layout: &Layout<TestWindow>, id: usize| -> f64 {
+        let ws = layout.active_workspace().unwrap();
+        ws.tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().0.id == id)
+            .map(|(_, pos, _)| pos.x)
+            .unwrap_or_else(|| panic!("window {id} not on the active workspace"))
+    };
+
+    // First swap: window 1 (active, in the left column) trades places with window 3 and starts
+    // animating rightwards across the column boundary. Via check_ops_on_layout so the layout
+    // invariants run right after the swap — the changed code is inside swap.
+    check_ops_on_layout(
+        &mut layout,
+        [Op::SwapWindowInDirection(ScrollDirection::Left)],
+    );
+    assert_eq!(
+        render_x(&layout, 1),
+        0.,
+        "the swap animates from the old position, so frame zero is still the old x"
+    );
+
+    // Let it run part of the way, then read where window 1 visually is.
+    Op::AdvanceAnimations { msec_delta: 300 }.apply(&mut layout);
+    let x_before = render_x(&layout, 1);
+    assert!(
+        x_before > 0. && x_before < 100.,
+        "window 1 must be mid-flight between the columns, got x = {x_before}"
+    );
+
+    // Second swap while the first is still in flight. Window 1 came *from* the target column of
+    // this swap, so it lands in the slot the old workaround cancelled animations on.
+    check_ops_on_layout(
+        &mut layout,
+        [Op::SwapWindowInDirection(ScrollDirection::Right)],
+    );
+    let x_after = render_x(&layout, 1);
+
+    // The tile must not jump at the instant of the second swap. Pre-fix, the
+    // stop_move_animations() dropped the in-flight offset and the tile snapped to the first
+    // swap's endpoint.
+    assert!(
+        (x_after - x_before).abs() < 1.,
+        "A-7: second swap must not teleport the tile: render x jumped {x_before} -> {x_after}"
+    );
+}

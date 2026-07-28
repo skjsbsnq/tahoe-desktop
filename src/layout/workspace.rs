@@ -699,10 +699,16 @@ impl<W: LayoutElement> Workspace<W> {
         tile_idx: Option<usize>,
         tile: Tile<W>,
         activate: bool,
+        suppress_move_anim_for: Option<&W::Id>,
     ) {
         self.enter_output_for_window(tile.window());
-        self.scrolling
-            .add_tile_to_column(col_idx, tile_idx, tile, activate);
+        self.scrolling.add_tile_to_column(
+            col_idx,
+            tile_idx,
+            tile,
+            activate,
+            suppress_move_anim_for,
+        );
 
         if activate {
             self.floating_is_active = FloatingActive::No;

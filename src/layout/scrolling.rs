@@ -1046,12 +1046,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.add_column(col_idx, column, activate, anim_config);
     }
 
+    /// Adds a tile into an existing column.
+    ///
+    /// `suppress_move_anim_for` names a tile (by window id) already in the target column whose
+    /// move animations must be left untouched by the insertion. Swap uses this: it inserts the
+    /// source tile above the target tile and removes the target tile immediately afterwards, so
+    /// the insertion push on that one tile is a transient that never renders — while the tile's
+    /// own animations are legitimate and must survive (A-7).
     pub fn add_tile_to_column(
         &mut self,
         col_idx: usize,
         tile_idx: Option<usize>,
         tile: Tile<W>,
         activate: bool,
+        suppress_move_anim_for: Option<&W::Id>,
     ) {
         let prev_next_x = self.column_x(col_idx + 1);
 
@@ -1059,7 +1067,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let tile_idx = tile_idx.unwrap_or(target_column.tiles.len());
         let mut prev_active_tile_idx = target_column.active_tile_idx;
 
-        target_column.add_tile_at(tile_idx, tile);
+        target_column.add_tile_at(tile_idx, tile, suppress_move_anim_for);
         self.data[col_idx].update(target_column);
 
         if tile_idx <= prev_active_tile_idx {
@@ -2246,7 +2254,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 Transaction::new(),
                 Some(self.options.animations.window_movement.0),
             );
-            self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active);
+            self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active, None);
 
             let target_column = &mut self.columns[target_column_idx];
             offset.x -= target_column.render_offset().x;
@@ -2341,7 +2349,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 Transaction::new(),
                 Some(self.options.animations.window_movement.0),
             );
-            self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active);
+            self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active, None);
 
             let target_column = &mut self.columns[target_column_idx];
             offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
@@ -2398,7 +2406,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let prev_off = self.columns[source_column_idx].tile_offset(0);
 
         let removed = self.remove_tile_by_idx(source_column_idx, 0, Transaction::new(), None);
-        self.add_tile_to_column(target_column_idx, None, removed.tile, false);
+        self.add_tile_to_column(target_column_idx, None, removed.tile, false, None);
 
         let target_column = &mut self.columns[target_column_idx];
         offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
@@ -2483,6 +2491,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let target_tile_idx = self.columns[target_column_idx].active_tile_idx;
         let source_column_drained = self.columns[source_column_idx].tiles.len() == 1;
 
+        // A-7: identity of the tile being swapped in from the target column. It briefly shares a
+        // column with the incoming source tile, and must not be pushed by that insertion.
+        let target_tile_id = self.columns[target_column_idx].tiles[target_tile_idx]
+            .window()
+            .id()
+            .clone();
+
         // capture the original positions of the tiles
         let (mut source_pt, mut target_pt) = (
             self.columns[source_column_idx].render_offset()
@@ -2514,11 +2529,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     target_column_idx
                 };
 
+            // A-7: the source tile is inserted directly above the target tile, which is removed
+            // on the very next statement. Exempt the target tile from the insertion push so its
+            // own in-flight animations (e.g. from a previous swap) survive into the new column.
             self.add_tile_to_column(
                 adjusted_target_column_idx,
                 Some(target_tile_idx),
                 source_removed.tile,
                 false,
+                Some(&target_tile_id),
             );
 
             let RemovedTile {
@@ -2546,6 +2565,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     Some(source_tile_idx),
                     target_tile,
                     false,
+                    None,
                 );
             }
         }
@@ -2559,12 +2579,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .animate_move_from(source_pt - target_pt, Point::from((0., 0.)));
         self.columns[target_column_idx].tiles[target_tile_idx].ensure_alpha_animates_to_1();
 
-        // FIXME: this stop_move_animations() causes the target tile animation to "reset" when
-        // swapping. It's here as a workaround to stop the unwanted animation of moving the source
-        // tile down when adding the target tile above it. This code needs to be written in some
-        // other way not to trigger that animation, or to cancel it properly, so that swap doesn't
-        // cancel all ongoing target tile animations.
-        self.columns[source_column_idx].tiles[source_tile_idx].stop_move_animations();
+        // A-7: after the exchange below, this slot holds the tile that came *from* the target
+        // column — the one whose animations the old `stop_move_animations()` cancelled. It keeps
+        // whatever animation it already had: `animate_move_from` composes with an in-flight move
+        // (folding the current render offset into `from` and handing off velocity), so
+        // consecutive swaps stay continuous instead of teleporting to the previous animation's
+        // endpoint. The cancellation existed only to undo the insertion push, which
+        // `add_tile_to_column` now never applies to this tile.
         self.columns[source_column_idx].tiles[source_tile_idx]
             .animate_move_from(target_pt - source_pt, Point::from((0., 0.)));
         self.columns[source_column_idx].tiles[source_tile_idx].ensure_alpha_animates_to_1();
@@ -4185,11 +4206,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // and immediately replacing it via animate_view_offset_to_column)
         // yields a single velocity-carrying animation — no mid-release velocity
         // drop on wide-window edge snaps / center-focused corrections (T-11).
-        let final_view_offset = self.compute_new_view_offset_for_column(
-            Some(target_snap.view_pos),
-            new_col_idx,
-            None,
-        );
+        let final_view_offset =
+            self.compute_new_view_offset_for_column(Some(target_snap.view_pos), new_col_idx, None);
 
         self.view_offset = ViewOffset::Animation(Animation::new(
             self.clock.clone(),
@@ -4724,7 +4742,7 @@ impl<W: LayoutElement> Column<W> {
 
         let pending_sizing_mode = tile.window().pending_sizing_mode();
 
-        rv.add_tile_at(0, tile);
+        rv.add_tile_at(0, tile, None);
 
         // Apply transport expanded intent first. Fullscreen and maximized are independent:
         // both may be true so unfullscreen restores maximized. `SizingMode` alone cannot
@@ -5078,7 +5096,12 @@ impl<W: LayoutElement> Column<W> {
         self.activate_idx(idx);
     }
 
-    fn add_tile_at(&mut self, idx: usize, mut tile: Tile<W>) {
+    fn add_tile_at(
+        &mut self,
+        idx: usize,
+        mut tile: Tile<W>,
+        suppress_move_anim_for: Option<&W::Id>,
+    ) {
         tile.update_config(self.view_size, self.scale, self.options.clone());
 
         // Inserting a tile pushes down all tiles below it, but also in always-centering mode it
@@ -5100,6 +5123,13 @@ impl<W: LayoutElement> Column<W> {
         prev_offsets.insert(idx, Point::default());
         for (i, ((tile, offset), prev)) in zip(self.tiles_mut(), prev_offsets).enumerate() {
             if i == idx {
+                continue;
+            }
+
+            // A-7: this tile's push is a transient the caller will undo (swap removes it right
+            // after inserting above it). Animating it here would be visible only as the clobbering
+            // of the tile's own in-flight animations, so skip it entirely.
+            if suppress_move_anim_for == Some(tile.window().id()) {
                 continue;
             }
 
@@ -5140,9 +5170,7 @@ impl<W: LayoutElement> Column<W> {
             // to lagging neighbours. Offset-adjust in place instead: it preserves
             // `start_time` and re-derives `from` for visual continuity (the same
             // `(visual − target)/(1 − p)` tracking identity, applied to the move anim).
-            let tracked = tile
-                .resize_animation()
-                .is_some_and(|a| a.value() > 0.001);
+            let tracked = tile.resize_animation().is_some_and(|a| a.value() > 0.001);
             if tile.resize_animation().is_some() && !tracked {
                 // The resize anim was just (re)started from a fresh `start_time`
                 // (this commit or the first commit). Companion restarts with the

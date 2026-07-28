@@ -4845,6 +4845,7 @@ impl<W: LayoutElement> Layout<W> {
                                 move_.tile,
                                 true,
                                 allow_to_activate_workspace,
+                                None,
                             );
                         }
                         InsertPosition::Floating => {
