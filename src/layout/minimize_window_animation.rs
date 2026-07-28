@@ -319,6 +319,18 @@ impl MinimizeWindowAnimation {
         }
     }
 
+    /// Derivative of [`Self::morph_progress`] in morph-units per wall-clock second.
+    ///
+    /// Minimize maps morph = progress ⇒ same sign as `anim.velocity()`.
+    /// Restore maps morph = 1 − progress ⇒ negated.
+    fn morph_velocity(&self) -> f64 {
+        let v = self.anim.velocity();
+        match self.direction {
+            GenieDirection::Minimize => v,
+            GenieDirection::Restore => -v,
+        }
+    }
+
     /// Exposes the production animation's normalized morph value to the in-tree regression
     /// harness. This is compiled out of normal builds and creates no second animation clock.
     #[cfg(test)]
@@ -326,8 +338,25 @@ impl MinimizeWindowAnimation {
         self.morph_progress()
     }
 
+    /// Test/observation: morph-space velocity (see [`Self::morph_velocity`]).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn test_morph_velocity(&self) -> f64 {
+        self.morph_velocity()
+    }
+
     fn restart_progress(&mut self, from: f64, to: f64, config: niri_config::Animation) {
-        let mut anim = self.anim.restarted(from.clamp(0., 1.), to, 0.);
+        // reverse_to_{restore,minimize} always flip `direction` after this call.
+        // Preserve morph-space velocity across that flip (F-05 / T-12):
+        //   about to become Restore  (morph = 1−p) ⇒ progress_vel = −morph_vel
+        //   about to become Minimize (morph = p)   ⇒ progress_vel =  morph_vel
+        // Both equal −anim.velocity() given the current mapping.
+        let morph_vel = self.morph_velocity();
+        let velocity = match self.direction {
+            GenieDirection::Minimize => -morph_vel, // → Restore
+            GenieDirection::Restore => morph_vel,   // → Minimize
+        };
+        let mut anim = self.anim.restarted(from.clamp(0., 1.), to, velocity);
         anim.replace_config(config);
         self.anim = anim;
     }
@@ -578,9 +607,12 @@ fn genie_area(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use smithay::utils::Size;
 
     use super::*;
+    use crate::animation::{Animation, Clock, Spring, SpringParams};
     use crate::layout::coords::{GenieEndpointResolve, OutputLocalRect, WorkspaceContentPoint};
 
     #[test]
@@ -710,5 +742,131 @@ mod tests {
             }
             _ => panic!("expected matrix after set"),
         }
+    }
+
+    /// T-12 / F-05: reversing genie direction must keep d(morph)/dt continuous.
+    ///
+    /// Mirrors `restart_progress` + direction flip without needing a GL texture:
+    /// Minimize morph = p, Restore morph = 1−p; flip ⇒ progress velocity negates.
+    #[test]
+    fn genie_reverse_keeps_morph_velocity_continuous() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let spring = |clock: Clock, from: f64, to: f64, v0: f64| {
+            Animation::spring(
+                clock,
+                Spring {
+                    from,
+                    to,
+                    initial_velocity: v0,
+                    params: SpringParams::new(0.9, 700., 0.0005),
+                },
+            )
+        };
+
+        // --- Minimize mid-flight → reverse to Restore ---
+        let anim = spring(clock.clone(), 0., 1., 0.);
+        clock.set_unadjusted(Duration::from_millis(70));
+        let p = anim.clamped_value().clamp(0., 1.);
+        let v_progress = anim.velocity();
+        assert!(v_progress > 0.1, "minimize spring should be advancing");
+        let morph_vel_before = v_progress; // Minimize: morph = p
+
+        // restart_progress(1-morph, 1, -velocity) then direction = Restore
+        let velocity = -v_progress;
+        let restored = anim.restarted((1. - p).clamp(0., 1.), 1., velocity);
+        // Restore: morph = 1 - progress ⇒ d(morph)/dt = -progress_vel
+        let morph_vel_after = -restored.velocity_at(restored.start_time());
+        let rel = (morph_vel_after - morph_vel_before).abs() / morph_vel_before.abs().max(1.);
+        assert!(
+            rel < 0.01,
+            "minimize→restore morph vel kink: before={morph_vel_before} after={morph_vel_after}"
+        );
+
+        // Morph position continuous: 1 - from = p
+        assert!(((1. - restored.from()) - p).abs() < 1e-9);
+
+        // --- Restore mid-flight → reverse to Minimize ---
+        // Continue from the restored anim a bit, then flip back.
+        let mut clock2 = Clock::with_time(Duration::ZERO);
+        // Build a Restore-oriented anim: progress 0→1 means morph 1→0 (flying out of dock).
+        // Start mid restore with nonzero velocity toward progress=1 (morph decreasing).
+        let restore_anim = spring(clock2.clone(), 0., 1., 0.);
+        clock2.set_unadjusted(Duration::from_millis(60));
+        let p_r = restore_anim.clamped_value().clamp(0., 1.);
+        let v_r = restore_anim.velocity();
+        assert!(v_r > 0.1);
+        // Under Restore, morph = 1-p, morph_vel = -v_r
+        let morph = 1. - p_r;
+        let morph_vel_before = -v_r;
+
+        // reverse_to_minimize: restart_progress(morph, 1, -v_r), direction=Minimize
+        let minimized = restore_anim.restarted(morph.clamp(0., 1.), 1., -v_r);
+        // Minimize: morph = progress ⇒ morph_vel = progress_vel
+        let morph_vel_after = minimized.velocity_at(minimized.start_time());
+        let rel = (morph_vel_after - morph_vel_before).abs() / morph_vel_before.abs().max(1.);
+        assert!(
+            rel < 0.01,
+            "restore→minimize morph vel kink: before={morph_vel_before} after={morph_vel_after}"
+        );
+        assert!((minimized.from() - morph).abs() < 1e-9);
+    }
+
+    /// Zero-velocity baseline still works (idle reverse at rest).
+    #[test]
+    fn genie_reverse_at_rest_keeps_zero_velocity() {
+        let clock = Clock::with_time(Duration::ZERO);
+        let anim = Animation::spring(
+            clock,
+            Spring {
+                from: 0.,
+                to: 1.,
+                initial_velocity: 0.,
+                params: SpringParams::new(1.0, 800., 0.0001),
+            },
+        );
+        // At t=0, velocity is 0 for zero initial.
+        assert!(anim.velocity_at(anim.start_time()).abs() < 1e-9);
+        let restarted = anim.restarted(0., 1., -anim.velocity());
+        assert!(restarted.velocity_at(restarted.start_time()).abs() < 1e-9);
+    }
+
+    /// Production order: `restarted` then `replace_config` (minimize→restore springs
+    /// may differ). Velocity handoff must survive the config retarget.
+    #[test]
+    fn genie_reverse_replace_config_preserves_spring_handoff() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let minimize = niri_config::Animation {
+            off: false,
+            kind: niri_config::animations::Kind::Spring(niri_config::animations::SpringParams {
+                damping_ratio: 0.85,
+                stiffness: 600,
+                epsilon: 0.0001,
+            }),
+        };
+        let restore = niri_config::Animation {
+            off: false,
+            kind: niri_config::animations::Kind::Spring(niri_config::animations::SpringParams {
+                damping_ratio: 0.9,
+                stiffness: 500,
+                epsilon: 0.0001,
+            }),
+        };
+
+        let anim = Animation::new(clock.clone(), 0., 1., 0., minimize);
+        clock.set_unadjusted(Duration::from_millis(80));
+        let p = anim.clamped_value().clamp(0., 1.);
+        let morph_vel_before = anim.velocity(); // Minimize
+        assert!(morph_vel_before.abs() > 0.1);
+
+        // Same sequence as restart_progress + reverse_to_restore.
+        let mut restarted = anim.restarted((1. - p).clamp(0., 1.), 1., -morph_vel_before);
+        restarted.replace_config(restore);
+
+        let morph_vel_after = -restarted.velocity_at(restarted.start_time());
+        let rel = (morph_vel_after - morph_vel_before).abs() / morph_vel_before.abs().max(1.);
+        assert!(
+            rel < 0.01,
+            "replace_config dropped handoff: before={morph_vel_before} after={morph_vel_after}"
+        );
     }
 }
