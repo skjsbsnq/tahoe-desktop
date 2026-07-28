@@ -1659,7 +1659,7 @@ impl<W: LayoutElement> Workspace<W> {
             .find(|(tile, _)| *tile.window().id() == id)
             .unwrap();
 
-        tile.animate_move_from(render_pos - new_render_pos);
+        tile.animate_move_from(render_pos - new_render_pos, Point::from((0., 0.)));
     }
 
     pub fn set_window_floating(&mut self, id: Option<&W::Id>, floating: bool) {

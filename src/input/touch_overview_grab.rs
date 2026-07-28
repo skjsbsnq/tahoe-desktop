@@ -232,6 +232,7 @@ impl TouchGrab<State> for TouchOverviewGrab {
                         delta,
                         output,
                         pos_within_output,
+                        timestamp,
                     )
                 } else {
                     false

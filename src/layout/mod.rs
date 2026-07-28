@@ -485,6 +485,9 @@ struct InteractiveMoveData<W: LayoutElement> {
     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
     /// Current snap target and preview fade state.
     pub(self) snap_preview: SnapPreviewState,
+    /// Pointer velocity trackers (output-logical px) for fling on release (T-13).
+    pub(self) pointer_tracker_x: SwipeTracker,
+    pub(self) pointer_tracker_y: SwipeTracker,
 }
 
 #[derive(Debug)]
@@ -4343,6 +4346,7 @@ impl<W: LayoutElement> Layout<W> {
         delta: Point<f64, Logical>,
         output: Output,
         pointer_pos_within_output: Point<f64, Logical>,
+        timestamp: Duration,
     ) -> bool {
         let Some(state) = self.interactive_move.take() else {
             return false;
@@ -4364,6 +4368,9 @@ impl<W: LayoutElement> Layout<W> {
                 }
 
                 let zoom = self.overview_zoom();
+                // Keep the output-logical delta for pointer velocity tracking;
+                // rubberband math uses the workspace-scaled copy.
+                let output_delta = delta;
                 let delta = delta.downscale(zoom);
 
                 pointer_delta += delta;
@@ -4506,12 +4513,21 @@ impl<W: LayoutElement> Layout<W> {
                     output_config,
                     workspace_config,
                     snap_preview,
+                    pointer_tracker_x: SwipeTracker::new(),
+                    pointer_tracker_y: SwipeTracker::new(),
                 };
+
+                // Seed velocity with the output-logical delta that triggered
+                // detach so a single-frame fling still carries momentum.
+                data.pointer_tracker_x.push(output_delta.x, timestamp);
+                data.pointer_tracker_y.push(output_delta.y, timestamp);
 
                 if let Some((tile_pos, zoom)) = tile_pos {
                     let new_tile_pos = data.tile_render_location(zoom);
-                    data.tile
-                        .animate_move_from((tile_pos - new_tile_pos).downscale(zoom));
+                    data.tile.animate_move_from(
+                        (tile_pos - new_tile_pos).downscale(zoom),
+                        Point::from((0., 0.)),
+                    );
                 }
 
                 self.interactive_move = Some(InteractiveMoveState::Moving(data));
@@ -4566,6 +4582,10 @@ impl<W: LayoutElement> Layout<W> {
                     move_.tile.update_config(view_size, scale, Rc::new(options));
                 }
 
+                // Track pointer deltas in output-logical space for release fling.
+                move_.pointer_tracker_x.push(delta.x, timestamp);
+                move_.pointer_tracker_y.push(delta.y, timestamp);
+
                 move_.pointer_pos_within_output = pointer_pos_within_output;
                 move_.snap_preview.set_target(
                     self.snap_target_for_output(&output, pointer_pos_within_output),
@@ -4607,7 +4627,7 @@ impl<W: LayoutElement> Layout<W> {
                     {
                         let offset = tile.interactive_move_offset;
                         tile.interactive_move_offset = Point::from((0., 0.));
-                        tile.animate_move_from(offset);
+                        tile.animate_move_from(offset, Point::from((0., 0.)));
                     }
 
                     // Unlock the view on the workspaces, but if the moved window was active,
@@ -4718,6 +4738,17 @@ impl<W: LayoutElement> Layout<W> {
                 let win_id = move_.tile.window().id().clone();
                 let tile_render_loc = move_.tile_render_location(zoom);
                 let snap_target = move_.snap_preview.target;
+
+                // Idle-compensate then sample pointer velocity for settle fling.
+                // `from` / velocity are both workspace-logical (÷ zoom).
+                let now = self.clock.now_unadjusted();
+                move_.pointer_tracker_x.push(0., now);
+                move_.pointer_tracker_y.push(0., now);
+                let pointer_velocity = Point::from((
+                    move_.pointer_tracker_x.velocity(),
+                    move_.pointer_tracker_y.velocity(),
+                ))
+                .downscale(zoom);
 
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon
@@ -4895,7 +4926,10 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
                 let new_tile_render_loc = ws_geo.loc + tile_offset.upscale(zoom);
 
-                tile.animate_move_from((tile_render_loc - new_tile_render_loc).downscale(zoom));
+                tile.animate_move_from(
+                    (tile_render_loc - new_tile_render_loc).downscale(zoom),
+                    pointer_velocity,
+                );
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 if workspaces.is_empty() {

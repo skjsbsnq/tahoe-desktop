@@ -1519,7 +1519,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let origin_delta = prev_origin - new_origin;
         if origin_delta != Point::new(0., 0.) {
             for (tile, _pos) in column.tiles_mut() {
-                tile.animate_move_from(origin_delta);
+                tile.animate_move_from(origin_delta, Point::from((0., 0.)));
             }
         }
 
@@ -2243,7 +2243,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
 
             let new_tile = target_column.tiles.last_mut().unwrap();
-            new_tile.animate_move_from(offset);
+            new_tile.animate_move_from(offset, Point::from((0., 0.)));
         } else {
             // Move out of column.
             let mut offset = Point::from((source_column.render_offset().x, 0.));
@@ -2274,7 +2274,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
             let new_col = &mut self.columns[target_column_idx];
             offset += prev_off - new_col.tile_offset(0);
-            new_col.tiles[0].animate_move_from(offset);
+            new_col.tiles[0].animate_move_from(offset, Point::from((0., 0.)));
         }
     }
 
@@ -2337,7 +2337,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
 
             let new_tile = target_column.tiles.last_mut().unwrap();
-            new_tile.animate_move_from(offset);
+            new_tile.animate_move_from(offset, Point::from((0., 0.)));
         } else {
             // Move out of column.
             let prev_width = self.data[source_col_idx].width;
@@ -2365,7 +2365,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
             let new_col = &mut self.columns[target_column_idx];
             offset += prev_off - new_col.tile_offset(0);
-            new_col.tiles[0].animate_move_from(offset);
+            new_col.tiles[0].animate_move_from(offset, Point::from((0., 0.)));
         }
     }
 
@@ -2395,7 +2395,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         offset.x -= target_column.render_offset().x;
 
         let new_tile = target_column.tiles.last_mut().unwrap();
-        new_tile.animate_move_from(offset);
+        new_tile.animate_move_from(offset, Point::from((0., 0.)));
     }
 
     pub fn expel_from_column(&mut self) {
@@ -2432,7 +2432,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let new_col = &mut self.columns[target_col_idx];
         offset += prev_off - new_col.tile_offset(0);
-        new_col.tiles[0].animate_move_from(offset);
+        new_col.tiles[0].animate_move_from(offset, Point::from((0., 0.)));
     }
 
     pub fn swap_window_in_direction(&mut self, direction: ScrollDirection) {
@@ -2546,7 +2546,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // Animations
         self.columns[target_column_idx].tiles[target_tile_idx]
-            .animate_move_from(source_pt - target_pt);
+            .animate_move_from(source_pt - target_pt, Point::from((0., 0.)));
         self.columns[target_column_idx].tiles[target_tile_idx].ensure_alpha_animates_to_1();
 
         // FIXME: this stop_move_animations() causes the target tile animation to "reset" when
@@ -2556,7 +2556,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // cancel all ongoing target tile animations.
         self.columns[source_column_idx].tiles[source_tile_idx].stop_move_animations();
         self.columns[source_column_idx].tiles[source_tile_idx]
-            .animate_move_from(target_pt - source_pt);
+            .animate_move_from(target_pt - source_pt, Point::from((0., 0.)));
         self.columns[source_column_idx].tiles[source_tile_idx].ensure_alpha_animates_to_1();
 
         self.activate_column(target_column_idx);
@@ -5086,7 +5086,7 @@ impl<W: LayoutElement> Column<W> {
                 continue;
             }
 
-            tile.animate_move_from(prev - offset);
+            tile.animate_move_from(prev - offset, Point::from((0., 0.)));
         }
     }
 
@@ -5121,6 +5121,7 @@ impl<W: LayoutElement> Column<W> {
                 for tile in &mut self.tiles[tile_idx + 1..] {
                     tile.animate_move_y_from_with_config(
                         offset,
+                        0.,
                         self.options.animations.window_resize.anim,
                     );
                 }
@@ -5904,7 +5905,7 @@ impl<W: LayoutElement> Column<W> {
 
             let mut delta = origin_delta;
             delta.y += y_delta;
-            tile.animate_move_from(delta);
+            tile.animate_move_from(delta, Point::from((0., 0.)));
         }
 
         // Animate the opacity.

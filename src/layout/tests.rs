@@ -1626,7 +1626,8 @@ impl Op {
                     Point::from((dx, dy)),
                     output,
                     Point::from((px, py)),
-                );
+        std::time::Duration::ZERO,
+    );
             }
             Op::InteractiveMoveEnd { window } => {
                 layout.interactive_move_end(&window);
@@ -1854,6 +1855,7 @@ fn minimize_finishes_interactive_move() {
         Point::from((128., 0.)),
         output,
         Point::from((128., 0.)),
+        std::time::Duration::ZERO,
     ));
 
     assert!(layout.minimize_window(&2));
@@ -1889,6 +1891,7 @@ fn restore_rejects_while_interactively_moving() {
         Point::from((64., 0.)),
         output,
         Point::from((64., 0.)),
+        std::time::Duration::ZERO,
     ));
 
     // Window 2 is minimized and not moving: restore still works.
@@ -1911,6 +1914,7 @@ fn restore_rejects_while_interactively_moving() {
         Point::from((32., 0.)),
         output.clone(),
         Point::from((32., 0.)),
+        std::time::Duration::ZERO,
     ));
     // apply_lifecycle restore while Moving(same id) must NoOp even if already not minimized.
     assert!(!layout.apply_lifecycle(&1, false, None));

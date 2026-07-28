@@ -246,6 +246,7 @@ fn interactive_move_unfullscreen_to_scrolling_restores_size() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        std::time::Duration::ZERO,
     );
     f.double_roundtrip(id);
 
@@ -286,6 +287,7 @@ fn interactive_move_unmaximize_to_scrolling_restores_size() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        std::time::Duration::ZERO,
     );
     f.double_roundtrip(id);
 

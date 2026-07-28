@@ -1586,7 +1586,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let diff = prev_pos - new_pos;
         if diff.x * diff.x + diff.y * diff.y > ANIMATION_THRESHOLD_SQ {
-            tile.animate_move_from(prev_pos - new_pos);
+            tile.animate_move_from(prev_pos - new_pos, Point::from((0., 0.)));
         }
     }
 

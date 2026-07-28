@@ -183,11 +183,17 @@ struct MoveAnimation {
 /// `render_offset = from * anim.value()`, so
 /// `v_abs = from * anim.velocity()` and the retargeted anim needs
 /// `v_norm = v_abs / new_from` for C1 continuity of the visual offset.
-fn normalized_move_velocity(old_from: f64, anim: &Animation, new_from: f64) -> f64 {
+/// When `new_from ≈ 0` the offset is already settled; skip the kick.
+fn absolute_to_normalized_move_velocity(v_abs: f64, new_from: f64) -> f64 {
     if new_from.abs() <= f64::EPSILON {
         return 0.;
     }
-    (old_from * anim.velocity()) / new_from
+    v_abs / new_from
+}
+
+/// Ongoing move-anim absolute velocity plus an optional external (gesture) kick.
+fn combined_move_velocity(old_from: f64, anim: &Animation, external_v_abs: f64) -> f64 {
+    old_from * anim.velocity() + external_v_abs
 }
 
 #[derive(Debug)]
@@ -663,28 +669,52 @@ impl<W: LayoutElement> Tile<W> {
         self.resize_animation.as_ref().map(|resize| &resize.anim)
     }
 
-    pub fn animate_move_from(&mut self, from: Point<f64, Logical>) {
-        self.animate_move_x_from(from.x);
-        self.animate_move_y_from(from.y);
+    /// Animate the tile from a visual offset toward its layout position.
+    ///
+    /// `velocity` is the absolute render-offset rate (`d(offset)/dt` in logical
+    /// px/s) at the start of the animation — e.g. pointer velocity on interactive
+    /// move release. Pass `(0, 0)` when there is no external kick; an ongoing
+    /// move animation's velocity is still handed off for C1 continuity (T-10).
+    pub fn animate_move_from(&mut self, from: Point<f64, Logical>, velocity: Point<f64, Logical>) {
+        self.animate_move_x_from_with_config(
+            from.x,
+            velocity.x,
+            self.options.animations.window_movement.0,
+        );
+        self.animate_move_y_from_with_config(
+            from.y,
+            velocity.y,
+            self.options.animations.window_movement.0,
+        );
     }
 
     pub fn animate_move_x_from(&mut self, from: f64) {
-        self.animate_move_x_from_with_config(from, self.options.animations.window_movement.0);
+        self.animate_move_x_from_with_config(from, 0., self.options.animations.window_movement.0);
     }
 
-    pub fn animate_move_x_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
+    pub fn animate_move_x_from_with_config(
+        &mut self,
+        from: f64,
+        velocity: f64,
+        config: niri_config::Animation,
+    ) {
         let current_offset = self.render_offset().x;
         let new_from = from + current_offset;
 
         // Preserve the previous config if ongoing. Move anim is normalized 1→0
         // with render_offset = from * value; convert absolute velocity to the
-        // new unit scale so C1 holds across chained moves.
+        // new unit scale so C1 holds across chained moves. `velocity` is an
+        // extra absolute kick (interactive-move fling); from≈0 skips it.
         let anim = match self.move_x_animation.take() {
             Some(move_) => {
-                let v_norm = normalized_move_velocity(move_.from, &move_.anim, new_from);
+                let v_abs = combined_move_velocity(move_.from, &move_.anim, velocity);
+                let v_norm = absolute_to_normalized_move_velocity(v_abs, new_from);
                 move_.anim.restarted(1., 0., v_norm)
             }
-            None => Animation::new(self.clock.clone(), 1., 0., 0., config),
+            None => {
+                let v_norm = absolute_to_normalized_move_velocity(velocity, new_from);
+                Animation::new(self.clock.clone(), 1., 0., v_norm, config)
+            }
         };
 
         self.move_x_animation = Some(MoveAnimation {
@@ -694,26 +724,53 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn animate_move_y_from(&mut self, from: f64) {
-        self.animate_move_y_from_with_config(from, self.options.animations.window_movement.0);
+        self.animate_move_y_from_with_config(from, 0., self.options.animations.window_movement.0);
     }
 
-    pub fn animate_move_y_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
+    pub fn animate_move_y_from_with_config(
+        &mut self,
+        from: f64,
+        velocity: f64,
+        config: niri_config::Animation,
+    ) {
         let current_offset = self.render_offset().y;
         let new_from = from + current_offset;
 
         // Same normalized velocity handoff as animate_move_x_from_with_config.
         let anim = match self.move_y_animation.take() {
             Some(move_) => {
-                let v_norm = normalized_move_velocity(move_.from, &move_.anim, new_from);
+                let v_abs = combined_move_velocity(move_.from, &move_.anim, velocity);
+                let v_norm = absolute_to_normalized_move_velocity(v_abs, new_from);
                 move_.anim.restarted(1., 0., v_norm)
             }
-            None => Animation::new(self.clock.clone(), 1., 0., 0., config),
+            None => {
+                let v_norm = absolute_to_normalized_move_velocity(velocity, new_from);
+                Animation::new(self.clock.clone(), 1., 0., v_norm, config)
+            }
         };
 
         self.move_y_animation = Some(MoveAnimation {
             anim,
             from: new_from,
         });
+    }
+
+    /// Absolute render-offset velocity from the active move animations (px/s).
+    ///
+    /// Used by interactive-move inertia tests (T-13).
+    #[cfg(test)]
+    pub(crate) fn move_animation_velocity(&self) -> Point<f64, Logical> {
+        let x = self
+            .move_x_animation
+            .as_ref()
+            .map(|m| m.from * m.anim.velocity())
+            .unwrap_or(0.);
+        let y = self
+            .move_y_animation
+            .as_ref()
+            .map(|m| m.from * m.anim.velocity())
+            .unwrap_or(0.);
+        Point::from((x, y))
     }
 
     pub fn offset_move_y_anim_current(&mut self, offset: f64) {

@@ -448,6 +448,7 @@ fn interactive_move_unfullscreen_to_floating_restores_size() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        std::time::Duration::ZERO,
     );
     f.double_roundtrip(id);
 
@@ -493,7 +494,13 @@ fn interactive_move_unmaximize_to_floating_restores_size() {
     niri.layout
         .interactive_move_begin(window.clone(), &output, Point::default());
     niri.layout
-        .interactive_move_update(&window, Point::from((1., 0.)), output, Point::default());
+        .interactive_move_update(
+            &window,
+            Point::from((1., 0.)),
+            output,
+            Point::default(),
+            std::time::Duration::ZERO,
+        );
     f.double_roundtrip(id);
 
     // This should request the stored floating size (200 × 200).
@@ -542,6 +549,7 @@ layout {
         Point::from((0., -1000.)),
         output,
         Point::from((500., 0.)),
+        std::time::Duration::ZERO,
     );
     niri.layout.interactive_move_end(&window_id);
     f.double_roundtrip(id);
@@ -579,6 +587,7 @@ fn resize_during_interactive_move_propagates_to_floating() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        std::time::Duration::ZERO,
     );
     f.double_roundtrip(id);
 
@@ -795,6 +804,7 @@ fn interactive_move_restores_floating_size_when_set_to_floating() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        std::time::Duration::ZERO,
     );
     f.double_roundtrip(id);
 

@@ -1194,3 +1194,104 @@ fn view_offset_gesture_end_preserves_swipe_velocity() {
         "view_pos velocity kink after settle start: v0={v0} fd={fd} rel={rel}"
     );
 }
+
+/// T-13: interactive-move release must hand pointer velocity into the settle
+/// `animate_move_from` so the first frame of `render_offset` keeps flinging.
+#[test]
+fn interactive_move_end_preserves_pointer_velocity() {
+    use std::time::Duration;
+
+    let mut options = Options::default();
+    options.layout.gaps = 0.0;
+    options.animations.window_movement.0.kind =
+        niri_config::animations::Kind::Spring(niri_config::animations::SpringParams {
+            damping_ratio: 1.0,
+            stiffness: 800,
+            epsilon: 0.0001,
+        });
+
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::CompleteAnimations,
+        ],
+    );
+
+    let output = layout.outputs().next().unwrap().clone();
+
+    // Detach past the rubberband threshold (256²), then fling rightward.
+    assert!(layout.interactive_move_begin(1, &output, Point::from((50., 50.))));
+
+    // Large step to enter Moving (non-floating threshold is 256²).
+    assert!(layout.interactive_move_update(
+        &1,
+        Point::from((300., 0.)),
+        output.clone(),
+        Point::from((350., 50.)),
+        Duration::from_millis(0),
+    ));
+
+    // Fast fling after detach. Current SwipeTracker averages Σdelta / (t_last−t_first),
+    // so seed+fling ⇒ (300+40+50+60)/0.030 = 15000 px/s (T-14 will de-bias the seed).
+    assert!(layout.interactive_move_update(
+        &1,
+        Point::from((40., 0.)),
+        output.clone(),
+        Point::from((390., 50.)),
+        Duration::from_millis(10),
+    ));
+    assert!(layout.interactive_move_update(
+        &1,
+        Point::from((50., 0.)),
+        output.clone(),
+        Point::from((440., 50.)),
+        Duration::from_millis(20),
+    ));
+    assert!(layout.interactive_move_update(
+        &1,
+        Point::from((60., 0.)),
+        output.clone(),
+        Point::from((500., 50.)),
+        Duration::from_millis(30),
+    ));
+
+    // Align clock with last event so idle compensation is accepted.
+    layout.clock.set_unadjusted(Duration::from_millis(30));
+    layout.interactive_move_end(&1);
+    layout.verify_invariants();
+
+    let ws = layout.active_workspace().unwrap();
+    let tile = ws
+        .tiles()
+        .find(|t| *t.window().id() == 1)
+        .expect("tile reinserted after move end");
+
+    let vel = tile.move_animation_velocity();
+    // Acceptance: first-frame render_offset velocity ≈ pointer/tracker velocity.
+    // Pre-T-13 always started settle at 0 (静止再缓动).
+    let expected_pointer_vx = (300. + 40. + 50. + 60.) / 0.030;
+    let rel_ptr = (vel.x - expected_pointer_vx).abs() / expected_pointer_vx;
+    assert!(
+        rel_ptr < 0.15,
+        "settle vel must ≈ pointer velocity: got {} want≈{expected_pointer_vx} rel={rel_ptr}",
+        vel.x
+    );
+
+    // First-millisecond FD of render_offset.x ≈ handed-off velocity (no kink).
+    let o0 = tile.render_offset();
+    Op::AdvanceAnimations { msec_delta: 1 }.apply(&mut layout);
+    let ws = layout.active_workspace().unwrap();
+    let tile = ws.tiles().find(|t| *t.window().id() == 1).unwrap();
+    let o1 = tile.render_offset();
+    let fd = (o1.x - o0.x) / 0.001;
+    let rel = (fd - vel.x).abs() / vel.x.abs().max(1.);
+    assert!(
+        rel < 0.15,
+        "render_offset velocity kink after move end: v0={} fd={fd} rel={rel}",
+        vel.x
+    );
+}

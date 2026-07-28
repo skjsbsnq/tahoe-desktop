@@ -233,6 +233,7 @@ impl MoveGrab {
                     delta,
                     output,
                     pos_within_output,
+                    timestamp,
                 );
                 if ongoing {
                     // FIXME: only redraw the previous and the new output.
@@ -281,6 +282,7 @@ impl MoveGrab {
                 self.last_location - self.start_data.location(),
                 output,
                 pos_within_output,
+                get_monotonic_time(),
             );
             if !ongoing {
                 return false;
