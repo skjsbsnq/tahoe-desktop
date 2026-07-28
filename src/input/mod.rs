@@ -125,6 +125,56 @@ pub struct TabletData {
     pub aspect_ratio: f64,
 }
 
+/// Select the fractional scale to use for the 1-physical-px tablet edge clamp
+/// (F-07 / T-08). Prefers the output whose geometry contains `pos`; otherwise
+/// the nearest output by center distance. Falls back to 1.0 if `outputs` empty.
+pub fn output_scale_at_global_pos(
+    pos: Point<f64, Logical>,
+    outputs: &[(Rectangle<f64, Logical>, f64)],
+) -> f64 {
+    if outputs.is_empty() {
+        return 1.;
+    }
+
+    for (geo, scale) in outputs {
+        // Inclusive left/top, exclusive right/bottom — same convention as
+        // output geometry clipping elsewhere in niri (i32 sizes are exclusive).
+        if pos.x >= geo.loc.x
+            && pos.y >= geo.loc.y
+            && pos.x < geo.loc.x + geo.size.w
+            && pos.y < geo.loc.y + geo.size.h
+        {
+            return *scale;
+        }
+    }
+
+    outputs
+        .iter()
+        .min_by(|(a, _), (b, _)| {
+            let ca: Point<f64, Logical> =
+                Point::from((a.loc.x + a.size.w * 0.5, a.loc.y + a.size.h * 0.5));
+            let cb: Point<f64, Logical> =
+                Point::from((b.loc.x + b.size.w * 0.5, b.loc.y + b.size.h * 0.5));
+            let da = (ca.x - pos.x).hypot(ca.y - pos.y);
+            let db = (cb.x - pos.x).hypot(cb.y - pos.y);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, scale)| *scale)
+        .unwrap_or(1.)
+}
+
+/// Prefer a live surface global origin over a cached one (F-08 / T-08).
+///
+/// Pointer-constraint math must use the surface's *current* global origin so
+/// that region checks stay correct when the surface moves during the constraint.
+#[inline]
+pub fn resolve_constraint_surface_origin(
+    cached: Point<f64, Logical>,
+    live: Option<Point<f64, Logical>>,
+) -> Point<f64, Logical> {
+    live.unwrap_or(cached)
+}
+
 pub enum PointerOrTouchStartData<D: SeatHandler> {
     Pointer(PointerGrabStartData<D>),
     Touch(TouchGrabStartData<D>),
@@ -366,32 +416,30 @@ impl State {
             None
         };
 
-        let (target_geo, keep_ratio, px, transform) = if let Some((rect, output)) = window_target {
-            (
-                rect,
-                true,
-                1. / output.current_scale().fractional_scale(),
-                output.current_transform(),
-            )
-        } else if let Some(output) = mapped_output {
-            let geo = self.niri.global_space.output_geometry(output).unwrap();
-            (
-                geo.to_f64(),
-                true,
-                1. / output.current_scale().fractional_scale(),
-                output.current_transform(),
-            )
-        } else {
-            let geo = self.global_bounding_rectangle()?.to_f64();
-
-            // FIXME: this 1 px size should ideally somehow be computed for the rightmost output
-            // corresponding to the position on the right when clamping.
-            let output = self.niri.global_space.outputs().next().unwrap();
-            let scale = output.current_scale().fractional_scale();
-
-            // Do not keep ratio for the unified mode as this is what OpenTabletDriver expects.
-            (geo, false, 1. / scale, Transform::Normal)
-        };
+        // `px_scale` is Some when the 1-physical-px clamp inset is known up front
+        // (mapped output / focused window). Unified multi-output mode defers scale
+        // selection until after the unclamped global position is known (F-07).
+        let (target_geo, keep_ratio, px_scale, transform) =
+            if let Some((rect, output)) = window_target {
+                (
+                    rect,
+                    true,
+                    Some(output.current_scale().fractional_scale()),
+                    output.current_transform(),
+                )
+            } else if let Some(output) = mapped_output {
+                let geo = self.niri.global_space.output_geometry(output).unwrap();
+                (
+                    geo.to_f64(),
+                    true,
+                    Some(output.current_scale().fractional_scale()),
+                    output.current_transform(),
+                )
+            } else {
+                let geo = self.global_bounding_rectangle()?.to_f64();
+                // Do not keep ratio for the unified mode as this is what OpenTabletDriver expects.
+                (geo, false, None, Transform::Normal)
+            };
 
         let mut pos = {
             let size = transform.invert().transform_size(target_geo.size);
@@ -421,6 +469,24 @@ impl State {
             pos.x *= target_geo.size.w;
             pos.y *= target_geo.size.h;
         }
+
+        let scale = px_scale.unwrap_or_else(|| {
+            // Unified mapping: pick the scale of the output under (or nearest to)
+            // the unclamped global position so mixed-DPI edges clamp correctly.
+            let global = Point::from((pos.x + target_geo.loc.x, pos.y + target_geo.loc.y));
+            let outputs: Vec<(Rectangle<f64, Logical>, f64)> = self
+                .niri
+                .global_space
+                .outputs()
+                .filter_map(|output| {
+                    let geo = self.niri.global_space.output_geometry(output)?.to_f64();
+                    let scale = output.current_scale().fractional_scale();
+                    Some((geo, scale))
+                })
+                .collect();
+            output_scale_at_global_pos(global, &outputs)
+        });
+        let px = 1. / scale;
 
         pos.x = pos.x.clamp(0.0, target_geo.size.w - px);
         pos.y = pos.y.clamp(0.0, target_geo.size.h - px);
@@ -2537,55 +2603,77 @@ impl State {
 
         // Check if we have an active pointer constraint.
         //
-        // FIXME: ideally this should use the pointer focus with up-to-date global location.
+        // Use a *live* surface global origin (not the possibly-stale cached
+        // pointer_contents.surface.1) so confinement/region checks stay correct
+        // when the surface moves during the constraint (F-08 / T-08).
+        //
+        // Gate the extra contents_under hit-test on an already-active constraint
+        // so the common unconstrained desktop path stays cheap.
         let mut pointer_confined = None;
-        if let Some(under) = &self.niri.pointer_contents.surface {
-            // No need to check if the pointer focus surface matches, because here we're checking
-            // for an already-active constraint, and the constraint is deactivated when the focused
-            // surface changes.
-            let pos_within_surface = pos - under.1;
-
-            let mut pointer_locked = false;
-            with_pointer_constraint(&under.0, &pointer, |constraint| {
-                let Some(constraint) = constraint else { return };
-                if !constraint.is_active() {
-                    return;
-                }
-
-                // Constraint does not apply if not within region.
-                if let Some(region) = constraint.region() {
-                    if !region.contains(pos_within_surface.to_i32_round()) {
-                        return;
-                    }
-                }
-
-                match &*constraint {
-                    PointerConstraint::Locked(_locked) => {
-                        pointer_locked = true;
-                    }
-                    PointerConstraint::Confined(confine) => {
-                        pointer_confined = Some((under.clone(), confine.region().cloned()));
-                    }
-                }
+        if let Some((ref surface, cached_origin)) = &self.niri.pointer_contents.surface {
+            let is_active = with_pointer_constraint(surface, &pointer, |constraint| {
+                constraint.is_some_and(|c| c.is_active())
             });
 
-            // If the pointer is locked, only send relative motion.
-            if pointer_locked {
-                pointer.relative_motion(
-                    self,
-                    Some(under.clone()),
-                    &RelativeMotionEvent {
-                        delta: event.delta(),
-                        delta_unaccel: event.delta_unaccel(),
-                        utime: event.time(),
-                    },
-                );
+            if is_active {
+                let origin = {
+                    let live = self
+                        .niri
+                        .contents_under(pos)
+                        .surface
+                        .as_ref()
+                        .filter(|(s, _)| s == surface)
+                        .map(|(_, loc)| *loc);
+                    resolve_constraint_surface_origin(*cached_origin, live)
+                };
+                // No need to check if the pointer focus surface matches, because here we're
+                // checking for an already-active constraint, and the constraint is deactivated
+                // when the focused surface changes.
+                let pos_within_surface = pos - origin;
+                let under = (surface.clone(), origin);
 
-                pointer.frame(self);
+                let mut pointer_locked = false;
+                with_pointer_constraint(&under.0, &pointer, |constraint| {
+                    let Some(constraint) = constraint else { return };
+                    if !constraint.is_active() {
+                        return;
+                    }
 
-                // I guess a redraw to hide the tablet cursor could be nice? Doesn't matter too
-                // much here I think.
-                return;
+                    // Constraint does not apply if not within region.
+                    if let Some(region) = constraint.region() {
+                        if !region.contains(pos_within_surface.to_i32_round()) {
+                            return;
+                        }
+                    }
+
+                    match &*constraint {
+                        PointerConstraint::Locked(_locked) => {
+                            pointer_locked = true;
+                        }
+                        PointerConstraint::Confined(confine) => {
+                            pointer_confined = Some((under.clone(), confine.region().cloned()));
+                        }
+                    }
+                });
+
+                // If the pointer is locked, only send relative motion.
+                if pointer_locked {
+                    pointer.relative_motion(
+                        self,
+                        Some(under),
+                        &RelativeMotionEvent {
+                            delta: event.delta(),
+                            delta_unaccel: event.delta_unaccel(),
+                            utime: event.time(),
+                        },
+                    );
+
+                    pointer.frame(self);
+
+                    // I guess a redraw to hide the tablet cursor could be nice? Doesn't matter too
+                    // much here I think.
+                    return;
+                }
             }
         }
 
@@ -2674,8 +2762,19 @@ impl State {
             }
 
             // Prevent the pointer from leaving the confine region, if any.
+            // focus_surface.1 is already the live origin resolved above (F-08).
+            // If contents_under(new_pos) still sees the same surface, prefer that
+            // even fresher origin (window may have moved this frame).
             if let Some(region) = region {
-                let new_pos_within_surface = new_pos - focus_surface.1;
+                let origin = {
+                    let live = under
+                        .surface
+                        .as_ref()
+                        .filter(|(s, _)| *s == focus_surface.0)
+                        .map(|(_, loc)| *loc);
+                    resolve_constraint_surface_origin(focus_surface.1, live)
+                };
+                let new_pos_within_surface = new_pos - origin;
                 if !region.contains(new_pos_within_surface.to_i32_round()) {
                     prevent = true;
                 }
@@ -5276,8 +5375,105 @@ fn make_binds_iter<'a>(
 mod tests {
     use std::cell::Cell;
 
+    use smithay::utils::Size;
+
     use super::*;
     use crate::animation::Clock;
+
+    // ── F-07 / T-08: mixed-scale tablet edge clamp ─────────────────────
+
+    #[test]
+    fn tablet_clamp_scale_uses_output_under_pos() {
+        // Dual-monitor: left @1x (0,0)-(1920,1080), right @2x (1920,0)-(3840,1080).
+        let left = (
+            Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.))),
+            1.0_f64,
+        );
+        let right = (
+            Rectangle::new(Point::from((1920., 0.)), Size::from((1920., 1080.))),
+            2.0_f64,
+        );
+        let outputs = [left, right];
+
+        // Point clearly on the left output → scale 1.
+        assert_eq!(
+            output_scale_at_global_pos(Point::from((100., 100.)), &outputs),
+            1.0
+        );
+        // Point clearly on the right output → scale 2 (not the first-enumerated 1x).
+        assert_eq!(
+            output_scale_at_global_pos(Point::from((2000., 100.)), &outputs),
+            2.0
+        );
+        // Right-edge unclamped position past the bounding box → nearest is right @2x.
+        assert_eq!(
+            output_scale_at_global_pos(Point::from((3840.5, 500.)), &outputs),
+            2.0
+        );
+        // Left-edge past origin → nearest is left @1x.
+        assert_eq!(
+            output_scale_at_global_pos(Point::from((-1., 500.)), &outputs),
+            1.0
+        );
+    }
+
+    #[test]
+    fn tablet_clamp_px_inset_matches_output_scale() {
+        // 1 physical pixel in logical units = 1/scale.
+        let outputs = [(
+            Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.))),
+            2.0_f64,
+        )];
+        let scale = output_scale_at_global_pos(Point::from((10., 10.)), &outputs);
+        let px = 1. / scale;
+        assert!((px - 0.5).abs() < 1e-12);
+
+        // Clamping the far edge of a unified geo must use that px, not 1.0 from a
+        // hypothetical first output at scale 1.
+        let geo_w = 3840.0_f64;
+        let clamped = geo_w - px;
+        assert!((clamped - 3839.5).abs() < 1e-12);
+        // Old bug would have used px=1.0 → 3839.0 on a 2x edge.
+        assert!((clamped - (geo_w - 1.0)).abs() > 0.4);
+    }
+
+    // ── F-08 / T-08: pointer constraint live surface origin ────────────
+
+    #[test]
+    fn constraint_origin_prefers_live_over_cached() {
+        let cached = Point::from((10.0_f64, 20.0));
+        let live = Point::from((50.0_f64, 60.0));
+        assert_eq!(
+            resolve_constraint_surface_origin(cached, Some(live)),
+            live
+        );
+        assert_eq!(resolve_constraint_surface_origin(cached, None), cached);
+    }
+
+    #[test]
+    fn constraint_region_check_with_moved_surface() {
+        // Surface-local confine region: [0, 100) × [0, 100).
+        let region = Rectangle::new(Point::from((0, 0)), Size::from((100, 100)));
+        let cached_origin = Point::from((0.0_f64, 0.0));
+        // Window moved +50px in x while the constraint stayed active.
+        let live_origin = Point::from((50.0_f64, 0.0));
+        // Pointer still at global (30, 10) — inside the *old* surface rect, outside
+        // the *moved* surface rect.
+        let pointer = Point::from((30.0_f64, 10.0));
+
+        let within_cached = pointer - cached_origin;
+        assert!(
+            region.contains(within_cached.to_i32_round()),
+            "stale origin falsely keeps the pointer inside the region"
+        );
+
+        let origin = resolve_constraint_surface_origin(cached_origin, Some(live_origin));
+        let within_live = pointer - origin;
+        assert!(
+            !region.contains(within_live.to_i32_round()),
+            "live origin correctly reports the pointer outside the moved surface region"
+        );
+    }
 
     /// F-06 / T-07: dual-key hold and alternating release must keep the
     /// last-pressed key's repeat alive.

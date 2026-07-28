@@ -6678,6 +6678,8 @@ impl Niri {
     /// Activates the pointer constraint if necessary according to the current pointer contents.
     ///
     /// Make sure the pointer location and contents are up to date before calling this.
+    /// (Callers refresh via `update_pointer_contents` / `refresh_pointer_contents`, so the
+    /// cached surface origin here is already live for activation purposes.)
     pub fn maybe_activate_pointer_constraint(&self) {
         let Some((surface, surface_loc)) = &self.pointer_contents.surface else {
             return;

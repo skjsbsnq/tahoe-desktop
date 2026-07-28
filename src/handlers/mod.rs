@@ -190,17 +190,28 @@ impl PointerConstraintsHandler for State {
         // will change, even though the real pointer focus remains on the Blender surface due to
         // the click grab.
         //
-        // Ideally we would just use the constraint surface, but we need its origin. So this is
-        // more of a hack because pointer contents has the surface origin available.
-        //
-        // FIXME: use the constraint surface somehow, don't use pointer contents.
-        let Some((ref surface_under_pointer, origin)) = self.niri.pointer_contents.surface else {
+        // Resolve a *live* origin for the constraint surface (F-08 / T-08) so a
+        // moved window does not apply the hint against a stale global origin.
+        let Some((ref surface_under_pointer, cached_origin)) = self.niri.pointer_contents.surface
+        else {
             return;
         };
 
         if surface_under_pointer != surface {
             return;
         }
+
+        let pointer_pos = pointer.current_location();
+        let origin = {
+            let live = self
+                .niri
+                .contents_under(pointer_pos)
+                .surface
+                .as_ref()
+                .filter(|(s, _)| s == surface)
+                .map(|(_, loc)| *loc);
+            crate::input::resolve_constraint_surface_origin(cached_origin, live)
+        };
 
         let mut root = surface.clone();
         while let Some(parent) = get_parent(&root) {
