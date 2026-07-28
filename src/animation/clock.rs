@@ -16,6 +16,11 @@ pub struct Clock {
 #[derive(Debug, Default)]
 struct LazyClock {
     time: Option<Duration>,
+    /// When true, [`LazyClock::now`] / gesture-idle sampling stay on the
+    /// explicitly set timeline (unit tests, scripted clocks). Production
+    /// clocks leave this false so gesture end can take a fresh monotonic
+    /// sample instead of a stale lazy latch (T-14 / A-5).
+    controlled: bool,
 }
 
 /// Clock that can adjust its rate.
@@ -45,6 +50,21 @@ impl Clock {
     /// Returns the underlying time not adjusted for rate change.
     pub fn now_unadjusted(&self) -> Duration {
         self.inner.borrow_mut().inner.now()
+    }
+
+    /// Instant for gesture idle compensation (`SwipeTracker::push(0, …)`).
+    ///
+    /// Production clocks sample [`get_monotonic_time`] directly so a lazy latch
+    /// from earlier in the event-loop iteration (or a presentation-time freeze)
+    /// cannot predate the last libinput timestamp and get silently dropped.
+    /// Controlled test clocks keep using the explicit timeline.
+    pub fn now_for_gesture_idle(&self) -> Duration {
+        let mut inner = self.inner.borrow_mut();
+        if inner.inner.controlled {
+            inner.inner.now()
+        } else {
+            get_monotonic_time()
+        }
     }
 
     /// Sets the unadjusted clock time.
@@ -88,10 +108,16 @@ impl Eq for Clock {}
 
 impl LazyClock {
     pub fn with_time(time: Duration) -> Self {
-        Self { time: Some(time) }
+        Self {
+            time: Some(time),
+            controlled: true,
+        }
     }
 
     pub fn clear(&mut self) {
+        // Controlled clocks keep their flag so a later `now()` after clear
+        // still re-latches via get_or_insert only when uncontrolled; for
+        // controlled clocks tests always `set` again before reading.
         self.time = None;
     }
 
@@ -198,5 +224,13 @@ mod tests {
         clock.set_unadjusted(Duration::from_millis(250));
         assert_eq!(clock.now_unadjusted(), Duration::from_millis(250));
         assert_eq!(clock.now(), Duration::from_millis(275));
+    }
+
+    #[test]
+    fn gesture_idle_now_respects_controlled_timeline() {
+        let mut clock = Clock::with_time(Duration::from_millis(40));
+        assert_eq!(clock.now_for_gesture_idle(), Duration::from_millis(40));
+        clock.set_unadjusted(Duration::from_millis(90));
+        assert_eq!(clock.now_for_gesture_idle(), Duration::from_millis(90));
     }
 }

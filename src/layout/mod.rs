@@ -4249,7 +4249,14 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         // Take into account any idle time between the last event and now.
-        let now = self.clock.now_unadjusted();
+        // Fresh monotonic sample (T-14): lazy clock latch can predate the last
+        // libinput timestamp and get silently dropped by SwipeTracker::push.
+        // Clamp to last event so a slightly-behind sample still lands as a
+        // no-op idle rather than being rejected.
+        let now = self
+            .clock
+            .now_for_gesture_idle()
+            .max(gesture.tracker.last_timestamp().unwrap_or_default());
         gesture.tracker.push(0., now);
 
         let total_height = OVERVIEW_GESTURE_MOVEMENT;
@@ -4741,7 +4748,15 @@ impl<W: LayoutElement> Layout<W> {
 
                 // Idle-compensate then sample pointer velocity for settle fling.
                 // `from` / velocity are both workspace-logical (÷ zoom).
-                let now = self.clock.now_unadjusted();
+                // Fresh monotonic sample (T-14) — see workspace_switch / view_offset.
+                let last_ts = move_
+                    .pointer_tracker_x
+                    .last_timestamp()
+                    .into_iter()
+                    .chain(move_.pointer_tracker_y.last_timestamp())
+                    .max()
+                    .unwrap_or_default();
+                let now = self.clock.now_for_gesture_idle().max(last_ts);
                 move_.pointer_tracker_x.push(0., now);
                 move_.pointer_tracker_y.push(0., now);
                 let pointer_velocity = Point::from((

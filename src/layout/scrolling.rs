@@ -3865,7 +3865,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // effort and bug potential.
 
         // Take into account any idle time between the last event and now.
-        let now = self.clock.now_unadjusted();
+        // Fresh monotonic sample (T-14): lazy clock latch can predate the last
+        // libinput timestamp and get silently dropped by SwipeTracker::push.
+        // Clamp to last event so a slightly-behind sample still lands as a
+        // no-op idle rather than being rejected.
+        let now = self
+            .clock
+            .now_for_gesture_idle()
+            .max(gesture.tracker.last_timestamp().unwrap_or_default());
         gesture.tracker.push(0., now);
 
         let norm_factor = if gesture.is_touchpad {
