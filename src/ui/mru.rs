@@ -274,16 +274,25 @@ impl Thumbnail {
     /// Animate thumbnail motion from given location.
     fn animate_move_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
         let current_offset = self.render_offset();
+        let new_from = from + current_offset;
 
-        // Preserve the previous config if ongoing.
-        let anim = self.move_animation.take().map(|ma| ma.anim);
-        let anim = anim
-            .map(|anim| anim.restarted(1., 0., 0.))
-            .unwrap_or_else(|| Animation::new(self.clock.clone(), 1., 0., 0., config));
+        // Preserve the previous config if ongoing. Normalized 1→0 move anim:
+        // hand off absolute velocity scaled to the new `from`.
+        let anim = match self.move_animation.take() {
+            Some(ma) => {
+                let v_norm = if new_from.abs() > f64::EPSILON {
+                    (ma.from * ma.anim.velocity()) / new_from
+                } else {
+                    0.
+                };
+                ma.anim.restarted(1., 0., v_norm)
+            }
+            None => Animation::new(self.clock.clone(), 1., 0., 0., config),
+        };
 
         self.move_animation = Some(MoveAnimation {
             anim,
-            from: from + current_offset,
+            from: new_from,
         });
     }
 
@@ -880,8 +889,17 @@ impl ViewPos {
         config: niri_config::Animation,
         clock: Clock,
     ) {
-        // FIXME: also compute and use current velocity.
-        let anim = Animation::new(clock, self.current() + from, self.target(), 0., config);
+        let velocity = match self {
+            ViewPos::Static(_) => 0.,
+            ViewPos::Animation(anim) => anim.velocity(),
+        };
+        let anim = Animation::new(
+            clock,
+            self.current() + from,
+            self.target(),
+            velocity,
+            config,
+        );
         *self = ViewPos::Animation(anim);
     }
 

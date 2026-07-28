@@ -11,11 +11,9 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::ClosingWindowRenderElement;
-use super::lifecycle_controller::{
-    ClosingAnimationLane, LeaseEvent, MinimizeRestoreController,
-};
 #[cfg(test)]
 use super::lifecycle_controller::LifecycleAnimDirection;
+use super::lifecycle_controller::{ClosingAnimationLane, LeaseEvent, MinimizeRestoreController};
 use super::maximize_visual_fsm::{MaximizeVisualClear, MaximizeVisualFsm, MaximizeVisualPhase};
 use super::minimize_window_animation::MinimizeWindowAnimationRenderElement;
 use super::monitor::InsertPosition;
@@ -880,12 +878,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 gesture.animate_from(-offset_delta, self.clock.clone(), config);
             }
             _ => {
-                // FIXME: also compute and use current velocity.
+                // Preserve C1: hand off the in-flight view-offset velocity so
+                // rapid focus-column / retarget does not stutter to a stop.
+                let velocity = self.view_offset.velocity();
                 self.view_offset = ViewOffset::Animation(Animation::new(
                     self.clock.clone(),
                     self.view_offset.current(),
                     new_view_offset,
-                    0.,
+                    velocity,
                     config,
                 ));
             }
@@ -3546,7 +3546,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let scale = Scale::from(self.scale);
         // Closing still stores workspace-content positions and subtracts current view_pos.
         let content_view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
-        // Genie endpoints are output-local; viewport origin is zero (single output-local→render step).
+        // Genie endpoints are output-local; viewport origin is zero (single output-local→render
+        // step).
         let output_local_view_rect = Rectangle::from_size(self.view_size);
         let policy = self.render_policy();
         // Lifecycle overlays are drawn under an explicit policy action, not gated by the same
@@ -4494,6 +4495,21 @@ impl ViewOffset {
         }
     }
 
+    /// Instantaneous view-offset velocity (logical px per wall-clock second).
+    ///
+    /// Used to preserve C1 continuity when retargeting an in-flight view
+    /// animation. Gesture tracker velocity is handled separately at gesture
+    /// end; here we only report the active animation derivative.
+    pub fn velocity(&self) -> f64 {
+        match self {
+            ViewOffset::Static(_) => 0.,
+            ViewOffset::Animation(anim) => anim.velocity(),
+            ViewOffset::Gesture(gesture) => {
+                gesture.animation.as_ref().map_or(0., Animation::velocity)
+            }
+        }
+    }
+
     /// Returns the target view offset suitable for computing the new view offset.
     pub fn target(&self) -> f64 {
         match self {
@@ -4562,7 +4578,8 @@ impl ViewOffset {
 impl ViewGesture {
     fn animate_from(&mut self, from: f64, clock: Clock, config: niri_config::Animation) {
         let current = self.animation.as_ref().map_or(0., Animation::value);
-        self.animation = Some(Animation::new(clock, from + current, 0., 0., config));
+        let velocity = self.animation.as_ref().map_or(0., Animation::velocity);
+        self.animation = Some(Animation::new(clock, from + current, 0., velocity, config));
     }
 }
 
@@ -4885,12 +4902,23 @@ impl<W: LayoutElement> Column<W> {
         from_x_offset: f64,
         config: niri_config::Animation,
     ) {
-        let current_offset = self
-            .move_animation
-            .as_ref()
-            .map_or(0., |move_| move_.from * move_.anim.value());
+        // Normalized 1→0 move anim (same pattern as Tile): hand off absolute
+        // offset velocity so chained column inserts/removes stay C1-continuous.
+        let (current_offset, v_norm) = match &self.move_animation {
+            Some(move_) => {
+                let current = move_.from * move_.anim.value();
+                let new_from = from_x_offset + current;
+                let v_norm = if new_from.abs() > f64::EPSILON {
+                    (move_.from * move_.anim.velocity()) / new_from
+                } else {
+                    0.
+                };
+                (current, v_norm)
+            }
+            None => (0., 0.),
+        };
 
-        let anim = Animation::new(self.clock.clone(), 1., 0., 0., config);
+        let anim = Animation::new(self.clock.clone(), 1., 0., v_norm, config);
         self.move_animation = Some(MoveAnimation {
             anim,
             from: from_x_offset + current_offset,

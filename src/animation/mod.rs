@@ -725,4 +725,91 @@ mod tests {
             "linear easing velocity want≈500 got {v}"
         );
     }
+
+    /// T-10 acceptance: retarget via `Animation::new(..., old.velocity())`
+    /// keeps velocity continuous (diff < 1%).
+    ///
+    /// Instantaneous `velocity()` is the C1 contract. A 1 ms finite-difference
+    /// sample is also checked with a tight step: target change makes
+    /// *acceleration* discontinuous, so a full 1 ms average after retarget
+    /// legitimately drifts; we probe with 100 µs so the average stays within
+    /// 1% of the handed-off instantaneous velocity.
+    #[test]
+    fn retarget_via_new_preserves_velocity_within_one_percent() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let config = niri_config::Animation {
+            off: false,
+            kind: niri_config::animations::Kind::Spring(niri_config::animations::SpringParams {
+                damping_ratio: 1.0,
+                stiffness: 1000,
+                epsilon: 0.0001,
+            }),
+        };
+
+        // Horizontal-view-style: animate 0 → 400.
+        let anim = Animation::new(clock.clone(), 0., 400., 0., config);
+        clock.set_unadjusted(Duration::from_millis(60));
+
+        let before_pos = anim.value();
+        let before_vel = anim.velocity();
+        assert!(before_vel.abs() > 1., "spring should be moving at 60ms");
+
+        // Retarget to a new column offset, handing off velocity (T-10 pattern).
+        let retargeted = Animation::new(clock.clone(), before_pos, 120., before_vel, config);
+
+        // Instantaneous API must agree within 1%.
+        let handoff = retargeted.velocity_at(retargeted.start_time());
+        assert!(
+            (handoff - before_vel).abs() / before_vel.abs().max(1.) < 0.01,
+            "velocity() handoff: {handoff} vs {before_vel}"
+        );
+
+        // Tight FD just after restart ≈ instantaneous handoff (C1, not C2).
+        let dt = Duration::from_micros(100);
+        let fd_after = (retargeted.value_at(retargeted.start_time() + dt)
+            - retargeted.value_at(retargeted.start_time()))
+            / dt.as_secs_f64();
+        let rel = (fd_after - before_vel).abs() / before_vel.abs().max(1.);
+        assert!(
+            rel < 0.01,
+            "post-retarget FD velocity drifted: fd={fd_after} want≈{before_vel} rel={rel}"
+        );
+    }
+
+    /// T-10 tile/mru move pattern: normalized 1→0 anim, v_norm = v_abs / new_from.
+    #[test]
+    fn normalized_move_velocity_preserves_absolute_offset_rate() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let config = niri_config::Animation {
+            off: false,
+            kind: niri_config::animations::Kind::Spring(niri_config::animations::SpringParams {
+                damping_ratio: 1.0,
+                stiffness: 800,
+                epsilon: 0.0001,
+            }),
+        };
+
+        // First move: from=200, anim 1→0 ⇒ offset = 200 * value.
+        let anim = Animation::new(clock.clone(), 1., 0., 0., config);
+        let old_from = 200.;
+        clock.set_unadjusted(Duration::from_millis(40));
+
+        let abs_vel = old_from * anim.velocity();
+        assert!(abs_vel.abs() > 1., "absolute offset should be moving");
+
+        // Chain another move that extends the visual offset.
+        let current_offset = old_from * anim.value();
+        let extra = 80.;
+        let new_from = extra + current_offset;
+        let v_norm = abs_vel / new_from;
+        let retargeted = anim.restarted(1., 0., v_norm);
+
+        // Absolute offset velocity after retarget = new_from * v_norm ≈ abs_vel.
+        let abs_after = new_from * retargeted.velocity_at(retargeted.start_time());
+        let rel = (abs_after - abs_vel).abs() / abs_vel.abs().max(1.);
+        assert!(
+            rel < 0.01,
+            "normalized move lost absolute velocity: before={abs_vel} after={abs_after}"
+        );
+    }
 }

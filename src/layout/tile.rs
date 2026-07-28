@@ -178,6 +178,18 @@ struct MoveAnimation {
     from: f64,
 }
 
+/// Convert absolute render-offset velocity to the normalized 1→0 move-anim unit.
+///
+/// `render_offset = from * anim.value()`, so
+/// `v_abs = from * anim.velocity()` and the retargeted anim needs
+/// `v_norm = v_abs / new_from` for C1 continuity of the visual offset.
+fn normalized_move_velocity(old_from: f64, anim: &Animation, new_from: f64) -> f64 {
+    if new_from.abs() <= f64::EPSILON {
+        return 0.;
+    }
+    (old_from * anim.velocity()) / new_from
+}
+
 #[derive(Debug)]
 pub(super) struct AlphaAnimation {
     pub(super) anim: Animation,
@@ -314,12 +326,15 @@ impl<W: LayoutElement> Tile<W> {
         self.sizing_mode = self.window.sizing_mode();
 
         if let Some(animate_from) = self.window.take_animation_snapshot() {
+            // (size_from, tile_size_from, fullscreen_from, expanded_from, offscreen,
+            //  resize_progress_vel, fullscreen_progress_vel, expanded_progress_vel)
             let params = if let Some(resize) = self.resize_animation.take() {
                 // Compute like in animated_window_size(), but using the snapshot geometry (since
                 // the current one is already overwritten).
                 let mut size = animate_from.size;
 
                 let val = resize.anim.value();
+                let resize_progress_vel = resize.anim.velocity();
                 let size_from = resize.size_from;
                 let tile_size_from = resize.tile_size_from;
 
@@ -339,19 +354,22 @@ impl<W: LayoutElement> Tile<W> {
                 tile_size.w = tile_size_from.w + (tile_size.w - tile_size_from.w) * val;
                 tile_size.h = tile_size_from.h + (tile_size.h - tile_size_from.h) * val;
 
-                let fullscreen_from = resize
-                    .fullscreen_progress
-                    .map(|anim| anim.clamped_value().clamp(0., 1.))
-                    .unwrap_or(if prev_sizing_mode.is_fullscreen() {
-                        1.
-                    } else {
-                        0.
-                    });
+                let (fullscreen_from, fullscreen_progress_vel) = match &resize.fullscreen_progress {
+                    Some(anim) => (anim.clamped_value().clamp(0., 1.), anim.velocity()),
+                    None => (
+                        if prev_sizing_mode.is_fullscreen() {
+                            1.
+                        } else {
+                            0.
+                        },
+                        0.,
+                    ),
+                };
 
-                let expanded_from = resize
-                    .expanded_progress
-                    .map(|anim| anim.clamped_value().clamp(0., 1.))
-                    .unwrap_or(if prev_sizing_mode.is_normal() { 0. } else { 1. });
+                let (expanded_from, expanded_progress_vel) = match &resize.expanded_progress {
+                    Some(anim) => (anim.clamped_value().clamp(0., 1.), anim.velocity()),
+                    None => (if prev_sizing_mode.is_normal() { 0. } else { 1. }, 0.),
+                };
 
                 // Also try to reuse the existing offscreen buffer if we have one.
                 (
@@ -360,6 +378,9 @@ impl<W: LayoutElement> Tile<W> {
                     fullscreen_from,
                     expanded_from,
                     resize.offscreen,
+                    resize_progress_vel,
+                    fullscreen_progress_vel,
+                    expanded_progress_vel,
                 )
             } else {
                 let size = animate_from.size;
@@ -389,9 +410,21 @@ impl<W: LayoutElement> Tile<W> {
                     fullscreen_from,
                     expanded_from,
                     OffscreenBuffer::default(),
+                    0.,
+                    0.,
+                    0.,
                 )
             };
-            let (size_from, tile_size_from, fullscreen_from, expanded_from, offscreen) = params;
+            let (
+                size_from,
+                tile_size_from,
+                fullscreen_from,
+                expanded_from,
+                offscreen,
+                resize_progress_vel,
+                fullscreen_progress_vel,
+                expanded_progress_vel,
+            ) = params;
 
             let change = self.window.size().to_f64().to_point() - size_from.to_point();
             let change = f64::max(change.x.abs(), change.y.abs());
@@ -412,18 +445,22 @@ impl<W: LayoutElement> Tile<W> {
             let mode_progress_changes =
                 fullscreen_from != fullscreen_to || expanded_from != expanded_to;
             if change > RESIZE_ANIMATION_THRESHOLD || mode_progress_changes {
+                // Progress always restarts 0→1 with size_from set to the current
+                // visual size (C0). Hand off the previous progress velocity so
+                // the size rate does not drop to zero on every client commit.
                 let anim = Animation::new(
                     self.clock.clone(),
                     0.,
                     1.,
-                    0.,
+                    resize_progress_vel,
                     self.options.animations.window_resize.anim,
                 );
 
-                let fullscreen_progress = (fullscreen_from != fullscreen_to)
-                    .then(|| anim.restarted(fullscreen_from, fullscreen_to, 0.));
+                let fullscreen_progress = (fullscreen_from != fullscreen_to).then(|| {
+                    anim.restarted(fullscreen_from, fullscreen_to, fullscreen_progress_vel)
+                });
                 let expanded_progress = (expanded_from != expanded_to)
-                    .then(|| anim.restarted(expanded_from, expanded_to, 0.));
+                    .then(|| anim.restarted(expanded_from, expanded_to, expanded_progress_vel));
 
                 self.resize_animation = Some(ResizeAnimation {
                     anim,
@@ -637,16 +674,22 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn animate_move_x_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
         let current_offset = self.render_offset().x;
+        let new_from = from + current_offset;
 
-        // Preserve the previous config if ongoing.
-        let anim = self.move_x_animation.take().map(|move_| move_.anim);
-        let anim = anim
-            .map(|anim| anim.restarted(1., 0., 0.))
-            .unwrap_or_else(|| Animation::new(self.clock.clone(), 1., 0., 0., config));
+        // Preserve the previous config if ongoing. Move anim is normalized 1→0
+        // with render_offset = from * value; convert absolute velocity to the
+        // new unit scale so C1 holds across chained moves.
+        let anim = match self.move_x_animation.take() {
+            Some(move_) => {
+                let v_norm = normalized_move_velocity(move_.from, &move_.anim, new_from);
+                move_.anim.restarted(1., 0., v_norm)
+            }
+            None => Animation::new(self.clock.clone(), 1., 0., 0., config),
+        };
 
         self.move_x_animation = Some(MoveAnimation {
             anim,
-            from: from + current_offset,
+            from: new_from,
         });
     }
 
@@ -656,16 +699,20 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn animate_move_y_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
         let current_offset = self.render_offset().y;
+        let new_from = from + current_offset;
 
-        // Preserve the previous config if ongoing.
-        let anim = self.move_y_animation.take().map(|move_| move_.anim);
-        let anim = anim
-            .map(|anim| anim.restarted(1., 0., 0.))
-            .unwrap_or_else(|| Animation::new(self.clock.clone(), 1., 0., 0., config));
+        // Same normalized velocity handoff as animate_move_x_from_with_config.
+        let anim = match self.move_y_animation.take() {
+            Some(move_) => {
+                let v_norm = normalized_move_velocity(move_.from, &move_.anim, new_from);
+                move_.anim.restarted(1., 0., v_norm)
+            }
+            None => Animation::new(self.clock.clone(), 1., 0., 0., config),
+        };
 
         self.move_y_animation = Some(MoveAnimation {
             anim,
-            from: from + current_offset,
+            from: new_from,
         });
     }
 
@@ -1693,8 +1740,9 @@ impl<W: LayoutElement> Tile<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use smithay::utils::Physical;
+
+    use super::*;
 
     #[test]
     fn offscreen_render_location_preserves_physical_pixel_anchor() {

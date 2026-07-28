@@ -208,6 +208,16 @@ impl WorkspaceSwitch {
         }
     }
 
+    /// Instantaneous workspace-index velocity (indices per wall-clock second).
+    pub fn velocity(&self) -> f64 {
+        match self {
+            WorkspaceSwitch::Animation(anim) => anim.velocity(),
+            WorkspaceSwitch::Gesture(gesture) => {
+                gesture.animation.as_ref().map_or(0., Animation::velocity)
+            }
+        }
+    }
+
     pub fn target_idx(&self) -> f64 {
         match self {
             WorkspaceSwitch::Animation(anim) => anim.to(),
@@ -251,7 +261,8 @@ impl WorkspaceSwitchGesture {
 
     fn animate_from(&mut self, from: f64, clock: Clock, config: niri_config::Animation) {
         let current = self.animation.as_ref().map_or(0., Animation::value);
-        self.animation = Some(Animation::new(clock, from + current, 0., 0., config));
+        let velocity = self.animation.as_ref().map_or(0., Animation::velocity);
+        self.animation = Some(Animation::new(clock, from + current, 0., velocity, config));
     }
 }
 
@@ -441,8 +452,12 @@ impl<W: LayoutElement> Monitor<W> {
         idx: usize,
         config: Option<niri_config::Animation>,
     ) {
-        // FIXME: also compute and use current velocity.
         let current_idx = self.workspace_render_idx();
+        // Preserve C1 across rapid workspace switches.
+        let velocity = self
+            .workspace_switch
+            .as_ref()
+            .map_or(0., WorkspaceSwitch::velocity);
 
         if self.active_workspace_idx != idx {
             self.previous_workspace_id = Some(self.workspaces[self.active_workspace_idx].id());
@@ -477,7 +492,7 @@ impl<W: LayoutElement> Monitor<W> {
                     self.clock.clone(),
                     current_idx,
                     idx as f64,
-                    0.,
+                    velocity,
                     config,
                 )));
             }
@@ -1376,8 +1391,8 @@ impl<W: LayoutElement> Monitor<W> {
         // the workspace switch to avoid jumps.
         if prev_render_idx != new_render_idx {
             if let Some(WorkspaceSwitch::Animation(anim)) = &mut self.workspace_switch {
-                // FIXME: maintain velocity.
-                *anim = anim.restarted(prev_render_idx, anim.to(), 0.);
+                let velocity = anim.velocity();
+                *anim = anim.restarted(prev_render_idx, anim.to(), velocity);
             }
         }
     }
