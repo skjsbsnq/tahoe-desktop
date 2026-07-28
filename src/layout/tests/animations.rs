@@ -1097,3 +1097,100 @@ fn width_resize_and_cancel_of_column_to_the_left() {
     200 × 200 at x:100 y:  0
     ");
 }
+
+/// T-11: fast horizontal swipe release must settle with a single velocity-
+/// carrying animation (no zero-velocity secondary snap).
+#[test]
+fn view_offset_gesture_end_preserves_swipe_velocity() {
+    use std::time::Duration;
+
+    // Spring settle so velocity() is meaningful (defaults are already spring).
+    let mut options = Options::default();
+    options.layout.gaps = 0.0;
+    options.animations.horizontal_view_movement.0.kind =
+        niri_config::animations::Kind::Spring(niri_config::animations::SpringParams {
+            damping_ratio: 1.0,
+            stiffness: 800,
+            epsilon: 0.0001,
+        });
+
+    // Output is 1280×720; a 2000px-wide window is larger-than-view so the
+    // former HACK secondary snap path used to fire on edge settle.
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::SetForcedSize {
+                id: 1,
+                size: Some(Size::new(2000, 400)),
+            },
+            Op::Communicate(1),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::ViewOffsetGestureBegin {
+                output_idx: 1,
+                workspace_idx: None,
+                is_touchpad: false,
+            },
+            // Fast rightward fling over ~30ms.
+            Op::ViewOffsetGestureUpdate {
+                delta: 40.,
+                timestamp: Duration::from_millis(0),
+                is_touchpad: false,
+            },
+            Op::ViewOffsetGestureUpdate {
+                delta: 50.,
+                timestamp: Duration::from_millis(10),
+                is_touchpad: false,
+            },
+            Op::ViewOffsetGestureUpdate {
+                delta: 60.,
+                timestamp: Duration::from_millis(20),
+                is_touchpad: false,
+            },
+            Op::ViewOffsetGestureEnd {
+                is_touchpad: Some(false),
+            },
+        ],
+    );
+
+    let ws = layout.active_workspace().unwrap();
+    let scrolling = ws.scrolling();
+    assert!(
+        scrolling.test_view_offset_animating(),
+        "gesture end should produce a settle animation"
+    );
+
+    let v0 = scrolling.test_view_offset_velocity();
+    // Tracker saw ~150px / 20ms ≈ 7500 px/s; after idle push the velocity is
+    // lower but must remain clearly nonzero (the pre-T-11 double-anim path
+    // zeroed it whenever the secondary snap retargeted).
+    assert!(
+        v0.abs() > 100.,
+        "settle animation must carry swipe velocity, got {v0}"
+    );
+
+    // Frame-by-frame: 1ms sample of view_pos must not reverse abruptly
+    // relative to the handed-off velocity (no 急停 kink).
+    let p0 = scrolling.view_pos();
+    Op::AdvanceAnimations { msec_delta: 1 }.apply(&mut layout);
+    let ws = layout.active_workspace().unwrap();
+    let scrolling = ws.scrolling();
+    let p1 = scrolling.view_pos();
+    let fd = (p1 - p0) / 0.001;
+    // Finite-difference over the first ms must stay within 15% of v0 (spring
+    // acceleration changes velocity, but a zero-vel restart would be ~0).
+    let rel = (fd - v0).abs() / v0.abs();
+    assert!(
+        rel < 0.15,
+        "view_pos velocity kink after settle start: v0={v0} fd={fd} rel={rel}"
+    );
+}

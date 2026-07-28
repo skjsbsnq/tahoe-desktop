@@ -2704,6 +2704,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.column_x(self.active_column_idx) + self.view_offset.target()
     }
 
+    /// Test/observation: instantaneous view-offset velocity after gesture end.
+    #[cfg(test)]
+    pub(crate) fn test_view_offset_velocity(&self) -> f64 {
+        self.view_offset.velocity()
+    }
+
+    /// Test/observation: whether the view offset is a settle animation.
+    #[cfg(test)]
+    pub(crate) fn test_view_offset_animating(&self) -> bool {
+        matches!(self.view_offset, ViewOffset::Animation(_))
+    }
+
     // HACK: pass a self.data iterator in manually as a workaround for the lack of method partial
     // borrowing. Note that this method's return value does not borrow the entire &Self!
     fn column_xs(&self, data: impl Iterator<Item = ColumnData>) -> impl Iterator<Item = f64> {
@@ -4150,18 +4162,25 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         self.active_column_idx = new_col_idx;
 
-        let target_view_offset = target_snap.view_pos - new_col_x;
+        // Final settle target uses the same fit/center/strut rules as column
+        // activation, with the snap view position as the motion-preference
+        // reference. Computing it here (instead of creating a snap animation
+        // and immediately replacing it via animate_view_offset_to_column)
+        // yields a single velocity-carrying animation — no mid-release velocity
+        // drop on wide-window edge snaps / center-focused corrections (T-11).
+        let final_view_offset = self.compute_new_view_offset_for_column(
+            Some(target_snap.view_pos),
+            new_col_idx,
+            None,
+        );
 
         self.view_offset = ViewOffset::Animation(Animation::new(
             self.clock.clone(),
             current_view_offset + delta,
-            target_view_offset,
+            final_view_offset,
             velocity,
             self.options.animations.horizontal_view_movement.0,
         ));
-
-        // HACK: deal with things like snapping to the right edge of a larger-than-view window.
-        self.animate_view_offset_to_column(None, new_col_idx, None);
 
         true
     }
