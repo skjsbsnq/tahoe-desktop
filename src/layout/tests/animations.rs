@@ -395,11 +395,17 @@ fn height_resize_and_back_during_another_y_anim() {
     ");
 
     // Advance the time a bit. Both resize and consume movement are still ongoing.
+    // T-15/A-3: the resize-back here lands at progress 0.2 (under half), so the
+    // in-flight resize is target-tracked (start_time preserved) rather than
+    // restarted; the height reads 115 here and 113 one advance later instead of
+    // the pre-T-15 restart values 116 / 114. The bottom window's Y also shifts
+    // (84→85, 86→88) because its move anim is now phase-locked to the preserved
+    // resize timeline instead of being restarted at the commit instant.
     Op::AdvanceAnimations { msec_delta: 200 }.apply(&mut layout);
 
     assert_snapshot!(format_tiles(&layout), @r"
-    100 × 116 at x:  0 y:  0
-    200 × 200 at x: 10 y: 84
+    100 × 115 at x:  0 y:  0
+    200 × 200 at x: 10 y: 85
     ");
 
     // Advance the time to complete the consume movement.
@@ -408,8 +414,8 @@ fn height_resize_and_back_during_another_y_anim() {
     // The Y position is still lower than the height since the window started the resize-induced Y
     // movement high up.
     assert_snapshot!(format_tiles(&layout), @r"
-    100 × 114 at x:  0 y:  0
-    200 × 200 at x:  0 y: 86
+    100 × 113 at x:  0 y:  0
+    200 × 200 at x:  0 y: 88
     ");
 
     // Advance the time to complete the resize.
@@ -1321,4 +1327,221 @@ fn interactive_move_end_preserves_pointer_velocity() {
         "render_offset velocity kink after move end: v0={} fd={fd} rel={rel}",
         vel.x
     );
+}
+
+/// T-15/A-3: three sequential client commits during an in-flight resize must
+/// keep the same animation `start_time` (target tracking), not restart phase.
+#[test]
+fn resize_midflight_commits_preserve_start_time() {
+    let mut options = make_options();
+    // Linear 1000ms so progress is a pure clock fraction.
+    options.animations.window_resize.anim.kind =
+        niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+            duration_ms: 1000,
+            curve: niri_config::animations::Curve::Linear,
+        });
+
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::SetForcedSize {
+                id: 1,
+                size: Some(Size::new(400, 400)),
+            },
+            Op::Communicate(1),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    // Issue an animated width resize; the (slow) client answers in steps.
+    Op::SetWindowWidth {
+        id: None,
+        change: niri_ipc::SizeChange::SetFixed(280),
+    }
+    .apply(&mut layout);
+
+    // Helper: re-arm the per-configure animate bit so subsequent commits of a
+    // multi-step client response still produce an animation snapshot (mirrors
+    // Mapped storing a snapshot on each animated serial commit).
+    let rearm_animate = |layout: &Layout<TestWindow>| {
+        for (_mon, win) in layout.windows() {
+            if win.0.id == 1 {
+                win.0.animate_next_configure.set(true);
+            }
+        }
+    };
+
+    let commit_size = |layout: &mut Layout<TestWindow>, w: i32| {
+        Op::SetForcedSize {
+            id: 1,
+            size: Some(Size::new(w, 400)),
+        }
+        .apply(layout);
+        Op::Communicate(1).apply(layout);
+    };
+
+    let anim_start = |layout: &Layout<TestWindow>| {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        let tile = scrolling.tiles().next().unwrap();
+        tile.resize_animation()
+            .expect("resize anim must be active")
+            .start_time()
+    };
+
+    // Commit 1: first step (Δ=20 from 400→380) starts the resize anim.
+    commit_size(&mut layout, 380);
+    let t0 = anim_start(&layout);
+
+    // Advance past a few frames but stay well under half (track band).
+    Op::AdvanceAnimations { msec_delta: 100 }.apply(&mut layout);
+
+    // Commit 2: another small step — must target-track, not restart.
+    rearm_animate(&layout);
+    commit_size(&mut layout, 360);
+    let t1 = anim_start(&layout);
+    assert_eq!(
+        t0, t1,
+        "T-15: second mid-flight commit must preserve start_time (was {t0:?}, now {t1:?})"
+    );
+
+    Op::AdvanceAnimations { msec_delta: 100 }.apply(&mut layout);
+
+    // Commit 3: third step, still under half and under restart threshold.
+    rearm_animate(&layout);
+    commit_size(&mut layout, 340);
+    let t2 = anim_start(&layout);
+    assert_eq!(
+        t0, t2,
+        "T-15: triple-commit start_time must stay {t0:?}, got {t2:?}"
+    );
+
+    // Progress should still reflect wall time from original start (~200ms of
+    // 1000ms linear), not a fresh 0 from a restart.
+    let progress = {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        let tile = scrolling.tiles().next().unwrap();
+        tile.resize_animation().unwrap().value()
+    };
+    assert!(
+        progress > 0.15 && progress < 0.35,
+        "tracked progress should stay near 0.2 after 200ms linear, got {progress}"
+    );
+}
+
+/// T-15/A-3 glue: while the top tile's resize is target-tracked across a
+/// mid-flight commit, the tile below must stay *glued* to the top tile's bottom
+/// edge at every frame — i.e. the resize anim and the tiles-below move anim
+/// share the same `start_time` so `val_companion + val_resize == 1`. Pre-T-15
+/// the companion restarted at the commit instant (fresh `start_time`), opening
+/// a transient gap to a lagging neighbour once the tracked resize settled.
+#[test]
+fn resize_tracking_keeps_tiles_below_glued() {
+    let mut options = make_options();
+    options.animations.window_resize.anim.kind =
+        niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+            duration_ms: 1000,
+            curve: niri_config::animations::Curve::Linear,
+        });
+
+    // Two tiles stacked in one column, gaps 0. Top id=1 (100×200), bottom id=2 (200×200).
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::FocusColumnLeft,
+            Op::ConsumeWindowIntoColumn,
+            Op::SetForcedSize {
+                id: 1,
+                size: Some(Size::new(100, 200)),
+            },
+            Op::SetForcedSize {
+                id: 2,
+                size: Some(Size::new(200, 200)),
+            },
+            Op::Communicate(1),
+            Op::Communicate(2),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    // Snapshot of (top animated height, bottom render y) at the current instant.
+    let glue = |layout: &Layout<TestWindow>| -> (f64, f64) {
+        let ws = layout.active_workspace().unwrap();
+        let mut tiles: Vec<_> = ws.tiles_with_render_positions().collect();
+        tiles.sort_by_key(|(t, _, _)| t.window().id());
+        let (top, top_pos, _) = &tiles[0];
+        let (_bot, bot_pos, _) = &tiles[1];
+        (top.animated_tile_size().h + top_pos.y, bot_pos.y)
+    };
+
+    // Start an animated height shrink on the top tile: 200 → 150.
+    let ops = [
+        Op::SetWindowHeight {
+            id: None,
+            change: niri_ipc::SizeChange::SetFixed(150),
+        },
+        Op::SetForcedSize {
+            id: 1,
+            size: Some(Size::new(100, 150)),
+        },
+        Op::Communicate(1),
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+
+    // Advance to progress 0.2 (200ms of 1000ms) — under half, inside the track band.
+    Op::AdvanceAnimations { msec_delta: 200 }.apply(&mut layout);
+
+    // Second small commit (150 → 130): Δ visual = 60 ≤ 80, progress 0.2 < 0.5 → TRACK.
+    for (_mon, win) in layout.windows() {
+        if win.0.id == 1 {
+            win.0.animate_next_configure.set(true);
+        }
+    }
+    let ops = [
+        Op::SetWindowHeight {
+            id: None,
+            change: niri_ipc::SizeChange::SetFixed(130),
+        },
+        Op::SetForcedSize {
+            id: 1,
+            size: Some(Size::new(100, 130)),
+        },
+        Op::Communicate(1),
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+
+    // Continuity at the track instant: the top height must not jump.
+    let (top_h, bot_y) = glue(&layout);
+    assert!(
+        (top_h - 190.).abs() < 0.5,
+        "track instant must preserve visual (top height ≈ 190), got {top_h}"
+    );
+    assert!(
+        (bot_y - top_h).abs() < 1.5,
+        "bottom must stay glued at the track instant (bot_y {bot_y} vs top bottom {top_h})"
+    );
+
+    // Advance across the resize's original end (t=1000). Pre-fix the tracked
+    // resize settled at t=1000 while the restarted companion lagged to t=1200,
+    // opening a ~gap; with the phase-locked companion they must stay glued.
+    for dt in [300, 300, 200, 200, 200] {
+        Op::AdvanceAnimations { msec_delta: dt }.apply(&mut layout);
+        let (top_h, bot_y) = glue(&layout);
+        assert!(
+            (bot_y - top_h).abs() < 1.5,
+            "glue broken at t+{dt}ms: bottom y {bot_y} != top bottom {top_h}"
+        );
+    }
 }

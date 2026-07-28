@@ -16,7 +16,7 @@ use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
 use super::shadow::Shadow;
 use super::{
     HitType, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
-    SizeFrac, RESIZE_ANIMATION_THRESHOLD,
+    SizeFrac, RESIZE_ANIMATION_RESTART_THRESHOLD, RESIZE_ANIMATION_THRESHOLD,
 };
 use crate::animation::{Animation, Clock};
 use crate::layout::SizingMode;
@@ -332,20 +332,28 @@ impl<W: LayoutElement> Tile<W> {
         self.sizing_mode = self.window.sizing_mode();
 
         if let Some(animate_from) = self.window.take_animation_snapshot() {
-            // (size_from, tile_size_from, fullscreen_from, expanded_from, offscreen,
-            //  resize_progress_vel, fullscreen_progress_vel, expanded_progress_vel)
-            let params = if let Some(resize) = self.resize_animation.take() {
-                // Compute like in animated_window_size(), but using the snapshot geometry (since
-                // the current one is already overwritten).
-                let mut size = animate_from.size;
-
+            // Current visual size (and tile size), plus anything we may reuse
+            // from an in-flight resize. `size_from` below is the visual size
+            // that a restarted 0→1 anim would depart from (C0).
+            let (
+                mut size_from,
+                mut tile_size_from,
+                fullscreen_from,
+                expanded_from,
+                offscreen,
+                resize_progress_vel,
+                fullscreen_progress_vel,
+                expanded_progress_vel,
+                mut preserved,
+            ) = if let Some(resize) = self.resize_animation.take() {
                 let val = resize.anim.value();
                 let resize_progress_vel = resize.anim.velocity();
-                let size_from = resize.size_from;
-                let tile_size_from = resize.tile_size_from;
 
-                size.w = size_from.w + (size.w - size_from.w) * val;
-                size.h = size_from.h + (size.h - size_from.h) * val;
+                // Visual window size at the current phase, using the snapshot
+                // geometry as the pre-commit target (live size is already new).
+                let mut size = animate_from.size;
+                size.w = resize.size_from.w + (size.w - resize.size_from.w) * val;
+                size.h = resize.size_from.h + (size.h - resize.size_from.h) * val;
 
                 let mut tile_size = animate_from.size;
                 if prev_sizing_mode.is_fullscreen() {
@@ -356,9 +364,10 @@ impl<W: LayoutElement> Tile<W> {
                     tile_size.w += width * 2.;
                     tile_size.h += width * 2.;
                 }
-
-                tile_size.w = tile_size_from.w + (tile_size.w - tile_size_from.w) * val;
-                tile_size.h = tile_size_from.h + (tile_size.h - tile_size_from.h) * val;
+                tile_size.w =
+                    resize.tile_size_from.w + (tile_size.w - resize.tile_size_from.w) * val;
+                tile_size.h =
+                    resize.tile_size_from.h + (tile_size.h - resize.tile_size_from.h) * val;
 
                 let (fullscreen_from, fullscreen_progress_vel) = match &resize.fullscreen_progress {
                     Some(anim) => (anim.clamped_value().clamp(0., 1.), anim.velocity()),
@@ -377,7 +386,6 @@ impl<W: LayoutElement> Tile<W> {
                     None => (if prev_sizing_mode.is_normal() { 0. } else { 1. }, 0.),
                 };
 
-                // Also try to reuse the existing offscreen buffer if we have one.
                 (
                     size,
                     tile_size,
@@ -387,11 +395,16 @@ impl<W: LayoutElement> Tile<W> {
                     resize_progress_vel,
                     fullscreen_progress_vel,
                     expanded_progress_vel,
+                    Some((
+                        resize.anim,
+                        val,
+                        resize.fullscreen_progress,
+                        resize.expanded_progress,
+                    )),
                 )
             } else {
                 let size = animate_from.size;
 
-                // Compute like in tile_size().
                 let mut tile_size = size;
                 if prev_sizing_mode.is_fullscreen() {
                     tile_size.w = f64::max(tile_size.w, self.view_size.w);
@@ -407,7 +420,6 @@ impl<W: LayoutElement> Tile<W> {
                 } else {
                     0.
                 };
-
                 let expanded_from = if prev_sizing_mode.is_normal() { 0. } else { 1. };
 
                 (
@@ -419,18 +431,9 @@ impl<W: LayoutElement> Tile<W> {
                     0.,
                     0.,
                     0.,
+                    None,
                 )
             };
-            let (
-                size_from,
-                tile_size_from,
-                fullscreen_from,
-                expanded_from,
-                offscreen,
-                resize_progress_vel,
-                fullscreen_progress_vel,
-                expanded_progress_vel,
-            ) = params;
 
             let change = self.window.size().to_f64().to_point() - size_from.to_point();
             let change = f64::max(change.x.abs(), change.y.abs());
@@ -446,37 +449,86 @@ impl<W: LayoutElement> Tile<W> {
             let expanded_to = if self.sizing_mode.is_normal() { 0. } else { 1. };
             // F08: same/near size unmaximize still needs the existing resize owner when
             // fullscreen/expanded chrome progress would jump (border, radius, backdrop).
-            // Do not lower RESIZE_ANIMATION_THRESHOLD globally — only animate when mode
-            // progress actually changes or size delta exceeds the threshold.
             let mode_progress_changes =
                 fullscreen_from != fullscreen_to || expanded_from != expanded_to;
+
             if change > RESIZE_ANIMATION_THRESHOLD || mode_progress_changes {
-                // Progress always restarts 0→1 with size_from set to the current
-                // visual size (C0). Hand off the previous progress velocity so
-                // the size rate does not drop to zero on every client commit.
-                let anim = Animation::new(
-                    self.clock.clone(),
-                    0.,
-                    1.,
-                    resize_progress_vel,
-                    self.options.animations.window_resize.anim,
-                );
+                // T-15/A-3: continuous client commits mid-flight should track the
+                // new target without resetting phase (same start_time). Large
+                // jumps and mode changes still restart with velocity handoff.
+                let track = match &preserved {
+                    Some((_, progress, _, _)) => {
+                        !mode_progress_changes
+                            && change <= RESIZE_ANIMATION_RESTART_THRESHOLD
+                            // Not past half: research "未过半". Also require
+                            // headroom so (1-progress) is numerically safe.
+                            && *progress > 0.001
+                            && *progress < 0.5
+                    }
+                    None => false,
+                };
 
-                let fullscreen_progress = (fullscreen_from != fullscreen_to).then(|| {
-                    anim.restarted(fullscreen_from, fullscreen_to, fullscreen_progress_vel)
-                });
-                let expanded_progress = (expanded_from != expanded_to)
-                    .then(|| anim.restarted(expanded_from, expanded_to, expanded_progress_vel));
+                if track {
+                    let (anim, progress, fullscreen_progress, expanded_progress) =
+                        preserved.take().unwrap();
 
-                self.resize_animation = Some(ResizeAnimation {
-                    anim,
-                    size_from,
-                    snapshot: animate_from,
-                    offscreen,
-                    tile_size_from,
-                    fullscreen_progress,
-                    expanded_progress,
-                });
+                    // The consumer (`animated_window_size` / `animated_tile_size`)
+                    // lerps `size_from → target` at `val`, where the target is the
+                    // *physical-rounded* size (`window_size()` / `tile_size()`). To
+                    // preserve visual continuity exactly at the rebuild instant
+                    // (visual == size_from + (target − size_from)·progress), we must
+                    // derive `size_from` against the same rounded targets, otherwise
+                    // a fractional-scale commit would drift up to one sub-pixel per
+                    // rebuild.
+                    let inv = 1. - progress;
+                    let target = self.window_size();
+                    let tile_target = self.tile_size();
+                    size_from = Size::from((
+                        (size_from.w - target.w * progress) / inv,
+                        (size_from.h - target.h * progress) / inv,
+                    ));
+                    tile_size_from = Size::from((
+                        (tile_size_from.w - tile_target.w * progress) / inv,
+                        (tile_size_from.h - tile_target.h * progress) / inv,
+                    ));
+
+                    self.resize_animation = Some(ResizeAnimation {
+                        anim,
+                        size_from,
+                        snapshot: animate_from,
+                        offscreen,
+                        tile_size_from,
+                        fullscreen_progress,
+                        expanded_progress,
+                    });
+                } else {
+                    // Restart 0→1 from the current visual size (C0) with prior
+                    // progress velocity (T-10 C1).
+                    let anim = Animation::new(
+                        self.clock.clone(),
+                        0.,
+                        1.,
+                        resize_progress_vel,
+                        self.options.animations.window_resize.anim,
+                    );
+
+                    let fullscreen_progress = (fullscreen_from != fullscreen_to).then(|| {
+                        anim.restarted(fullscreen_from, fullscreen_to, fullscreen_progress_vel)
+                    });
+                    let expanded_progress = (expanded_from != expanded_to).then(|| {
+                        anim.restarted(expanded_from, expanded_to, expanded_progress_vel)
+                    });
+
+                    self.resize_animation = Some(ResizeAnimation {
+                        anim,
+                        size_from,
+                        snapshot: animate_from,
+                        offscreen,
+                        tile_size_from,
+                        fullscreen_progress,
+                        expanded_progress,
+                    });
+                }
             } else {
                 // State/size effectively identical: no meaningful visual transition.
                 self.resize_animation = None;

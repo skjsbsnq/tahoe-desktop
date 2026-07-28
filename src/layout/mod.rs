@@ -105,6 +105,12 @@ mod tests;
 /// Size changes up to this many pixels don't animate.
 pub const RESIZE_ANIMATION_THRESHOLD: f64 = 10.;
 
+/// Above this delta from the current *visual* size, a mid-flight resize is
+/// restarted (new `start_time`) instead of target-tracked in place (T-15/A-3).
+/// Continuous client commits (set-column-width steps, interactive-resize tail)
+/// stay under this band and keep their animation phase.
+pub const RESIZE_ANIMATION_RESTART_THRESHOLD: f64 = 80.;
+
 /// Pointer needs to move this far to pull a window from the layout.
 const INTERACTIVE_MOVE_START_THRESHOLD: f64 = 256. * 256.;
 

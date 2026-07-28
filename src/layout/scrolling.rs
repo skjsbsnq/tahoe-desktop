@@ -1466,7 +1466,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let offset = prev_width - self.data[col_idx].width;
 
         // Move other columns in tandem with resizing.
-        let ongoing_resize_anim = column.tiles[tile_idx].resize_animation().is_some();
+        // T-15/A-3: like the tiles-below Y companion (see Column::update_window), when
+        // the resize was *target-tracked* (phase preserved — resize anim already
+        // mid-flight, `value() > 0.001`), the adjacent-columns X companion must keep
+        // the same `start_time` so the width glue (`val_companion + val_resize == 1`)
+        // holds. Restarting the companion here would desync a tracked resize and open
+        // a transient horizontal gap to lagging columns.
+        let resize_anim = column.tiles[tile_idx].resize_animation();
+        let tracked = resize_anim.is_some_and(|a| a.value() > 0.001);
+        let ongoing_resize_anim = resize_anim.is_some();
         if offset != 0. {
             if self.active_column_idx <= col_idx {
                 for col in &mut self.columns[col_idx + 1..] {
@@ -1488,7 +1496,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     //
                     // Notably, this is necessary to fix the animation jump when resizing width back
                     // and forth in quick succession (in a way that cancels the resize animation).
-                    if ongoing_resize_anim {
+                    if ongoing_resize_anim && !tracked {
                         col.animate_move_from_with_config(
                             offset,
                             self.options.animations.window_resize.anim,
@@ -1499,7 +1507,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 }
             } else {
                 for col in &mut self.columns[..=col_idx] {
-                    if ongoing_resize_anim {
+                    if ongoing_resize_anim && !tracked {
                         col.animate_move_from_with_config(
                             -offset,
                             self.options.animations.window_resize.anim,
@@ -1588,8 +1596,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     self.animate_view_offset_with_config(col_idx, prev_offset, config);
                 }
 
-                // FIXME: we will want to skip the animation in some cases here to make continuously
-                // resizing windows not look janky.
+                // T-15/A-3: animate_view_offset_with_config already no-ops when the
+                // new target is within 1 physical pixel of the current target, so
+                // continuous client commits that don't actually change the view
+                // snap point do not rebuild the view-offset animation.
                 self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
             }
         }
@@ -5121,10 +5131,22 @@ impl<W: LayoutElement> Column<W> {
         // animated vs. non-animated resizes? For example, an animated +20 resize followed by two
         // non-animated -10 resizes.
         if !is_tabbed && offset != 0. {
-            if tile.resize_animation().is_some() {
-                // If there's a resize animation (that may have just started in
-                // tile.update_window()), then the apparent size change is smooth with no sudden
-                // jumps. This corresponds to adding an Y animation to tiles below.
+            // T-15/A-3: when the resize was *target-tracked* (phase preserved, same
+            // `start_time` as before this commit — signalled by the resize anim being
+            // already mid-flight, `value() > 0.001`), the tiles-below move anim must
+            // keep the SAME `start_time` so the `val_companion + val_resize == 1` glue
+            // invariant holds. Restarts set `start_time = now`, desyncing a tracked
+            // resize (which keeps its old `start_time`) and opening a transient gap
+            // to lagging neighbours. Offset-adjust in place instead: it preserves
+            // `start_time` and re-derives `from` for visual continuity (the same
+            // `(visual − target)/(1 − p)` tracking identity, applied to the move anim).
+            let tracked = tile
+                .resize_animation()
+                .is_some_and(|a| a.value() > 0.001);
+            if tile.resize_animation().is_some() && !tracked {
+                // The resize anim was just (re)started from a fresh `start_time`
+                // (this commit or the first commit). Companion restarts with the
+                // same fresh `start_time` so glue holds across the 0→1 morph.
                 for tile in &mut self.tiles[tile_idx + 1..] {
                     tile.animate_move_y_from_with_config(
                         offset,
@@ -5133,20 +5155,18 @@ impl<W: LayoutElement> Column<W> {
                     );
                 }
             } else {
-                // There's no resize animation, but the offset is nonzero. This could happen for
-                // example:
-                // - if the window resized on its own, which we don't animate
-                // - if the window resized by less than 10 px (the resize threshold)
+                // Either there's no resize anim, or it is mid-flight (tracked). In
+                // both cases the apparent size change should not re-launch a fresh
+                // companion anim: offset the existing move anim in place so its
+                // `start_time` matches whatever timeline the resize is on.
                 //
-                // The latter case could also cancel an ongoing resize animation.
+                // No-resize case (window resized on its own, or by < 10 px which can
+                // cancel an ongoing resize anim): stationary tiles below should jump
+                // with the resize, but already-animating tiles offset to avoid the
+                // jump (also fixes quick height-resize-back-and-forth).
                 //
-                // Now, stationary tiles below shouldn't react to this offset change in any way,
-                // i.e. their apparent Y position should jump together with the resize. However,
-                // tiles below that are already animating an Y movement should offset their
-                // animations to avoid the jump.
-                //
-                // Notably, this is necessary to fix the animation jump when resizing height back
-                // and forth in quick succession (in a way that cancels the resize animation).
+                // Tracked case: preserves the in-flight companion `start_time` so it
+                // stays glued to the preserved resize `start_time`.
                 for tile in &mut self.tiles[tile_idx + 1..] {
                     tile.offset_move_y_anim_current(offset);
                 }
