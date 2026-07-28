@@ -232,6 +232,83 @@ impl Spring {
                     * (x0 * (omega2 * t).cosh() + ((beta * x0 + v0) / omega2) * (omega2 * t).sinh())
         }
     }
+
+    /// Analytical velocity (derivative of [`Self::value_at`]) at time `t`.
+    ///
+    /// Closed-form derivatives of the three damped-harmonic branches. Units are
+    /// position per second of spring time (i.e. the same time base as `t`).
+    pub fn velocity_at(&self, t: Duration) -> f64 {
+        self.velocity_oscillate(t.as_secs_f64())
+    }
+
+    /// Clamp an initial velocity so overdamped springs cannot explode numerically.
+    ///
+    /// Bound is ±10·|to−from| / expected_envelope_duration. Underdamped and
+    /// critically damped springs are left alone — they tolerate large kicks.
+    pub fn clamp_initial_velocity(from: f64, to: f64, velocity: f64, params: SpringParams) -> f64 {
+        if !velocity.is_finite() {
+            return 0.;
+        }
+
+        let beta = params.damping / (2. * params.mass);
+        let omega0 = (params.stiffness / params.mass).sqrt();
+
+        // Only overdamped needs the clamp (Newton duration + dual-exp blow-up).
+        if beta <= omega0 + f64::from(f32::EPSILON) {
+            return velocity;
+        }
+
+        let range = (to - from).abs().max(params.epsilon);
+        let expected = if beta > f64::EPSILON {
+            (-params.epsilon.ln() / beta).max(1e-3)
+        } else {
+            1.
+        };
+        let max_v = 10. * range / expected;
+        velocity.clamp(-max_v, max_v)
+    }
+
+    fn velocity_oscillate(&self, t: f64) -> f64 {
+        let b = self.params.damping;
+        let m = self.params.mass;
+        let k = self.params.stiffness;
+        let v0 = self.initial_velocity;
+
+        let beta = b / (2. * m);
+        let omega0 = (k / m).sqrt();
+        let x0 = self.from - self.to;
+        let envelope = (-beta * t).exp();
+
+        // f64::EPSILON is too small for this specific comparison, so we use
+        // f32::EPSILON even though it's doubles.
+        if (beta - omega0).abs() <= f64::from(f32::EPSILON) {
+            // Critically damped: y = to + e^(-βt)·(x0 + (β·x0 + v0)·t)
+            // ẏ = e^(-βt)·((β·x0 + v0) - β·(x0 + (β·x0 + v0)·t))
+            let a = x0;
+            let b_coef = beta * x0 + v0;
+            envelope * (b_coef - beta * (a + b_coef * t))
+        } else if beta < omega0 {
+            // Underdamped:
+            // y = to + e^(-βt)·(C1·cos(ω1 t) + C2·sin(ω1 t))
+            // ẏ = e^(-βt)·[(-β·C1 + C2·ω1)·cos + (-β·C2 - C1·ω1)·sin]
+            let omega1 = ((omega0 * omega0) - (beta * beta)).sqrt();
+            let c1 = x0;
+            let c2 = (beta * x0 + v0) / omega1;
+            let cos = (omega1 * t).cos();
+            let sin = (omega1 * t).sin();
+            envelope * ((-beta * c1 + c2 * omega1) * cos + (-beta * c2 - c1 * omega1) * sin)
+        } else {
+            // Overdamped:
+            // y = to + e^(-βt)·(D1·cosh(ω2 t) + D2·sinh(ω2 t))
+            // ẏ = e^(-βt)·[(-β·D1 + D2·ω2)·cosh + (-β·D2 + D1·ω2)·sinh]
+            let omega2 = ((beta * beta) - (omega0 * omega0)).sqrt();
+            let d1 = x0;
+            let d2 = (beta * x0 + v0) / omega2;
+            let cosh = (omega2 * t).cosh();
+            let sinh = (omega2 * t).sinh();
+            envelope * ((-beta * d1 + d2 * omega2) * cosh + (-beta * d2 + d1 * omega2) * sinh)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -290,5 +367,77 @@ mod tests {
         let duration = spring.duration();
         assert!(duration >= Duration::from_millis(1));
         assert_ne!(duration, Duration::MAX);
+    }
+
+    #[test]
+    fn velocity_at_matches_numerical_derivative_all_regimes() {
+        // (damping_ratio, stiffness, label) — under / critical / over.
+        let cases = [
+            (0.5, 400., "underdamped"),
+            (1.0, 400., "critical"),
+            (1.5, 400., "overdamped"),
+        ];
+
+        for (damping_ratio, stiffness, label) in cases {
+            let spring = Spring {
+                from: 0.,
+                to: 1.,
+                initial_velocity: 2.5,
+                params: SpringParams::new(damping_ratio, stiffness, 0.001),
+            };
+
+            // Sample interior points well clear of t=0 (where both are exact)
+            // and of the long tail.
+            for millis in [5u64, 20, 50, 100, 200] {
+                let t = Duration::from_millis(millis);
+                let analytical = spring.velocity_at(t);
+
+                // Central finite difference with a tight step.
+                let h = 1e-6;
+                let numerical =
+                    (spring.oscillate(t.as_secs_f64() + h) - spring.oscillate(t.as_secs_f64() - h))
+                        / (2. * h);
+
+                assert!(
+                    (analytical - numerical).abs() < 1e-6,
+                    "{label} @ {millis}ms: analytical={analytical} numerical={numerical} diff={}",
+                    (analytical - numerical).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn velocity_at_t0_equals_initial_velocity() {
+        for (damping_ratio, v0) in [(0.6, 3.), (1.0, -4.), (2.0, 7.5)] {
+            let spring = Spring {
+                from: 10.,
+                to: 0.,
+                initial_velocity: v0,
+                params: SpringParams::new(damping_ratio, 500., 0.001),
+            };
+            let v = spring.velocity_at(Duration::ZERO);
+            assert!(
+                (v - v0).abs() < 1e-9,
+                "damping_ratio={damping_ratio}: velocity_at(0)={v}, want {v0}"
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_initial_velocity_bounds_overdamped_kick() {
+        let params = SpringParams::new(2.0, 300., 0.001);
+        let huge = 1e9;
+        let clamped = Spring::clamp_initial_velocity(0., 100., huge, params);
+        assert!(clamped.is_finite());
+        assert!(clamped < huge);
+        assert!(clamped > 0.);
+
+        // Underdamped: no clamp.
+        let under = SpringParams::new(0.5, 300., 0.001);
+        assert_eq!(
+            Spring::clamp_initial_velocity(0., 100., huge, under),
+            huge
+        );
     }
 }

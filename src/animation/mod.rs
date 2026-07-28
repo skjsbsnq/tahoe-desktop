@@ -58,6 +58,8 @@ impl Animation {
         config: niri_config::Animation,
     ) -> Self {
         // Scale the velocity by rate to keep the touchpad gestures feeling right.
+        // Callers pass real-time velocity (units per wall-clock second); spring
+        // time advances at `clock.rate()`, so convert to animation-time units.
         let initial_velocity = initial_velocity / clock.rate().max(0.001);
 
         let mut rv = Self::ease(clock, from, to, initial_velocity, 0, Curve::EaseOutCubic);
@@ -83,11 +85,17 @@ impl Animation {
         match config.kind {
             niri_config::animations::Kind::Spring(p) => {
                 let params = SpringParams::new(p.damping_ratio, f64::from(p.stiffness), p.epsilon);
+                let initial_velocity = Spring::clamp_initial_velocity(
+                    self.from,
+                    self.to,
+                    self.initial_velocity,
+                    params,
+                );
 
                 let spring = Spring {
                     from: self.from,
                     to: self.to,
-                    initial_velocity: self.initial_velocity,
+                    initial_velocity,
                     params,
                 };
                 *self = Self::spring(self.clock.clone(), spring);
@@ -108,6 +116,10 @@ impl Animation {
     }
 
     /// Restarts the animation using the previous config.
+    ///
+    /// `initial_velocity` is in real-time units (value per wall-clock second),
+    /// matching [`Self::velocity`]. Pass the previous animation's velocity to
+    /// preserve C1 continuity across retargets.
     pub fn restarted(&self, from: f64, to: f64, initial_velocity: f64) -> Self {
         if self.is_off {
             return self.clone();
@@ -126,6 +138,8 @@ impl Animation {
                 curve,
             ),
             Kind::Spring(spring) => {
+                let initial_velocity =
+                    Spring::clamp_initial_velocity(from, to, initial_velocity, spring.params);
                 let spring = Spring {
                     from,
                     to,
@@ -135,7 +149,7 @@ impl Animation {
                 Self::spring(self.clock.clone(), spring)
             }
             Kind::Deceleration {
-                initial_velocity,
+                initial_velocity: _,
                 deceleration_rate,
             } => {
                 let threshold = 0.001; // FIXME
@@ -175,17 +189,27 @@ impl Animation {
         }
     }
 
-    pub fn spring(clock: Clock, spring: Spring) -> Self {
+    pub fn spring(clock: Clock, mut spring: Spring) -> Self {
         let _span = tracy_client::span!("Animation::spring");
+
+        spring.initial_velocity = Spring::clamp_initial_velocity(
+            spring.from,
+            spring.to,
+            spring.initial_velocity,
+            spring.params,
+        );
 
         let duration = spring.duration();
         let clamped_duration = spring.clamped_duration().unwrap_or(duration);
+        let from = spring.from;
+        let to = spring.to;
+        let initial_velocity = spring.initial_velocity;
         let kind = Kind::Spring(spring);
 
         Self {
-            from: spring.from,
-            to: spring.to,
-            initial_velocity: spring.initial_velocity,
+            from,
+            to,
+            initial_velocity,
             is_off: false,
             duration,
             clamped_duration,
@@ -303,6 +327,66 @@ impl Animation {
 
     pub fn value(&self) -> f64 {
         self.value_at(self.clock.now())
+    }
+
+    /// Current velocity in real-time units (value per wall-clock second).
+    ///
+    /// Spring uses the closed-form derivative; easing and deceleration use a
+    /// 1 ms finite difference. The return value is multiplied back by
+    /// `clock.rate()` so it matches the real-time velocity that
+    /// [`Self::new`] / [`Self::restarted`] expect as `initial_velocity`
+    /// (those divide by rate on the way in — without the multiply, slow-mo
+    /// debugging would double-scale).
+    pub fn velocity(&self) -> f64 {
+        self.velocity_at(self.clock.now())
+    }
+
+    /// Velocity at an absolute clock time. See [`Self::velocity`].
+    pub fn velocity_at(&self, at: Duration) -> f64 {
+        if self.is_off || self.clock.should_complete_instantly() {
+            return 0.;
+        }
+
+        // Frozen clock (rate 0): wall-clock time does not advance, so the
+        // real-time velocity is zero. (Animation-time derivative still exists
+        // internally; callers under a frozen clock should not hand off via
+        // velocity() → restarted.)
+        let rate = self.clock.rate();
+        if rate <= 0. {
+            return 0.;
+        }
+
+        // Not yet started, or fully elapsed → settled at rest.
+        // At exactly `start_time` we still report the initial velocity so a
+        // just-restarted animation hands off C1-continuously.
+        if at < self.start_time || at >= self.start_time + self.duration {
+            return 0.;
+        }
+
+        let anim_velocity = match self.kind {
+            Kind::Spring(spring) => {
+                let passed = at.saturating_sub(self.start_time);
+                spring.velocity_at(passed)
+            }
+            Kind::Easing { .. } | Kind::Deceleration { .. } => {
+                // 1 ms finite difference in animation time.
+                let dt = Duration::from_millis(1);
+                let end = self.start_time + self.duration;
+                let t0 = at.saturating_sub(dt).max(self.start_time);
+                let t1 = at.saturating_add(dt).min(end);
+                let denom = t1.saturating_sub(t0).as_secs_f64();
+                if denom <= f64::EPSILON {
+                    0.
+                } else {
+                    (self.value_at(t1) - self.value_at(t0)) / denom
+                }
+            }
+        };
+
+        // Convert animation-time velocity → real-time velocity.
+        // Symmetric with new/restarted which divide by rate.max(0.001); here
+        // rate is already > 0 from the early return above.
+        anim_velocity * rate
     }
 
     /// Returns a value that stops at the target value after first reaching it.
@@ -475,5 +559,170 @@ mod tests {
             - restarted.value_at(Duration::ZERO))
             / sample_time.as_secs_f64();
         assert!((sampled_velocity - -7.).abs() < 0.1);
+    }
+
+    #[test]
+    fn spring_velocity_matches_numerical_derivative() {
+        // Spring::velocity_at is checked vs oscillate at <1e-6 in spring tests.
+        // Here: Animation::velocity_at must equal spring derivative × clock.rate.
+        let clock = Clock::with_time(Duration::ZERO);
+        let animation = Animation::spring(
+            clock.clone(),
+            Spring {
+                from: 0.,
+                to: 200.,
+                initial_velocity: 0.,
+                params: SpringParams::new(0.85, 600., 0.0001),
+            },
+        );
+
+        let Kind::Spring(spring) = animation.kind else {
+            panic!("expected spring");
+        };
+
+        for millis in [10u64, 30, 80, 150] {
+            let at = Duration::from_millis(millis);
+            let got = animation.velocity_at(at);
+            let expect = spring.velocity_at(at) * clock.rate().max(0.001);
+
+            // Also cross-check spring analytical vs value_at central difference.
+            let h = Duration::from_nanos(100);
+            let numerical = (spring.value_at(at + h) - spring.value_at(at.saturating_sub(h)))
+                / (2. * h.as_secs_f64());
+
+            assert!(
+                (got - expect).abs() < 1e-12,
+                "@{millis}ms wrapper={got} expect={expect}"
+            );
+            assert!(
+                (spring.velocity_at(at) - numerical).abs() < 1e-6,
+                "@{millis}ms analytical={} numerical={numerical}",
+                spring.velocity_at(at)
+            );
+        }
+    }
+
+    #[test]
+    fn velocity_scales_with_clock_rate_no_double_scale() {
+        // Build two identical springs on clocks at different rates. After the
+        // same *animation* progress, the real-time velocity reported at rate r
+        // must equal rate-1 velocity × r (velocity() multiplies rate back out
+        // so callers can feed it straight into restarted/new).
+        let mut clock_r1 = Clock::with_time(Duration::ZERO);
+        clock_r1.set_rate(1.0);
+        let anim_r1 = Animation::spring(
+            clock_r1.clone(),
+            Spring {
+                from: 0.,
+                to: 1.,
+                initial_velocity: 0.,
+                params: SpringParams::new(0.8, 500., 0.001),
+            },
+        );
+
+        let mut clock_r05 = Clock::with_time(Duration::ZERO);
+        clock_r05.set_rate(0.5);
+        // Same spring numbers; animation-time derivative is identical when the
+        // spring itself is identical. velocity() then × rate.
+        let anim_r05 = Animation::spring(
+            clock_r05.clone(),
+            Spring {
+                from: 0.,
+                to: 1.,
+                initial_velocity: 0.,
+                params: SpringParams::new(0.8, 500., 0.001),
+            },
+        );
+
+        // Advance both clocks so their *adjusted* now equals 100ms of spring
+        // time: rate 1 → unadjusted 100ms; rate 0.5 → unadjusted 200ms.
+        clock_r1.set_unadjusted(Duration::from_millis(100));
+        clock_r05.set_unadjusted(Duration::from_millis(200));
+
+        assert_eq!(clock_r1.now(), Duration::from_millis(100));
+        assert_eq!(clock_r05.now(), Duration::from_millis(100));
+
+        let v1 = anim_r1.velocity();
+        let v05 = anim_r05.velocity();
+
+        // Real-time velocity at half rate is half (spring progresses half as
+        // fast in wall time). Must NOT be quartered (double-scale bug).
+        assert!(
+            (v05 - 0.5 * v1).abs() < 1e-9,
+            "rate scaling broken: v1={v1} v05={v05} (want 0.5*v1)"
+        );
+        assert!(v1.abs() > 1e-6, "spring should be moving at 100ms");
+    }
+
+    #[test]
+    fn velocity_round_trips_through_restarted() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let anim = Animation::spring(
+            clock.clone(),
+            Spring {
+                from: 0.,
+                to: 100.,
+                initial_velocity: 0.,
+                params: SpringParams::new(0.9, 700., 0.0005),
+            },
+        );
+
+        clock.set_unadjusted(Duration::from_millis(80));
+        let before = anim.value();
+        let vel = anim.velocity();
+        assert!(vel.abs() > 1e-3, "expected nonzero mid-flight velocity");
+
+        let restarted = anim.restarted(before, 50., vel);
+
+        // At the restart instant, velocity() must equal the handed-off velocity
+        // (acceptance: restart 前后速度差 < 1%).
+        let handed = restarted.velocity_at(restarted.start_time());
+        assert!(
+            (handed - vel).abs() / vel.abs().max(1.) < 0.01,
+            "velocity handoff: handed={handed} want≈{vel}"
+        );
+        // Storage is animation-time units (= real-time / rate); rate is 1 here.
+        assert!((restarted.initial_velocity - vel / clock.rate().max(0.001)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn new_and_restarted_rate_divide_round_trips() {
+        // Exercise the divide-on-input path (Animation::new / restarted) at
+        // rate ≠ 1, complementing the bare-spring multiply-out test.
+        let mut clock = Clock::with_time(Duration::ZERO);
+        clock.set_rate(0.5);
+
+        let config = niri_config::Animation {
+            off: false,
+            kind: niri_config::animations::Kind::Spring(niri_config::animations::SpringParams {
+                damping_ratio: 0.85,
+                stiffness: 600,
+                epsilon: 0.0001,
+            }),
+        };
+
+        // Pass real-time velocity 10; internally stored as 10/0.5 = 20.
+        let anim = Animation::new(clock.clone(), 0., 100., 10., config);
+        assert!((anim.initial_velocity - 20.).abs() < 1e-9);
+        // velocity() at t=0 multiplies rate back → 20 * 0.5 = 10.
+        assert!((anim.velocity_at(anim.start_time()) - 10.).abs() < 1e-9);
+
+        let restarted = anim.restarted(40., 0., 10.);
+        assert!((restarted.initial_velocity - 20.).abs() < 1e-9);
+        assert!((restarted.velocity_at(restarted.start_time()) - 10.).abs() < 1e-9);
+    }
+
+    #[test]
+    fn easing_velocity_finite_difference() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let anim = Animation::ease(clock.clone(), 0., 100., 0., 200, Curve::Linear);
+
+        clock.set_unadjusted(Duration::from_millis(50));
+        // Linear 0→100 over 200ms → 500 units/s.
+        let v = anim.velocity();
+        assert!(
+            (v - 500.).abs() < 1.0,
+            "linear easing velocity want≈500 got {v}"
+        );
     }
 }
