@@ -435,9 +435,10 @@ pub fn on_surface_commit(state: &mut State, surface: &WlSurface) {
                 // Geometry-healable rejections (a region briefly exceeding the
                 // not-yet-resized buffer during an animated grow) keep the
                 // dirty flag so the commit attaching the caught-up buffer
-                // revalidates the same pending set; the previously committed
-                // entries were carried over above so nothing flickers while
-                // waiting.
+                // revalidates the same pending set; overflowing entries are
+                // clamped to the current surface (or carried over when the
+                // clamp itself overflows the budget) so nothing flickers
+                // while waiting.
                 guard.pending_dirty = !complete;
                 if !complete {
                     debug!(
@@ -717,18 +718,22 @@ fn validate_regions(
 /// re-sends an unchanged region, so [`on_surface_commit`] keeps
 /// `pending_dirty` set and the commit attaching the caught-up buffer
 /// revalidates the same pending set.
-/// While waiting, the previously committed entry for that id is carried over
-/// (when it still fits) so the panel keeps its old glass — and a pending
-/// region-morph keeps its old-rect anchor — instead of flashing through the
-/// fallback path.
+/// While waiting, the overflowing region is committed clamped to the current
+/// surface so the glass tracks the growing buffer edge frame by frame (no
+/// glassless band on the freshly revealed rows) — a pending region-morph
+/// keeps an anchor under the same id, and the panel never flashes through the
+/// fallback path. If the clamp itself exceeds the residual area budget, the
+/// previously committed entry for that id is carried over instead (when it
+/// still fits), so a multi-region panel under a tight area budget keeps its
+/// old glass rather than dropping the fitting tail.
 ///
-/// Since T-17 the shell commits the region and its matching content buffer in
+/// T-17 made the shell commit the region and its matching content buffer in
 /// one atomic `wl_surface.commit` (quickshell `commitGlassIfIdle` defers the
-/// explicit region/transform commit to the render-thread buffer commit), so
-/// this window no longer opens in normal operation; the carry-over is retained
-/// as a dormant safety net. T-18 reverted the compositor-side grow clamp
-/// (`0faa78bd`, pinned in main-repo `42039bb`) that tracked the buffer edge
-/// while this window was still live.
+/// explicit region/transform commit to the render-thread buffer commit), but
+/// that guard only fires once a render cycle's `UpdateRequest` has been
+/// delivered; a `Behavior on height`-driven region update can run its polish
+/// before that, so the window still opens for surfaces like the clipboard
+/// popup. The clamp keeps the glass correct for any client regardless.
 ///
 /// Structural rejections (degenerate rects, origins outside the surface, the
 /// area budget) keep the pre-existing drop-and-move-on semantics: growth
@@ -776,10 +781,27 @@ fn validate_regions_for_surface_geo(
                 continue;
             }
 
-            // Geometry-healable overflow (animated grow window): revalidate on
-            // the next commit, and keep showing the previous glass meanwhile.
+            // Geometry-healable overflow (animated grow window): the region
+            // rides ahead of a still-growing buffer. Prefer the on-surface
+            // clamp so the glass tracks the growing buffer edge frame by frame
+            // (no glassless band on the freshly revealed rows); if the clamp
+            // itself exceeds the residual area budget, fall back to carrying
+            // the previously committed entry when it still fits, so the panel
+            // keeps its old glass instead of dropping through to the fallback
+            // path. Either way keep the commit incomplete so the full rect
+            // revalidates once the buffer catches up. A healable clamp or
+            // carry that does not fit the residual budget is skipped without
+            // exhausting the budget — the overflow is healable, not
+            // structural — so a later, genuinely fitting region still commits.
             complete = false;
-            if let Some(prev) = previous.iter().find(|prev| prev.id == region.id) {
+            let clamped = clamped.unwrap();
+            let clamp_area = i64::from(clamped.size.w) * i64::from(clamped.size.h);
+            if total_area.saturating_add(clamp_area) <= surface_area {
+                total_area = total_area.saturating_add(clamp_area);
+                let mut clamped_region = region.clone();
+                clamped_region.rect = clamped;
+                committed.push(clamped_region);
+            } else if let Some(prev) = previous.iter().find(|prev| prev.id == region.id) {
                 if prev.rect.intersection(surface_geo) == Some(prev.rect) {
                     let area = i64::from(prev.rect.size.w) * i64::from(prev.rect.size.h);
                     if total_area.saturating_add(area) <= surface_area {
@@ -1273,49 +1295,45 @@ mod tests {
     fn validation_keeps_only_regions_inside_surface_geometry() {
         let surface_geo = Rectangle::new(Point::new(0, 0), Size::new(100, 40));
         let inside = region(1, 8, 4, 84, 32);
-        let outside = region(2, 90, 4, 20, 32);
+        // Partially outside with origin inside is healable: committed clamped,
+        // flagged incomplete so the full rect revalidates once the surface grows.
+        let overflowing = region(2, 90, 4, 20, 32);
+        let clamped = region(2, 90, 4, 10, 32);
 
         assert_eq!(
-            validate_regions_for_surface_geo(Some(surface_geo), &[inside.clone(), outside], &[]),
-            Some((vec![inside], false))
+            validate_regions_for_surface_geo(Some(surface_geo), &[inside.clone(), overflowing], &[]),
+            Some((vec![inside, clamped], false))
         );
     }
 
-    /// Region ahead of buffer: the region rides a commit whose buffer still
-    /// has the old (smaller) size and is rejected. The rejection must be
-    /// reported as incomplete so on_surface_commit keeps `pending_dirty` set —
-    /// the commit attaching the caught-up buffer then revalidates the same
-    /// pending set and the region materializes without any client
-    /// retransmission.
+    /// Region ahead of buffer during an animated grow: the pending target is
+    /// clamped to the current surface so the glass tracks the buffer edge
+    /// frame by frame (no glassless band on the newly revealed rows), and the
+    /// commit is flagged incomplete so the full rect revalidates once the
+    /// buffer catches up — without any client retransmission.
     #[test]
-    fn oversized_region_revalidates_once_surface_geometry_catches_up() {
+    fn oversized_region_clamps_and_revalidates_once_surface_geometry_catches_up() {
         let grown = region(1, 0, 0, 360, 480);
 
-        let previous = region(1, 0, 0, 360, 440);
-
         let small_geo = Rectangle::new(Point::new(0, 0), Size::new(360, 440));
+        let small_clamped = region(1, 0, 0, 360, 440);
         assert_eq!(
             validate_regions_for_surface_geo(Some(small_geo), &[grown.clone()], &[]),
-            Some((Vec::new(), false)),
-            "region beyond the current buffer must be flagged incomplete"
+            Some((vec![small_clamped], false)),
+            "overflowing region must clamp to the current surface and stay dirty"
         );
+
+        let mid_geo = Rectangle::new(Point::new(0, 0), Size::new(360, 460));
+        let mid_clamped = region(1, 0, 0, 360, 460);
         assert_eq!(
-            validate_regions_for_surface_geo(
-                Some(small_geo),
-                &[grown.clone()],
-                std::slice::from_ref(&previous),
-            ),
-            Some((vec![previous.clone()], false)),
-            "the previously committed entry must be carried over while waiting"
+            validate_regions_for_surface_geo(Some(mid_geo), &[grown.clone()], &[]),
+            Some((vec![mid_clamped], false)),
+            "as the buffer grows mid-animation the clamp must track it"
         );
 
         let caught_up_geo = Rectangle::new(Point::new(0, 0), Size::new(360, 480));
         assert_eq!(
-            validate_regions_for_surface_geo(
-                Some(caught_up_geo),
-                &[grown.clone()],
-                std::slice::from_ref(&previous),
-            ),
+            validate_regions_for_surface_geo(Some(caught_up_geo), &[grown.clone()], &[]),
             Some((vec![grown], true)),
             "the same pending set must fully commit once the buffer catches up"
         );
@@ -1415,20 +1433,21 @@ mod tests {
         );
     }
 
-    /// A healable overflow whose carried previous entry fits the surface but
-    /// not the residual area budget is skipped without consuming the budget, so
-    /// a later, genuinely fitting region still commits. (The clamp variant set
-    /// `budget_exhausted` when its clamp overflowed and dropped the fitting
-    /// tail; carry-previous accounts by actual committed area, not by overflow.)
+    /// A healable overflow whose clamp (and carried previous entry) fit the
+    /// surface but not the residual area budget is skipped without consuming
+    /// the budget, so a later, genuinely fitting region still commits. The
+    /// healable path accounts by actual committed area (clamp preferred, then
+    /// previous fallback) — a clamp that overflows the residual budget never
+    /// sets `budget_exhausted`, so the fitting tail survives.
     #[test]
-    fn skipped_healable_carry_does_not_exhaust_budget_for_later_fitting_region() {
+    fn skipped_healable_overflow_does_not_exhaust_budget_for_later_fitting_region() {
         let surface_geo = Rectangle::new(Point::new(0, 0), Size::new(100, 100));
         // 9900 area, fully inside — committed and consumes most of the budget.
         let base = region(1, 0, 0, 100, 99);
-        // Healable: id 2 overflows the surface (height 200). Its previous entry
-        // is fully inside (40×100) but its area (4000) exceeds the residual
-        // budget after `base` (100), so the carry is skipped — and must NOT set
-        // `budget_exhausted`.
+        // Healable: id 2 overflows the surface (height 200). Its on-surface
+        // clamp (40×100) and its previous entry (40×100) both exceed the
+        // residual budget after `base` (100), so both are skipped — and must
+        // NOT set `budget_exhausted`.
         let grown = region(2, 0, 0, 40, 200);
         let previous = region(2, 0, 0, 40, 100);
         // A later, fitting structural region must still commit (9900 + 100).
@@ -1448,7 +1467,7 @@ mod tests {
         assert_eq!(
             committed,
             vec![base, fitting],
-            "skipped carry must not exhaust the budget; the later fitting region still commits"
+            "skipped healable overflow must not exhaust the budget; the later fitting region still commits"
         );
     }
 
