@@ -3871,20 +3871,6 @@ impl<W: LayoutElement> Layout<W> {
         false
     }
 
-    /// Retarget an active minimize/restore Genie's dock endpoint for `id` (the
-    /// dock reflowed and re-reported its icon rect). Dispatches to the workspace
-    /// owning `id`, mirroring `apply_lifecycle`. Returns whether an active
-    /// animation was retargeted (false ⇒ no animation running, or `id` not
-    /// found) — a no-op, not an error.
-    pub fn retarget_minimize_anchor(&mut self, id: &W::Id, rect: &MinimizeRect) -> bool {
-        for ws in self.workspaces_mut() {
-            if ws.has_window(id) {
-                return ws.retarget_minimize_anchor(id, rect);
-            }
-        }
-        false
-    }
-
     /// Snapshot-backed lifecycle transition. Only called from the compositor lifecycle command
     /// after anchor resolution and xray preparation.
     pub(crate) fn apply_lifecycle_with_snapshot(

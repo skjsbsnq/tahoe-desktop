@@ -1746,18 +1746,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         true
     }
 
-    /// Retarget an active minimize/restore Genie's dock endpoint (the dock
-    /// reflowed and re-reported its icon rect). No-op when no animation is
-    /// active for `window`; the controller's retarget is keyed by id. Mirrors
-    /// the anchor consumption used at minimize/restore start.
-    pub fn retarget_minimize_anchor(
-        &mut self,
-        window: &W::Id,
-        rect: Option<super::coords::OutputLocalRect>,
-    ) -> bool {
-        self.minimize_restore.retarget(window, rect)
-    }
-
     pub fn minimize_with_snapshot(
         &mut self,
         renderer: &mut GlesRenderer,
