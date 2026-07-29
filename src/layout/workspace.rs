@@ -807,6 +807,22 @@ impl<W: LayoutElement> Workspace<W> {
         changed
     }
 
+    /// Retarget an active minimize/restore Genie's dock endpoint on this
+    /// workspace (the dock reflowed and re-reported its icon rect). Applies the
+    /// same current-output filter as `minimize_with_snapshot`/`restore_with_snapshot`:
+    /// a hint from a different output is in a foreign coordinate space and is
+    /// dropped. No-op when no animation is active for `id`.
+    pub fn retarget_minimize_anchor(&mut self, id: &W::Id, rect: &MinimizeRect) -> bool {
+        let rect = match self.current_output() {
+            Some(output) if &rect.output == output => Some(rect.rect),
+            _ => None,
+        };
+        if self.floating.has_window(id) {
+            return self.floating.retarget_minimize_anchor(id, rect);
+        }
+        self.scrolling.retarget_minimize_anchor(id, rect)
+    }
+
     pub fn minimize_with_snapshot(
         &mut self,
         renderer: &mut GlesRenderer,

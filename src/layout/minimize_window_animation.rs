@@ -297,6 +297,15 @@ impl MinimizeWindowAnimation {
         self.target_rect = target_rect;
     }
 
+    /// Retarget the Genie dock endpoint mid-flight. `render_genie` re-reads
+    /// `target_rect` and recomputes `genie_area` every frame, so this retargets
+    /// smoothly with no animation restart — the same field `reverse_to_*`
+    /// already mutate mid-flight. Pass `None` to drop the dock endpoint (the
+    /// genie falls back to a plain fade). No lease/direction/snapshot change.
+    pub fn retarget(&mut self, target_rect: Option<OutputLocalRectF>) {
+        self.target_rect = target_rect;
+    }
+
     /// Output-local window origin stored for Genie (test/observation only).
     #[cfg(test)]
     #[allow(dead_code)]
