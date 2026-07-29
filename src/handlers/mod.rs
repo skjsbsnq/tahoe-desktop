@@ -673,10 +673,16 @@ impl ForeignToplevelHandler for State {
         // (invalid_rectangle) before this handler runs. Treat them as programmer bugs.
         debug_assert!(width >= 0 && height >= 0);
 
-        let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) else {
+        let Some((mapped, window_output)) = self.niri.layout.find_window_and_output(&wl_surface) else {
             return;
         };
         let mapped_id = mapped.id();
+        // T-20: clone the W::Id (smithay Window) for retarget, which runs after
+        // the mutable hint-storing block below releases the layout borrow.
+        let window = mapped.window.clone();
+        // The Genie renders on the window's output; retarget redraws it so the
+        // new dock endpoint repaints next frame.
+        let window_output = window_output.cloned();
 
         // XML: width=height=0 removes the already-set rectangle.
         if width == 0 && height == 0 {
@@ -723,6 +729,11 @@ impl ForeignToplevelHandler for State {
             }
         });
 
+        // T-20: a Resolved hint retargets an in-flight minimize/restore Genie to
+        // the new dock endpoint (the shelf reflowed). Collected here and applied
+        // after the block below releases its mutable layout borrow.
+        let mut retarget: Option<crate::layout::MinimizeRect> = None;
+
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&wl_surface) {
             let generation = mapped.next_foreign_toplevel_rect_generation();
             match outcome {
@@ -748,6 +759,11 @@ impl ForeignToplevelHandler for State {
                         height = rect.size().h,
                         "stored foreign-toplevel last-hint Resolved (output-local)"
                     );
+                    // T-20: retarget an in-flight minimize/restore Genie to this
+                    // new dock endpoint (the shelf reflowed). No-op when no
+                    // animation is active; the stored hint remains the source of
+                    // truth for the next minimize/restore.
+                    retarget = Some(crate::layout::MinimizeRect { output, rect });
                 }
                 Some(ResolveOutcome::Unresolved(reason)) => {
                     mapped.set_foreign_toplevel_rect_hint(ForeignToplevelRectHint::Unresolved(
@@ -786,6 +802,17 @@ impl ForeignToplevelHandler for State {
                         "stored foreign-toplevel last-hint Unresolved (source not mapped; \
                          replaced prior, did not restore earlier rectangle)"
                     );
+                }
+            }
+        }
+
+        // T-20: apply the retarget now that the hint-storing block released the
+        // layout borrow. Only a Resolved hint sets `retarget`; Unresolved/Clear
+        // leave any active Genie at its prior endpoint, matching anchor semantics.
+        if let Some(rect) = retarget {
+            if self.niri.layout.retarget_minimize_anchor(&window, &rect) {
+                if let Some(output) = &window_output {
+                    self.niri.queue_redraw(output);
                 }
             }
         }

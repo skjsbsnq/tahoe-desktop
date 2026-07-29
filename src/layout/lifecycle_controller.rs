@@ -172,6 +172,20 @@ impl<Id: Clone + PartialEq + Debug> MinimizeRestoreController<Id> {
         Some(event)
     }
 
+    /// Retarget the dock endpoint of an active minimize/restore Genie for `id`
+    /// (the dock reflowed and re-reported its icon rect). The animation keeps
+    /// its direction, snapshot/texture and visibility lease; only the endpoint
+    /// moves, and `render_genie` picks the new `target_rect` up next frame — no
+    /// restart. Returns whether an active entry was retargeted (false ⇒ no-op:
+    /// no animation running for `id`).
+    pub fn retarget(&mut self, id: &Id, target_rect: Option<OutputLocalRect>) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|e| e.id == *id) else {
+            return false;
+        };
+        entry.animation.retarget(target_rect.map(|r| r.to_f64()));
+        true
+    }
+
     /// Start a new minimize animation. Drops any prior entry for `id` (revealing if leased).
     pub fn start_minimize(
         &mut self,

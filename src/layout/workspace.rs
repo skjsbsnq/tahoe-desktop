@@ -807,6 +807,30 @@ impl<W: LayoutElement> Workspace<W> {
         changed
     }
 
+    /// Retarget an active minimize/restore Genie's dock endpoint on this
+    /// workspace (the dock reflowed and re-reported its icon rect). Applies the
+    /// same current-output filter as `minimize_with_snapshot`/`restore_with_snapshot`:
+    /// a hint from a different output is in a foreign coordinate space and is
+    /// dropped. No-op when no animation is active for `id`.
+    ///
+    /// Divergence from the start-time path: at minimize/restore start a
+    /// cross-output hint yields `animation_rect = None` so the Genie is *created*
+    /// with no dock endpoint, whereas here a cross-output hint forwards `None`
+    /// to the controller, which *strips the endpoint from an already-running*
+    /// Genie. The endpoint was in this workspace's coordinate space at start, so
+    /// stripping it once the dock reports a foreign-output rect is the intended
+    /// parity (the old coordinates are now meaningless), not a regression.
+    pub fn retarget_minimize_anchor(&mut self, id: &W::Id, rect: &MinimizeRect) -> bool {
+        let rect = match self.current_output() {
+            Some(output) if &rect.output == output => Some(rect.rect),
+            _ => None,
+        };
+        if self.floating.has_window(id) {
+            return self.floating.retarget_minimize_anchor(id, rect);
+        }
+        self.scrolling.retarget_minimize_anchor(id, rect)
+    }
+
     pub fn minimize_with_snapshot(
         &mut self,
         renderer: &mut GlesRenderer,
