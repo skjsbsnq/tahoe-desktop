@@ -1471,6 +1471,40 @@ mod tests {
         );
     }
 
+    /// A healable overflow whose clamp FITS the residual area budget commits
+    /// the clamped rect and must not set `budget_exhausted`, so a later,
+    /// genuinely fitting region still commits using the leftover. This locks
+    /// the clamp-preferred path against the T-18 regression the 0faa78bd clamp
+    /// had: that variant set `budget_exhausted` on clamp overflow and wrongly
+    /// dropped the fitting tail. The current clamp branch accounts by actual
+    /// committed area only, so the tail survives.
+    #[test]
+    fn healable_overflow_clamp_fits_keeps_budget_for_later_fitting_region() {
+        let surface_geo = Rectangle::new(Point::new(0, 0), Size::new(200, 100));
+        // Healable: id 1 target 100×120 overflows the 100-tall surface; its
+        // on-surface clamp (100×100 = 10000) fits the budget, so it commits
+        // clamped and must NOT exhaust the remaining budget.
+        let growing = region(1, 0, 0, 100, 120);
+        let clamped = region(1, 0, 0, 100, 100);
+        // A later, fully-inside structural region (80×100 = 8000) fits the
+        // leftover budget (20000 − 10000 = 10000), so it must still commit.
+        let fitting = region(2, 110, 0, 80, 100);
+
+        let (committed, complete) =
+            validate_regions_for_surface_geo(Some(surface_geo), &[growing, fitting.clone()], &[])
+                .unwrap();
+
+        assert!(
+            !complete,
+            "the healable overflow (id 1) must keep the surface dirty"
+        );
+        assert_eq!(
+            committed,
+            vec![clamped, fitting],
+            "a fitting clamp must not exhaust the budget; the later fitting region still commits"
+        );
+    }
+
     #[test]
     fn equality_preserves_adjacent_protocol_quantization_steps() {
         let mut before = region(1, 0, 0, 100, 40);
