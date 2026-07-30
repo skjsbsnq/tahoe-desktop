@@ -729,8 +729,12 @@ impl ForeignToplevelHandler for State {
             }
         });
 
-        // T-20: a Resolved hint retargets an in-flight minimize/restore Genie to
-        // the new dock endpoint (the shelf reflowed). Collected here and applied
+        // T-20: a Resolved hint retargets an in-flight **restore** Genie to the
+        // new dock endpoint (the shelf reflowed). Minimize locks its takeoff
+        // target — see MinimizeRestoreController::retarget's Restore-only gate —
+        // so a minimize Genie ignores a late set_rectangle (notably the shelf
+        // thumbnail's own REST rect, which shares the toplevel handle with the
+        // dock icon and would otherwise yank it left). Collected here and applied
         // after the block below releases its mutable layout borrow.
         let mut retarget: Option<crate::layout::MinimizeRect> = None;
 
@@ -810,7 +814,17 @@ impl ForeignToplevelHandler for State {
         // layout borrow. Only a Resolved hint sets `retarget`; Unresolved/Clear
         // leave any active Genie at its prior endpoint, matching anchor semantics.
         if let Some(rect) = retarget {
-            if self.niri.layout.retarget_minimize_anchor(&window, &rect) {
+            let hit = self.niri.layout.retarget_minimize_anchor(&window, &rect);
+            debug!(
+                output = rect.output.name(),
+                x = rect.rect.loc().x,
+                y = rect.rect.loc().y,
+                width = rect.rect.size().w,
+                height = rect.rect.size().h,
+                hit,
+                "T-20 retarget applied (hit=true retargeted an in-flight restore Genie; hit=false no active restore animation, or an active minimize Genie is locked to its takeoff target)"
+            );
+            if hit {
                 if let Some(output) = &window_output {
                     self.niri.queue_redraw(output);
                 }

@@ -450,12 +450,18 @@ fn r16_output_target_reuses_stable_binding() {
     );
 }
 
-/// T-20: a `set_rectangle` mid-flight retargets an active minimize Genie to the
-/// new dock endpoint in place — the target field updates and the stable element
-/// Id is unchanged (retarget, not a recreate). Output 1 (1920×1080) with a
-/// Left|Bottom 200×80 dock yields output-local (x, 1000 + y).
+/// T-20: a `set_rectangle` mid-flight does **not** retarget an active minimize
+/// Genie — the minimize target locks to the dock endpoint sampled at
+/// `start_minimize` time for the animation's native duration. The shelf
+/// thumbnail (the `DockMinimizedWindow` delegate created when the window
+/// enters the shelf) shares the toplevel handle with the dock icon and is a
+/// later "last writer wins" publisher; if the minimize Genie followed mid-air
+/// rects it would be yanked to the shelf thumbnail (left) and flicker for the
+/// whole animation. The stable element Id is still unchanged (no recreate).
+/// Restore direction still retargets (see `r16_genie_retarget_updates_active_restore_target`).
+/// Output 1 (1920×1080) with a Left|Bottom 200×80 dock yields output-local (x, 1000 + y).
 #[test]
-fn r16_genie_retarget_updates_active_minimize_target() {
+fn r16_genie_retarget_minimize_locks_takeoff_target() {
     let mut f = Fixture::with_config(linear_lifecycle_config());
     f.niri_state().backend.headless().add_renderer().unwrap();
     f.add_output(1, (1920, 1080));
@@ -515,20 +521,16 @@ fn r16_genie_retarget_updates_active_minimize_target() {
                 found_target = anim.test_output_local_target();
             });
         (
-            found_id.expect("retargeted Genie still active"),
-            found_target.expect("retargeted Genie keeps a dock target"),
+            found_id.expect("active minimize Genie still running"),
+            found_target.expect("minimize Genie keeps its dock target"),
         )
     };
     assert_eq!(
         target_b,
-        Rectangle::new(Point::from((200., 1040.)), Size::from((48., 48.))),
-        "Genie retargets to the new dock rect B"
+        target_a,
+        "minimize Genie locks its takeoff dock rect A; mid-flight set_rectangle does not retarget it"
     );
-    assert_ne!(
-        target_b, target_a,
-        "retarget must actually move the endpoint"
-    );
-    assert_eq!(id_after, id_before, "retarget is in-place, not a recreate");
+    assert_eq!(id_after, id_before, "entry is unchanged (no recreate)");
 }
 
 /// T-20: a `set_rectangle` with no active animation retargets nothing — no

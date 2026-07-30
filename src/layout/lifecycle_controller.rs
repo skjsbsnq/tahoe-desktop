@@ -172,14 +172,29 @@ impl<Id: Clone + PartialEq + Debug> MinimizeRestoreController<Id> {
         Some(event)
     }
 
-    /// Retarget the dock endpoint of an active minimize/restore Genie for `id`
-    /// (the dock reflowed and re-reported its icon rect). The animation keeps
-    /// its direction, snapshot/texture and visibility lease; only the endpoint
+    /// Retarget the dock endpoint of an active **restore** Genie for `id` (the
+    /// dock reflowed and re-reported its icon rect). The animation keeps its
+    /// direction, snapshot/texture and visibility lease; only the endpoint
     /// moves, and `render_genie` picks the new `target_rect` up next frame — no
-    /// restart. Returns whether an active entry was retargeted (false ⇒ no-op:
-    /// no animation running for `id`).
+    /// restart. Returns whether a restore entry was retargeted (false ⇒ no-op:
+    /// no restore animation running for `id`).
+    ///
+    /// Only the restore direction is retargeted. The minimize Genie's target is
+    /// the dock icon sampled at `start_minimize` time; a later-reported rect
+    /// (notably the shelf thumbnail's own REST rect, published when the
+    /// minimized window's `DockMinimizedWindow` delegate is created) must not
+    /// pull it away — the shelf thumbnail shares the toplevel handle with the
+    /// dock icon ("last writer wins"), so without this gate the minimize Genie
+    /// would be retargeted to the shelf thumbnail (left) and flicker between
+    /// the dock icon and the thumbnail for the whole animation. The minimize
+    /// target therefore locks to its takeoff endpoint for the animation's
+    /// native duration.
     pub fn retarget(&mut self, id: &Id, target_rect: Option<OutputLocalRect>) -> bool {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.id == *id) else {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == *id && e.direction == LifecycleAnimDirection::Restore)
+        else {
             return false;
         };
         entry.animation.retarget(target_rect.map(|r| r.to_f64()));
