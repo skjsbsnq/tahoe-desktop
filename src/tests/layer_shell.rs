@@ -1357,3 +1357,74 @@ fn layer_close_anim(duration_ms: u32, curve: Curve) -> LayerCloseAnim {
         ..Default::default()
     }
 }
+
+#[test]
+fn on_demand_layer_without_exclusive_zone_takes_focus_on_map() {
+    // Upstream contract (niri#641): newly mapped on-demand surfaces get
+    // keyboard focus, which popups/launchers rely on.
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let layer = f.client(id).create_layer(None, Layer::Top, "");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        anchor: Some(Anchor::Left | Anchor::Right | Anchor::Top),
+        size: Some((0, 50)),
+        kb_interactivity: Some(KeyboardInteractivity::OnDemand),
+        ..Default::default()
+    });
+    layer.commit();
+    f.double_roundtrip(id);
+
+    let layer = f.client(id).layer(&surface);
+    layer.attach_new_buffer();
+    layer.set_size(100, 100);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    assert!(
+        matches!(
+            f.niri().keyboard_focus,
+            crate::niri::KeyboardFocus::LayerShell { .. }
+        ),
+        "on-demand layer without exclusive zone must take keyboard focus on map"
+    );
+}
+
+#[test]
+fn on_demand_layer_with_exclusive_zone_does_not_steal_focus_on_map() {
+    // TAHOE (T-29 / F-1): persistent panels (positive exclusive zone, e.g.
+    // the TopBar) must not auto-steal keyboard focus on every (re)map —
+    // session start and every fullscreen exit would grab focus from the
+    // focused window. Popup auto-focus and click-to-focus are unaffected.
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let layer = f.client(id).create_layer(None, Layer::Top, "");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        anchor: Some(Anchor::Left | Anchor::Right | Anchor::Top),
+        size: Some((0, 50)),
+        kb_interactivity: Some(KeyboardInteractivity::OnDemand),
+        exclusive_zone: Some(40),
+        ..Default::default()
+    });
+    layer.commit();
+    f.double_roundtrip(id);
+
+    let layer = f.client(id).layer(&surface);
+    layer.attach_new_buffer();
+    layer.set_size(100, 100);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    assert!(
+        matches!(
+            f.niri().keyboard_focus,
+            crate::niri::KeyboardFocus::Layout { .. }
+        ),
+        "on-demand panel with exclusive zone must not steal keyboard focus on map"
+    );
+}

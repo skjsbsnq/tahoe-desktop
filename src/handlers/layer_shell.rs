@@ -217,7 +217,19 @@ impl State {
             // https://github.com/niri-wm/niri/issues/641
             let on_demand = layer.cached_state().keyboard_interactivity
                 == wlr_layer::KeyboardInteractivity::OnDemand;
-            if was_unmapped && on_demand {
+            // TAHOE (T-29 / F-1): persistent panels (positive exclusive zone,
+            // e.g. the TopBar) must not auto-steal keyboard focus on every
+            // (re)map. The TopBar remaps around fullscreen for direct scanout,
+            // so auto-focus would grab keys from the focused window at session
+            // start and on every fullscreen exit. Popups/launchers do not
+            // reserve an exclusive zone, so their auto-focus on open is
+            // preserved; click-to-focus still works for panels through
+            // focus_layer_surface_if_on_demand().
+            let is_persistent_panel = matches!(
+                layer.cached_state().exclusive_zone,
+                wlr_layer::ExclusiveZone::Exclusive(_)
+            );
+            if was_unmapped && on_demand && !is_persistent_panel {
                 // I guess it'd make sense to check that no higher-layer on-demand surface
                 // has focus, but Smithay's Layer doesn't implement Ord so this would be a
                 // little annoying.
