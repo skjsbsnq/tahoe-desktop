@@ -225,8 +225,9 @@ impl XdgShellHandler for State {
                     self.niri.layer_shell_on_demand_focus = None;
                     self.niri.layout.reset_window_height(Some(&window));
                 }
-                // FIXME: granular.
-                self.niri.queue_redraw_all();
+                // T-31: resize visuals are on the window's output (pointer is on it).
+                let pos = self.niri.seat.get_pointer().unwrap().current_location();
+                self.niri.queue_redraw_output_under(pos);
                 return;
             }
         }
@@ -419,7 +420,14 @@ impl XdgShellHandler for State {
 
             let window = mapped.window.clone();
             self.niri.layout.set_maximized(&window, true);
-            self.niri.queue_redraw_all();
+            // T-31: redraw the outputs the maximize dirtied.
+            let dirty = self.niri.layout.take_dirty_outputs();
+            if !dirty.is_empty() {
+                self.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::outputs(
+                    dirty,
+                    crate::redraw_attribution::RedrawReason::Maximize,
+                ));
+            }
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {
@@ -504,7 +512,14 @@ impl XdgShellHandler for State {
             if !self.niri.layout.snap_window_to_working_area(&window, false) {
                 self.niri.layout.set_maximized(&window, false);
             }
-            self.niri.queue_redraw_all();
+            // T-31: redraw the outputs the unmaximize dirtied.
+            let dirty = self.niri.layout.take_dirty_outputs();
+            if !dirty.is_empty() {
+                self.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::outputs(
+                    dirty,
+                    crate::redraw_attribution::RedrawReason::Maximize,
+                ));
+            }
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {

@@ -28,8 +28,9 @@ impl PickWindowGrab {
             .niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
-        // Redraw to update the cursor.
-        state.niri.queue_redraw_all();
+        // Redraw to update the cursor on the output under it.
+        let pos = state.niri.seat.get_pointer().unwrap().current_location();
+        state.niri.queue_redraw_output_under(pos);
     }
 }
 

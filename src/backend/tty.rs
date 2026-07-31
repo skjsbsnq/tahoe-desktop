@@ -737,7 +737,10 @@ impl Tty {
                 niri.notify_activity();
                 niri.monitors_active = true;
                 self.set_monitors_active(true);
-                niri.queue_redraw_all();
+                // Session resume re-arms every output.
+                niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::all(
+                    crate::redraw_attribution::RedrawFallbackReason::GlobalConfig,
+                ));
             }
         }
     }

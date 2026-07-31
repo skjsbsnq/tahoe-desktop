@@ -432,8 +432,9 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                     .niri
                     .cursor_manager
                     .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
-                // Redraw to update the cursor.
-                state.niri.queue_redraw_all();
+                // Redraw to update the cursor on the output under it.
+                let pos = state.niri.seat.get_pointer().unwrap().current_location();
+                state.niri.queue_redraw_output_under(pos);
             });
             let result = rx.recv().await;
             let id = result.map_err(|_| String::from("error getting picked window info"))?;

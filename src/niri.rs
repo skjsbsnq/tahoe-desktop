@@ -158,7 +158,7 @@ use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::tahoe_glass::TahoeGlassManagerState;
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
-use crate::redraw_attribution::{RedrawAttribution, RedrawReason};
+use crate::redraw_attribution::{RedrawAttribution, RedrawFallbackReason, RedrawReason};
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
@@ -878,6 +878,9 @@ impl State {
     }
 
     pub fn move_cursor(&mut self, location: Point<f64, Logical>) {
+        // T-31: remember where the cursor was so we can redraw both the output it leaves and
+        // the one it lands on.
+        let old_location = self.niri.seat.get_pointer().unwrap().current_location();
         let mut under = match self.niri.pointer_visibility {
             PointerVisibility::Disabled => PointContents::default(),
             _ => self.niri.contents_under(location),
@@ -910,9 +913,8 @@ impl State {
         self.niri.maybe_activate_pointer_constraint();
 
         // We do not show the pointer on programmatic or keyboard movement.
-
-        // FIXME: granular
-        self.niri.queue_redraw_all();
+        self.niri.queue_redraw_output_under(old_location);
+        self.niri.queue_redraw_output_under(location);
     }
 
     /// Moves cursor within the specified rectangle, only adjusting coordinates if needed.
@@ -1018,8 +1020,12 @@ impl State {
             self.maybe_warp_cursor_to_focus();
         }
 
-        // FIXME: granular
-        self.niri.queue_redraw_all();
+        // T-31: drain the outputs the activation dirtied (window output + previous active).
+        let dirty = self.niri.layout.take_dirty_outputs();
+        if !dirty.is_empty() {
+            self.niri
+                .apply_redraw_attribution(RedrawAttribution::outputs(dirty, RedrawReason::Activate));
+        }
     }
 
     pub fn confirm_mru(&mut self) {
@@ -1084,10 +1090,8 @@ impl State {
         pointer.frame(self);
 
         // Pointer motion from a surface to nothing triggers a cursor change to default, which
-        // means we may need to redraw.
-
-        // FIXME: granular
-        self.niri.queue_redraw_all();
+        // means we may need to redraw. Only the output under the pointer shows the cursor.
+        self.niri.queue_redraw_output_under(location);
     }
 
     pub fn update_pointer_contents(&mut self) -> bool {
@@ -1401,8 +1405,41 @@ impl State {
             self.niri.keyboard_focus.clone_from(&focus);
             keyboard.set_focus(self, focus.into_surface(), SERIAL_COUNTER.next_serial());
 
-            // FIXME: can be more granular.
-            self.niri.queue_redraw_all();
+            // T-31: redraw only the output that displays the new keyboard focus; global UI
+            // focus targets keep an auditable all-outputs fallback.
+            let dirty = self.niri.layout.take_dirty_outputs();
+            if !dirty.is_empty() {
+                self.niri.apply_redraw_attribution(RedrawAttribution::outputs(
+                    dirty,
+                    RedrawReason::Activate,
+                ));
+            } else {
+                let output = match &self.niri.keyboard_focus {
+                    KeyboardFocus::Layout { surface: Some(surface) }
+                    | KeyboardFocus::LayerShell { surface } => {
+                        self.niri.output_for_root(surface).cloned()
+                    }
+                    KeyboardFocus::LockScreen { surface: Some(surface) } => {
+                        self.niri.output_for_root(surface).cloned()
+                    }
+                    KeyboardFocus::Layout { surface: None }
+                    | KeyboardFocus::LockScreen { surface: None } => {
+                        self.niri.layout.active_output().cloned()
+                    }
+                    KeyboardFocus::ScreenshotUi
+                    | KeyboardFocus::ExitConfirmDialog
+                    | KeyboardFocus::Overview
+                    | KeyboardFocus::Mru => {
+                        self.niri.apply_redraw_attribution(RedrawAttribution::all(
+                            RedrawFallbackReason::GlobalUi,
+                        ));
+                        None
+                    }
+                };
+                if let Some(output) = output {
+                    self.niri.queue_redraw(&output);
+                }
+            }
         }
     }
 
@@ -1464,7 +1501,9 @@ impl State {
             Ok(config) => config,
             Err(()) => {
                 self.niri.config_error_notification.show();
-                self.niri.queue_redraw_all();
+                self.niri.apply_redraw_attribution(RedrawAttribution::all(
+                    RedrawFallbackReason::GlobalUi,
+                ));
 
                 #[cfg(feature = "dbus")]
                 self.niri.a11y_announce_config_error();
@@ -1756,7 +1795,8 @@ impl State {
         // global suddenly appearing? Either way, right now it's live-reloaded in a sense that new
         // clients will use the new xdg-decoration setting.
 
-        self.niri.queue_redraw_all();
+        self.niri
+            .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalConfig));
     }
 
     pub fn reload_output_config(&mut self) {
@@ -2041,7 +2081,8 @@ impl State {
         self.niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
-        self.niri.queue_redraw_all();
+        self.niri
+            .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
     }
 
     pub fn handle_pick_color(&mut self, tx: async_channel::Sender<Option<niri_ipc::PickedColor>>) {
@@ -2057,7 +2098,8 @@ impl State {
         self.niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
-        self.niri.queue_redraw_all();
+        self.niri
+            .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
     }
 
     pub fn window_thumbnail(
@@ -2119,7 +2161,8 @@ impl State {
         self.niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
-        self.niri.queue_redraw_all();
+        self.niri
+            .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
     }
 
     pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
@@ -3283,7 +3326,7 @@ impl Niri {
         if self.screenshot_ui.close() {
             self.cursor_manager
                 .set_cursor_image(CursorImageStatus::default_named());
-            self.queue_redraw_all();
+            self.apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
         }
 
         if self.window_mru_ui.output() == Some(output) {
@@ -3333,7 +3376,9 @@ impl Niri {
                 self.screenshot_ui.close();
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
-                self.queue_redraw_all();
+                self.apply_redraw_attribution(RedrawAttribution::all(
+                    RedrawFallbackReason::GlobalUi,
+                ));
                 return;
             }
         }
@@ -3367,7 +3412,8 @@ impl Niri {
         self.monitors_active = true;
         backend.set_monitors_active(true);
 
-        self.queue_redraw_all();
+        // Monitor power-on affects every output.
+        self.apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalConfig));
     }
 
     pub fn output_under(&self, pos: Point<f64, Logical>) -> Option<(&Output, Point<f64, Logical>)> {
@@ -3381,6 +3427,61 @@ impl Niri {
                 .to_f64();
 
         Some((output, pos_within_output))
+    }
+
+    /// Schedule a redraw on the output under `pos`, if any.
+    ///
+    /// T-31 directed-redraw helper for pointer/cursor paths. Safe when the output disappears
+    /// between the lookup and the queue.
+    pub fn queue_redraw_output_under(&mut self, pos: Point<f64, Logical>) {
+        let Some((output, _)) = self.output_under(pos) else {
+            return;
+        };
+        let output = output.clone();
+        if self.output_state.contains_key(&output) {
+            self.queue_redraw(&output);
+        }
+    }
+
+    /// Schedule redraws on every output whose geometry overlaps `rect` (output-logical).
+    ///
+    /// T-31 directed-redraw helper for drag paths (interactive move / touch overview).
+    pub fn queue_redraw_overlapping(&mut self, rect: Rectangle<f64, Logical>) {
+        let overlapping: Vec<Output> = self
+            .global_space
+            .outputs()
+            .filter_map(|output| {
+                let geo = self.global_space.output_geometry(output)?;
+                let geo = Rectangle::new(geo.loc.to_f64(), geo.size.to_f64());
+                geo.intersection(rect)
+                    .is_some()
+                    .then(|| output.clone())
+            })
+            .collect();
+        for output in overlapping {
+            if self.output_state.contains_key(&output) {
+                self.queue_redraw(&output);
+            }
+        }
+    }
+
+    /// Queue a redraw on `output` if it still exists (hot-unplug safe).
+    pub fn queue_redraw_if_exists(&mut self, output: &Output) {
+        if self.output_state.contains_key(output) {
+            self.queue_redraw(output);
+        }
+    }
+
+    /// Drain the layout dirty set and apply it as a targeted attribution.
+    ///
+    /// Non-`do_action` callers that mutated the layout through the dirty-marking entry points
+    /// (activation, focus, cross-output moves) must call this so the affected outputs (window
+    /// output + previous active, etc.) are redrawn exactly once.
+    pub fn apply_layout_dirty_redraw(&mut self, reason: RedrawReason) {
+        let dirty = self.layout.take_dirty_outputs();
+        if !dirty.is_empty() {
+            self.apply_redraw_attribution(RedrawAttribution::outputs(dirty, reason));
+        }
     }
 
     fn is_inside_hot_corner(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
@@ -5989,7 +6090,8 @@ impl Niri {
             }
         }
 
-        self.queue_redraw_all();
+        // Debug damage overlay spans every output.
+        self.apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
     }
 
     pub fn capture_screenshots<'a>(
@@ -6548,7 +6650,10 @@ impl Niri {
                 } else {
                     // There are outputs which we need to redraw before locking.
                     self.lock_state = LockState::Locking(confirmation);
-                    self.queue_redraw_all();
+                    // The lock screen covers every output.
+                    self.apply_redraw_attribution(RedrawAttribution::all(
+                        RedrawFallbackReason::GlobalUi,
+                    ));
                 }
             }
             other => {
@@ -6569,7 +6674,8 @@ impl Niri {
         for output_state in self.output_state.values_mut() {
             output_state.lock_surface = None;
         }
-        self.queue_redraw_all();
+        // Unlock removes the lock surface from every output.
+        self.apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
     }
 
     #[cfg(feature = "dbus")]
@@ -6718,8 +6824,12 @@ impl Niri {
                 if self.layer_shell_on_demand_focus.as_ref() != Some(&surface) {
                     self.layer_shell_on_demand_focus = Some(surface);
 
-                    // FIXME: granular.
-                    self.queue_redraw_all();
+                    // T-31: redraw only the output hosting the layer surface.
+                    let layer = self.layer_shell_on_demand_focus.as_ref().unwrap();
+                    let output = self.output_for_root(layer.wl_surface()).cloned();
+                    if let Some(output) = output {
+                        self.queue_redraw(&output);
+                    }
                 }
 
                 return;
@@ -6727,11 +6837,12 @@ impl Niri {
         }
 
         // Something else got clicked, clear on-demand layer-shell focus.
-        if self.layer_shell_on_demand_focus.is_some() {
-            self.layer_shell_on_demand_focus = None;
-
-            // FIXME: granular.
-            self.queue_redraw_all();
+        if let Some(surface) = self.layer_shell_on_demand_focus.take() {
+            // T-31: redraw only the output that hosted the layer surface.
+            let output = self.output_for_root(surface.wl_surface()).cloned();
+            if let Some(output) = output {
+                self.queue_redraw(&output);
+            }
         }
     }
 
@@ -6959,8 +7070,10 @@ impl Niri {
         };
 
         if changed {
-            // FIXME: granular.
-            self.queue_redraw_all();
+            // Rule changes can affect any output.
+            self.apply_redraw_attribution(RedrawAttribution::all(
+                RedrawFallbackReason::GlobalConfig,
+            ));
         }
     }
 
@@ -6981,8 +7094,10 @@ impl Niri {
         }
 
         if changed {
-            // FIXME: granular.
-            self.queue_redraw_all();
+            // Rule changes can affect any output.
+            self.apply_redraw_attribution(RedrawAttribution::all(
+                RedrawFallbackReason::GlobalConfig,
+            ));
         }
     }
 
@@ -7012,7 +7127,9 @@ impl Niri {
                 // frame of hover.
                 if state.niri.pointer_visibility.is_visible() {
                     state.niri.pointer_visibility = PointerVisibility::Hidden;
-                    state.niri.queue_redraw_all();
+                    // T-31: only the output under the pointer showed the cursor.
+                    let pos = state.niri.seat.get_pointer().unwrap().current_location();
+                    state.niri.queue_redraw_output_under(pos);
                 }
 
                 TimeoutAction::Drop
@@ -7039,7 +7156,8 @@ impl Niri {
         if !self.window_mru_ui.is_open() {
             return None;
         }
-        self.queue_redraw_all();
+        // The MRU overlay lives on a single output.
+        self.queue_redraw_mru_output();
 
         let id = self.window_mru_ui.close(close_request)?;
         self.find_window_by_id(id)
@@ -7071,7 +7189,7 @@ impl Niri {
 
     pub fn queue_redraw_mru_output(&mut self) {
         if let Some(output) = self.window_mru_ui.output().cloned() {
-            self.queue_redraw(&output);
+            self.queue_redraw_if_exists(&output);
         }
     }
 }

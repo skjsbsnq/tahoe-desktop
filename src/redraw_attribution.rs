@@ -23,6 +23,8 @@ pub enum RedrawReason {
     Maximize,
     /// Tahoe glass surface content or lifecycle change.
     Glass,
+    /// Generic layout/workspace action cluster (`Input::do_action` tail).
+    Action,
 }
 
 /// Reviewed reasons that may schedule a redraw on every output.
@@ -34,6 +36,9 @@ pub enum RedrawFallbackReason {
     OutputTeardown,
     /// Global configuration change that affects all outputs.
     GlobalConfig,
+    /// Global UI overlay / debug state that spans all outputs (overview, debug
+    /// tint/damage, screenshot UI, hotkey overlay, screen transition).
+    GlobalUi,
 }
 
 /// Result of attributing a cluster event to affected outputs.
@@ -155,6 +160,9 @@ pub fn note_fallback_reason(reason: RedrawFallbackReason) {
         RedrawFallbackReason::GlobalConfig => {
             lifecycle_diag::note_redraw_fallback_global_config();
         }
+        RedrawFallbackReason::GlobalUi => {
+            lifecycle_diag::note_redraw_fallback_global_ui();
+        }
     }
 }
 
@@ -165,6 +173,7 @@ pub fn note_targeted_reason(reason: RedrawReason) {
         RedrawReason::Activate => lifecycle_diag::note_redraw_targeted_activate(),
         RedrawReason::Maximize => lifecycle_diag::note_redraw_targeted_maximize(),
         RedrawReason::Glass => lifecycle_diag::note_redraw_targeted_glass(),
+        RedrawReason::Action => lifecycle_diag::note_redraw_targeted_action(),
     }
 }
 

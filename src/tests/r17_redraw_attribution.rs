@@ -8,6 +8,7 @@
 use niri_config::Config;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+use smithay::utils::{Point, Rectangle, Size};
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::LayerConfigureProps;
@@ -448,13 +449,15 @@ fn r17_set_rectangle_is_cache_only_no_redraw() {
             .set_rectangle(&dock, 10, 20, 30, 40);
         f.double_roundtrip(id);
 
-        let diag = lifecycle_diag::snapshot();
-        // Pure cache write: no lifecycle/maximize/activate attribution notes.
-        // Source proof covers zero queue_redraw_all in ForeignToplevelHandler;
-        // global counters may be polluted under parallel libtest.
-        assert_eq!(diag.redraw_targeted_lifecycle, 0);
-        assert_eq!(diag.redraw_targeted_maximize, 0);
-        assert_eq!(diag.redraw_targeted_activate, 0);
+        // Pure cache write: the foreign set_rectangle path queues no frame on this
+        // fixture's outputs. Fixture-local Queued state is immune to the process-global
+        // counter pollution that parallel libtest workers cause for attribution notes
+        // (production focus/maximize paths apply attribution outside the diag test lock).
+        assert_eq!(
+            count_outputs_queued(f.niri()).0,
+            0,
+            "set_rectangle must not queue any output"
+        );
         assert!(f
             .niri()
             .layout
@@ -624,4 +627,249 @@ fn r17_minimize_animation_ongoing_on_home_output() {
     // Advance one animation step: lifecycle model must remain (no dropped owner).
     f.niri().advance_animations();
     assert!(f.niri().layout.windows().next().unwrap().1.is_minimized());
+}
+
+// ==== T-31 extensions: layout dirty tail + directed helpers =================
+
+/// T-31: generic do_action layout mutations redraw only the active output via the unified
+/// dirty tail — no queue_redraw_all, no cross-output pollution.
+#[test]
+fn r17_do_action_layout_targets_active_output_only() {
+    lifecycle_diag::with_enabled_for_test(|| {
+        let mut f = Fixture::new();
+        f.niri_state().backend.headless().add_renderer().unwrap();
+        f.add_output(1, (1920, 1080));
+        f.add_output(2, (1280, 720));
+
+        let id = f.add_client();
+        let _surface = create_window(&mut f, id, 400, 300);
+        f.niri_focus_output(1);
+
+        force_idle_redraw_states(f.niri());
+        lifecycle_diag::reset();
+
+        f.niri_state()
+            .do_action(niri_config::Action::MoveColumnLeft, true);
+
+        let (queued, total) = count_outputs_queued(f.niri());
+        let home = f.niri_output(1);
+        let other = f.niri_output(2);
+        let diag = lifecycle_diag::snapshot();
+        eprintln!(
+            "R17_SAMPLE kind=do_action_move queued={queued} total={total} \
+             redraw_all={} targeted_action={}",
+            diag.queue_redraw_all, diag.redraw_targeted_action
+        );
+        assert_eq!(total, 2);
+        assert_eq!(queued, 1, "only the active output must be queued");
+        assert!(is_output_queued(f.niri(), &home));
+        assert!(
+            !is_output_queued(f.niri(), &other),
+            "unaffected output must stay Idle"
+        );
+        assert_eq!(
+            diag.queue_redraw_all, 0,
+            "do_action must not queue every output"
+        );
+        assert!(
+            diag.redraw_targeted_action >= 1,
+            "do_action tail must apply Action attribution"
+        );
+    });
+}
+
+/// T-31: cross-output actions mark source and target monitors (dedup applied by attribution).
+#[test]
+fn r17_do_action_move_to_monitor_marks_source_and_target() {
+    lifecycle_diag::with_enabled_for_test(|| {
+        let mut f = Fixture::new();
+        f.niri_state().backend.headless().add_renderer().unwrap();
+        f.add_output(1, (1920, 1080));
+        f.add_output(2, (1280, 720));
+
+        let id = f.add_client();
+        let _surface = create_window(&mut f, id, 400, 300);
+        f.niri_focus_output(1);
+
+        force_idle_redraw_states(f.niri());
+        lifecycle_diag::reset();
+
+        f.niri_state().do_action(
+            niri_config::Action::MoveWindowToMonitor("headless-2".to_string()),
+            true,
+        );
+
+        let (queued, total) = count_outputs_queued(f.niri());
+        let home = f.niri_output(1);
+        let target = f.niri_output(2);
+        let diag = lifecycle_diag::snapshot();
+        eprintln!(
+            "R17_SAMPLE kind=do_action_move_to_monitor queued={queued} total={total} \
+             redraw_all={} targeted_action={}",
+            diag.queue_redraw_all, diag.redraw_targeted_action
+        );
+        assert_eq!(total, 2);
+        assert_eq!(queued, 2, "source and target outputs must be queued");
+        assert!(is_output_queued(f.niri(), &home));
+        assert!(is_output_queued(f.niri(), &target));
+        assert_eq!(diag.queue_redraw_all, 0);
+        assert!(diag.redraw_targeted_action >= 1);
+        assert_eq!(
+            f.niri().layout.active_output().map(|o| o.name()),
+            Some("headless-2".to_string())
+        );
+    });
+}
+
+/// T-31: directed redraw helpers queue exactly the outputs under a point / overlapping a rect.
+#[test]
+fn r17_directed_helpers_queue_only_overlapping_outputs() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+    let out1 = f.niri_output(1);
+    let out2 = f.niri_output(2);
+
+    force_idle_redraw_states(f.niri());
+    f.niri().queue_redraw_output_under(Point::from((50., 50.)));
+    assert!(is_output_queued(f.niri(), &out1));
+    assert!(!is_output_queued(f.niri(), &out2));
+
+    force_idle_redraw_states(f.niri());
+    let geo1 = f.niri().global_space.output_geometry(&out1).unwrap();
+    let geo2 = f.niri().global_space.output_geometry(&out2).unwrap();
+    let x1 = geo1.loc.x.min(geo2.loc.x) as f64;
+    let x2 = (geo1.loc.x + i32::from(geo1.size.w))
+        .max(geo2.loc.x + i32::from(geo2.size.w)) as f64;
+    let rect = Rectangle::new(Point::from((x1, 0.)), Size::from((x2 - x1, 10.)));
+    f.niri().queue_redraw_overlapping(rect);
+    assert!(is_output_queued(f.niri(), &out1));
+    assert!(is_output_queued(f.niri(), &out2));
+}
+
+/// T-31: layout dirty marks dedup and drain (first-touched order).
+#[test]
+fn r17_layout_dirty_outputs_dedup_and_drain() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+    let out1 = f.niri_output(1);
+    let out2 = f.niri_output(2);
+
+    f.niri().layout.focus_output(&out1); // already active: only the target is marked
+    f.niri().layout.focus_output(&out2); // old active + new
+    f.niri().layout.focus_output(&out1); // old active + new, deduped
+
+    let dirty = f.niri().layout.take_dirty_outputs();
+    assert_eq!(dirty.len(), 2, "dedup + both outputs");
+    assert!(dirty.contains(&out1));
+    assert!(dirty.contains(&out2));
+    assert!(
+        f.niri().layout.take_dirty_outputs().is_empty(),
+        "take drains the set"
+    );
+}
+
+/// T-31 source deletion: Input::do_action must not call queue_redraw_all; the layout dirty
+/// tail schedules per-output attribution.
+#[test]
+fn r17_do_action_source_has_zero_queue_redraw_all() {
+    let input = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/input/mod.rs"));
+    let start = input.find("pub fn do_action(").expect("do_action");
+    let end = input[start..]
+        .find("fn on_pointer_motion<")
+        .expect("on_pointer_motion after do_action")
+        + start;
+    let block = &input[start..end];
+
+    let hits: Vec<_> = block
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("queue_redraw_all"))
+        .map(|(i, line)| (i + 1, line.trim().to_string()))
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "do_action must not call queue_redraw_all; hits={hits:?}"
+    );
+    assert!(
+        block.contains("take_dirty_outputs"),
+        "do_action must use the layout dirty tail"
+    );
+    assert!(
+        block.contains("apply_redraw_attribution"),
+        "do_action must apply redraw attribution"
+    );
+}
+
+
+/// T-31: non-do_action activation paths must drain the layout dirty set so both the window
+/// output and the previous active output are redrawn (adversarial finding: focus ring /
+/// ghost window residue on the old active output after cross-output activation).
+#[test]
+fn r17_apply_layout_dirty_redraw_after_cross_output_activation() {
+    let mut f = Fixture::new();
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+
+    let id = f.add_client();
+    // Map the window on output 2, then make output 1 active again.
+    f.niri_focus_output(2);
+    let _surface = create_window(&mut f, id, 400, 300);
+    f.niri_focus_output(1);
+    let window = f.niri().layout.windows().next().unwrap().1.window.clone();
+
+    // Simulate a cross-output activation (e.g. DnD dropped on the second output):
+    // activate a window that lives on output 2 while output 1 is active.
+    f.niri().layout.activate_window(&window);
+    f.niri().apply_layout_dirty_redraw(RedrawReason::Activate);
+
+    let (queued, total) = count_outputs_queued(f.niri());
+    let home = f.niri_output(1);
+    let target = f.niri_output(2);
+    assert_eq!(total, 2);
+    assert_eq!(
+        queued, 2,
+        "window output + previous active output must both be queued"
+    );
+    assert!(is_output_queued(f.niri(), &home));
+    assert!(is_output_queued(f.niri(), &target));
+    assert_eq!(
+        f.niri().layout.active_output().map(|o| o.name()),
+        Some("headless-2".to_string())
+    );
+}
+
+/// T-31: removing the output that hosts an open MRU must not panic (the MRU close path queues
+/// a redraw on its output, which is already gone from output_state).
+#[test]
+fn r17_remove_output_with_open_mru_does_not_panic() {
+    let mut f = Fixture::new();
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+
+    let id = f.add_client();
+    let _surface = create_window(&mut f, id, 400, 300);
+    f.niri_focus_output(1);
+
+    f.niri_state().do_action(
+        niri_config::Action::MruAdvance {
+            direction: niri_config::MruDirection::Forward,
+            scope: None,
+            filter: None,
+        },
+        true,
+    );
+    assert!(
+        f.niri().window_mru_ui.is_open(),
+        "MRU must be open on the active output"
+    );
+
+    let out1 = f.niri_output(1);
+    // Must not panic: queue_redraw_mru_output is hot-unplug guarded.
+    f.niri().remove_output(&out1);
+    assert!(f.niri().global_space.outputs().count() >= 1);
 }

@@ -122,8 +122,9 @@ impl SeatHandler for State {
             image = CursorImageStatus::Named(CursorIcon::Crosshair);
         }
         self.niri.cursor_manager.set_cursor_image(image);
-        // FIXME: more granular
-        self.niri.queue_redraw_all();
+        // T-31: the cursor is visible on the output under the pointer only.
+        let pos = self.niri.seat.get_pointer().unwrap().current_location();
+        self.niri.queue_redraw_output_under(pos);
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
@@ -156,8 +157,9 @@ impl TabletSeatHandler for State {
     fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
         // FIXME: tablet tools should have their own cursors.
         self.niri.cursor_manager.set_cursor_image(image);
-        // FIXME: granular.
-        self.niri.queue_redraw_all();
+        // T-31: the cursor is visible on the output under the pointer only.
+        let pos = self.niri.seat.get_pointer().unwrap().current_location();
+        self.niri.queue_redraw_output_under(pos);
     }
 }
 delegate_tablet_manager!(State);
@@ -231,8 +233,7 @@ impl PointerConstraintsHandler for State {
 
         // Redraw to update the cursor position if it's visible.
         if self.niri.pointer_visibility.is_visible() {
-            // FIXME: redraw only outputs overlapping the cursor.
-            self.niri.queue_redraw_all();
+            self.niri.queue_redraw_output_under(pointer_pos);
         }
     }
 }
@@ -363,8 +364,9 @@ impl WaylandDndGrabHandler for State {
             }
         }
 
-        // FIXME: more granular
-        self.niri.queue_redraw_all();
+        // T-31: the DnD icon appears at the pointer.
+        let pos = self.niri.seat.get_pointer().unwrap().current_location();
+        self.niri.queue_redraw_output_under(pos);
     }
 }
 
@@ -402,6 +404,11 @@ impl DndGrabHandler for State {
                 self.niri.layout.focus_output(&output);
             }
         }
+
+        // T-31: the activation/focus above dirtied the layout — drain it so the window output
+        // and the previous active output are redrawn (not only the DnD icon output).
+        self.niri
+            .apply_layout_dirty_redraw(crate::redraw_attribution::RedrawReason::Activate);
     }
 
     fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
@@ -415,8 +422,9 @@ impl crate::niri::Niri {
     fn on_maybe_dnd_ended(&mut self) {
         self.layout.dnd_end();
         self.dnd_icon = None;
-        // FIXME: more granular
-        self.queue_redraw_all();
+        // T-31: the DnD icon was on the output under the pointer.
+        let pos = self.seat.get_pointer().unwrap().current_location();
+        self.queue_redraw_output_under(pos);
     }
 }
 
@@ -854,8 +862,14 @@ impl ExtWorkspaceHandler for State {
             self.niri.layout.switch_workspace(index);
             // No mouse warp: assuming the layer-shell bar workspaces use-case.
 
-            // FIXME: granular
-            self.niri.queue_redraw_all();
+            // T-31: redraw only the outputs the workspace switch dirtied.
+            let dirty = self.niri.layout.take_dirty_outputs();
+            if !dirty.is_empty() {
+                self.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::outputs(
+                    dirty,
+                    crate::redraw_attribution::RedrawReason::Activate,
+                ));
+            }
         }
     }
 
@@ -1063,11 +1077,23 @@ impl XdgActivationHandler for State {
                 let window = mapped.window.clone();
                 if token_data.user_data.get::<UrgentOnlyMarker>().is_some() {
                     mapped.set_urgent(true);
-                    self.niri.queue_redraw_all();
+                    // Urgent state is consumed by taskbars across outputs.
+                    self.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::all(
+                        crate::redraw_attribution::RedrawFallbackReason::GlobalUi,
+                    ));
                 } else {
                     self.niri.layout.activate_window(&window);
                     self.niri.layer_shell_on_demand_focus = None;
-                    self.niri.queue_redraw_all();
+                    // T-31: redraw only the outputs the activation dirtied.
+                    let dirty = self.niri.layout.take_dirty_outputs();
+                    if !dirty.is_empty() {
+                        self.niri.apply_redraw_attribution(
+                            crate::redraw_attribution::RedrawAttribution::outputs(
+                                dirty,
+                                crate::redraw_attribution::RedrawReason::Activate,
+                            ),
+                        );
+                    }
                 }
             } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(&surface) {
                 unmapped.activation_token_data = Some(token_data);

@@ -79,6 +79,11 @@ impl MoveGrab {
     }
 
     fn on_ungrab(&mut self, data: &mut State) {
+        // T-31: remember where the dragged window currently renders so the final redraw can be
+        // directed to exactly the outputs it overlaps (it may have crossed monitors).
+        let move_rect = data.niri.layout.interactive_move_render_rect();
+        let overview_was_open = data.niri.layout.is_overview_open();
+
         let layout = &mut data.niri.layout;
         match self.gesture {
             GestureState::Recognizing => {
@@ -111,8 +116,21 @@ impl MoveGrab {
                 .set_cursor_image(CursorImageStatus::default_named());
         }
 
-        // FIXME: only redraw the window output.
-        data.niri.queue_redraw_all();
+        // T-31: overview taps close the overview on every output. Otherwise drain the layout
+        // dirty set (activation/insertion) and redraw the outputs the dragged window overlapped
+        // plus the cursor output.
+        if overview_was_open {
+            data.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::all(
+                crate::redraw_attribution::RedrawFallbackReason::GlobalUi,
+            ));
+        } else {
+            data.niri
+                .apply_layout_dirty_redraw(crate::redraw_attribution::RedrawReason::Activate);
+        }
+        if let Some(rect) = move_rect {
+            data.niri.queue_redraw_overlapping(rect);
+        }
+        data.niri.queue_redraw_output_under(data.niri.seat.get_pointer().unwrap().current_location());
     }
 
     fn begin_move(&mut self, data: &mut State) -> bool {
@@ -236,8 +254,10 @@ impl MoveGrab {
                     timestamp,
                 );
                 if ongoing {
-                    // FIXME: only redraw the previous and the new output.
-                    data.niri.queue_redraw_all();
+                    // T-31: redraw only the outputs the dragged window overlaps.
+                    if let Some(rect) = data.niri.layout.interactive_move_render_rect() {
+                        data.niri.queue_redraw_overlapping(rect);
+                    }
                     return true;
                 }
             }
@@ -290,7 +310,10 @@ impl MoveGrab {
         }
 
         data.niri.layout.toggle_window_floating(Some(&self.window));
-        data.niri.queue_redraw_all();
+        // T-31: the floating toggle affects the output the dragged window overlaps.
+        if let Some(rect) = data.niri.layout.interactive_move_render_rect() {
+            data.niri.queue_redraw_overlapping(rect);
+        }
 
         true
     }

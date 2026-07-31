@@ -412,6 +412,12 @@ pub struct Layout<W: LayoutElement> {
     overview_progress: Option<OverviewProgress>,
     /// Configurable properties of the layout.
     options: Rc<Options>,
+    /// Outputs dirtied by layout mutations since the last [`Self::take_dirty_outputs`].
+    ///
+    /// T-31 convergence primitive: mutation entry points mark the monitors they affect, and
+    /// callers (e.g. `Input::do_action`) drain the set once at a unified tail to schedule
+    /// per-output redraws instead of `queue_redraw_all`.
+    dirty_outputs: Vec<Output>,
 }
 
 #[derive(Debug)]
@@ -964,6 +970,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             options: Rc::new(options),
+            dirty_outputs: Vec::new(),
         }
     }
 
@@ -989,6 +996,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             options: opts,
+            dirty_outputs: Vec::new(),
         }
     }
 
@@ -1803,10 +1811,16 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
 
-        for (monitor_idx, mon) in monitors.iter_mut().enumerate() {
+        let old_active_output = monitors[*active_monitor_idx].output.clone();
+        let mut dirty = Vec::new();
+        'outer: for (monitor_idx, mon) in monitors.iter_mut().enumerate() {
             for (workspace_idx, ws) in mon.workspaces.iter_mut().enumerate() {
                 if ws.activate_window(window) {
+                    if *active_monitor_idx != monitor_idx {
+                        dirty.push(old_active_output.clone());
+                    }
                     *active_monitor_idx = monitor_idx;
+                    dirty.push(mon.output.clone());
 
                     // If currently in the middle of a vertical swipe between the target workspace
                     // and some other, don't switch the workspace.
@@ -1817,9 +1831,12 @@ impl<W: LayoutElement> Layout<W> {
                         _ => mon.switch_workspace(workspace_idx),
                     }
 
-                    return;
+                    break 'outer;
                 }
             }
+        }
+        for output in &dirty {
+            self.mark_output_dirty(output);
         }
     }
 
@@ -1839,10 +1856,16 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
 
-        for (monitor_idx, mon) in monitors.iter_mut().enumerate() {
+        let old_active_output = monitors[*active_monitor_idx].output.clone();
+        let mut dirty = Vec::new();
+        'outer: for (monitor_idx, mon) in monitors.iter_mut().enumerate() {
             for (workspace_idx, ws) in mon.workspaces.iter_mut().enumerate() {
                 if ws.activate_window_without_raising(window) {
+                    if *active_monitor_idx != monitor_idx {
+                        dirty.push(old_active_output.clone());
+                    }
                     *active_monitor_idx = monitor_idx;
+                    dirty.push(mon.output.clone());
 
                     // If currently in the middle of a vertical swipe between the target workspace
                     // and some other, don't switch the workspace.
@@ -1853,9 +1876,12 @@ impl<W: LayoutElement> Layout<W> {
                         _ => mon.switch_workspace(workspace_idx),
                     }
 
-                    return;
+                    break 'outer;
                 }
             }
+        }
+        for output in &dirty {
+            self.mark_output_dirty(output);
         }
     }
 
@@ -1891,9 +1917,20 @@ impl<W: LayoutElement> Layout<W> {
             monitors,
             active_monitor_idx,
             ..
-        } = &mut self.monitor_set
+        } = &self.monitor_set
         else {
             return None;
+        };
+        let output = monitors[*active_monitor_idx].output.clone();
+        self.mark_output_dirty(&output);
+
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            unreachable!()
         };
 
         let mon = &mut monitors[*active_monitor_idx];
@@ -2001,9 +2038,20 @@ impl<W: LayoutElement> Layout<W> {
             monitors,
             active_monitor_idx,
             ..
-        } = &mut self.monitor_set
+        } = &self.monitor_set
         else {
             return None;
+        };
+        let output = monitors[*active_monitor_idx].output.clone();
+        self.mark_output_dirty(&output);
+
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            unreachable!()
         };
 
         Some(&mut monitors[*active_monitor_idx])
@@ -2062,6 +2110,44 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn outputs(&self) -> impl Iterator<Item = &Output> + '_ {
         self.monitors().map(|mon| &mon.output)
+    }
+
+    /// Mark `output` as dirtied by a layout mutation.
+    ///
+    /// Marks accumulate until [`Self::take_dirty_outputs`] drains them; duplicates are ignored.
+    /// This is a redraw hint only — it never changes layout state.
+    pub fn mark_output_dirty(&mut self, output: &Output) {
+        if !self.dirty_outputs.iter().any(|o| o == output) {
+            self.dirty_outputs.push(output.clone());
+        }
+    }
+
+    /// Mark every connected output as dirtied.
+    pub fn mark_all_outputs_dirty(&mut self) {
+        let outputs: Vec<Output> = self.outputs().cloned().collect();
+        for output in &outputs {
+            self.mark_output_dirty(output);
+        }
+    }
+
+    /// Drain the outputs dirtied since the last call, in first-touched order.
+    ///
+    /// Callers wanting an action-scoped set should discard at the start of the action and take
+    /// here at the end.
+    pub fn take_dirty_outputs(&mut self) -> Vec<Output> {
+        std::mem::take(&mut self.dirty_outputs)
+    }
+
+    /// Render rect (output-logical) of the interactively moved window, when a move is ongoing.
+    ///
+    /// Used to direct redraws to exactly the outputs the dragged window overlaps.
+    pub fn interactive_move_render_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        let move_ = match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(move_)) => move_,
+            _ => return None,
+        };
+        let loc = move_.tile_render_location(1.);
+        Some(Rectangle::new(loc, move_.tile.window_size()))
     }
 
     pub fn move_left(&mut self) {
@@ -3548,6 +3634,7 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn focus_output(&mut self, output: &Output) {
+        let mut dirty = Vec::new();
         if let MonitorSet::Normal {
             monitors,
             active_monitor_idx,
@@ -3556,10 +3643,17 @@ impl<W: LayoutElement> Layout<W> {
         {
             for (idx, mon) in monitors.iter().enumerate() {
                 if &mon.output == output {
+                    if *active_monitor_idx != idx {
+                        dirty.push(monitors[*active_monitor_idx].output.clone());
+                    }
                     *active_monitor_idx = idx;
-                    return;
+                    dirty.push(monitors[idx].output.clone());
+                    break;
                 }
             }
+        }
+        for output in &dirty {
+            self.mark_output_dirty(output);
         }
     }
 
@@ -3575,6 +3669,26 @@ impl<W: LayoutElement> Layout<W> {
                 return;
             }
         }
+
+        // T-31: both the source monitor (window/active column currently there) and the target
+        // output change when something crosses outputs.
+        let source_output = match &self.monitor_set {
+            MonitorSet::Normal { monitors, active_monitor_idx, .. } => {
+                if let Some(window) = window {
+                    monitors
+                        .iter()
+                        .find(|mon| mon.has_window(window))
+                        .map(|mon| mon.output.clone())
+                } else {
+                    monitors.get(*active_monitor_idx).map(|mon| mon.output.clone())
+                }
+            }
+            MonitorSet::NoOutputs { .. } => None,
+        };
+        if let Some(source_output) = source_output {
+            self.mark_output_dirty(&source_output);
+        }
+        self.mark_output_dirty(output);
 
         if let MonitorSet::Normal {
             monitors,
@@ -3669,6 +3783,28 @@ impl<W: LayoutElement> Layout<W> {
         target_ws_idx: Option<usize>,
         activate: bool,
     ) {
+        let source_output = match &self.monitor_set {
+            MonitorSet::Normal { monitors, active_monitor_idx, .. } => {
+                monitors.get(*active_monitor_idx).map(|mon| mon.output.clone())
+            }
+            MonitorSet::NoOutputs { .. } => None,
+        };
+        if let Some(source_output) = source_output {
+            self.mark_output_dirty(&source_output);
+        }
+        self.mark_output_dirty(output);
+
+        let source_output = match &self.monitor_set {
+            MonitorSet::Normal { monitors, active_monitor_idx, .. } => {
+                monitors.get(*active_monitor_idx).map(|mon| mon.output.clone())
+            }
+            MonitorSet::NoOutputs { .. } => None,
+        };
+        if let Some(source_output) = source_output {
+            self.mark_output_dirty(&source_output);
+        }
+        self.mark_output_dirty(output);
+
         if let MonitorSet::Normal {
             monitors,
             active_monitor_idx,
@@ -3720,6 +3856,18 @@ impl<W: LayoutElement> Layout<W> {
         old_output: Option<Output>,
         new_output: &Output,
     ) -> bool {
+        // T-31: source and target monitors both change when a workspace crosses outputs.
+        let source_output = old_output.clone().or_else(|| {
+            let MonitorSet::Normal { monitors, active_monitor_idx, .. } = &self.monitor_set else {
+                return None;
+            };
+            monitors.get(*active_monitor_idx).map(|mon| mon.output.clone())
+        });
+        if let Some(source_output) = source_output {
+            self.mark_output_dirty(&source_output);
+        }
+        self.mark_output_dirty(new_output);
+
         let MonitorSet::Normal {
             monitors,
             active_monitor_idx,
@@ -5135,6 +5283,15 @@ impl<W: LayoutElement> Layout<W> {
         reference: Option<(Option<Output>, usize)>,
         new_idx: usize,
     ) {
+        // T-31: reordering a workspace changes the visuals of its monitor.
+        if let Some((Some(output), _)) = &reference {
+            self.mark_output_dirty(output);
+        } else {
+            if let Some(output) = self.active_output().cloned() {
+                self.mark_output_dirty(&output);
+            }
+        }
+
         let (monitor, old_idx) = if let Some((output, old_idx)) = reference {
             let monitor = if let Some(output) = output {
                 let Some(monitor) = self.monitor_for_output_mut(&output) else {
@@ -5715,6 +5872,11 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn workspaces_mut(&mut self) -> impl Iterator<Item = &mut Workspace<W>> + '_ {
+        // Window-targeted mutations that search across monitors (set_* / toggle_* by id,
+        // urgent arms) dirty every output: the affected monitor cannot be known cheaply here,
+        // and these paths are user-initiated rather than per-frame.
+        self.mark_all_outputs_dirty();
+
         let iter_normal;
         let iter_no_outputs;
 

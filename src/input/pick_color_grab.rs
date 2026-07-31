@@ -32,7 +32,9 @@ impl PickColorGrab {
             .niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
-        state.niri.queue_redraw_all();
+        // Redraw to update the cursor on the output under it.
+        let pos = state.niri.seat.get_pointer().unwrap().current_location();
+        state.niri.queue_redraw_output_under(pos);
     }
 
     fn pick_color_at_point(location: Point<f64, Logical>, data: &mut State) -> Option<PickedColor> {

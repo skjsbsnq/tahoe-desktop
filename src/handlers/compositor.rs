@@ -445,8 +445,9 @@ impl CompositorHandler for State {
                 });
             }
 
-            // FIXME: granular redraws for cursors.
-            self.niri.queue_redraw_all();
+            // T-31: the cursor surface is visible on the output under the pointer only.
+            let pos = self.niri.seat.get_pointer().unwrap().current_location();
+            self.niri.queue_redraw_output_under(pos);
             return;
         }
 
@@ -469,8 +470,9 @@ impl CompositorHandler for State {
                 });
             }
 
-            // FIXME: granular redraws for cursors.
-            self.niri.queue_redraw_all();
+            // T-31: the DnD icon is visible on the output under the pointer only.
+            let pos = self.niri.seat.get_pointer().unwrap().current_location();
+            self.niri.queue_redraw_output_under(pos);
             return;
         }
 

@@ -60,6 +60,11 @@ impl TouchOverviewGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut State) {
+        let overview_was_open = state.niri.layout.is_overview_open();
+        // T-31: remember where the dragged window currently renders so the final redraw can be
+        // directed to exactly the outputs it overlaps.
+        let move_rect = state.niri.layout.interactive_move_render_rect();
+
         let layout = &mut state.niri.layout;
         match self.gesture {
             GestureState::Recognizing => {
@@ -109,7 +114,20 @@ impl TouchOverviewGrab {
             }
         };
 
-        state.niri.queue_redraw_all();
+        // T-31: overview taps close the overview on every output; other gestures affect only
+        // the outputs the touch/gesture touched.
+        if overview_was_open {
+            state
+                .niri
+                .apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::all(
+                    crate::redraw_attribution::RedrawFallbackReason::GlobalUi,
+                ));
+        } else {
+            state.niri.queue_redraw_if_exists(&self.output);
+            if let Some(rect) = move_rect {
+                state.niri.queue_redraw_overlapping(rect);
+            }
+        }
     }
 }
 
@@ -131,7 +149,8 @@ impl TouchGrab<State> for TouchOverviewGrab {
         if matches!(self.gesture, GestureState::InteractiveMove) {
             if let Some(window) = &self.window.as_ref() {
                 data.niri.layout.toggle_window_floating(Some(window));
-                data.niri.queue_redraw_all();
+                // T-31: the floating toggle affects the output under the touch.
+                data.niri.queue_redraw_output_under(event.location);
             }
         }
     }
@@ -215,33 +234,44 @@ impl TouchGrab<State> for TouchOverviewGrab {
         let delta = event.location - self.last_location;
         self.last_location = event.location;
 
-        let ongoing = match self.gesture {
+        let (ongoing, gesture_output) = match self.gesture {
             GestureState::Recognizing => unreachable!(),
-            GestureState::ViewOffset => layout
-                .view_offset_gesture_update(-delta.x, timestamp, false)
-                .is_some(),
-            GestureState::WorkspaceSwitch => layout
-                .workspace_switch_gesture_update(-delta.y, timestamp, false)
-                .is_some(),
+            GestureState::ViewOffset => {
+                let res = layout.view_offset_gesture_update(-delta.x, timestamp, false);
+                (res.is_some(), res.flatten())
+            }
+            GestureState::WorkspaceSwitch => {
+                let res = layout.workspace_switch_gesture_update(-delta.y, timestamp, false);
+                (res.is_some(), res.flatten())
+            }
             GestureState::InteractiveMove => {
                 let window = self.window.as_ref().unwrap();
                 if let Some((output, pos_within_output)) = data.niri.output_under(event.location) {
                     let output = output.clone();
-                    data.niri.layout.interactive_move_update(
+                    let ongoing = data.niri.layout.interactive_move_update(
                         window,
                         delta,
-                        output,
+                        output.clone(),
                         pos_within_output,
                         timestamp,
-                    )
+                    );
+                    (ongoing, Some(output))
                 } else {
-                    false
+                    (false, None)
                 }
             }
         };
 
         if ongoing {
-            data.niri.queue_redraw_all();
+            // T-31: an interactive move redraws the outputs the dragged window overlaps; view
+            // offset / workspace switch gestures redraw their output.
+            if let Some(rect) = data.niri.layout.interactive_move_render_rect() {
+                data.niri.queue_redraw_overlapping(rect);
+            } else if let Some(output) = gesture_output {
+                data.niri.queue_redraw(&output);
+            } else {
+                data.niri.queue_redraw_if_exists(&self.output);
+            }
         } else {
             handle.unset_grab(self, data);
         }

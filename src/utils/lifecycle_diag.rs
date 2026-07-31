@@ -36,9 +36,11 @@ static REDRAW_TARGETED_LIFECYCLE: AtomicU64 = AtomicU64::new(0);
 static REDRAW_TARGETED_ACTIVATE: AtomicU64 = AtomicU64::new(0);
 static REDRAW_TARGETED_MAXIMIZE: AtomicU64 = AtomicU64::new(0);
 static REDRAW_TARGETED_GLASS: AtomicU64 = AtomicU64::new(0);
+static REDRAW_TARGETED_ACTION: AtomicU64 = AtomicU64::new(0);
 static REDRAW_FALLBACK_UNLOCATABLE: AtomicU64 = AtomicU64::new(0);
 static REDRAW_FALLBACK_OUTPUT_TEARDOWN: AtomicU64 = AtomicU64::new(0);
 static REDRAW_FALLBACK_GLOBAL_CONFIG: AtomicU64 = AtomicU64::new(0);
+static REDRAW_FALLBACK_GLOBAL_UI: AtomicU64 = AtomicU64::new(0);
 
 fn ensure_init() {
     // Fast path: avoid the atomic RMW on every hot-path is_enabled() call.
@@ -85,9 +87,11 @@ pub fn reset() {
     REDRAW_TARGETED_ACTIVATE.store(0, Ordering::Relaxed);
     REDRAW_TARGETED_MAXIMIZE.store(0, Ordering::Relaxed);
     REDRAW_TARGETED_GLASS.store(0, Ordering::Relaxed);
+    REDRAW_TARGETED_ACTION.store(0, Ordering::Relaxed);
     REDRAW_FALLBACK_UNLOCATABLE.store(0, Ordering::Relaxed);
     REDRAW_FALLBACK_OUTPUT_TEARDOWN.store(0, Ordering::Relaxed);
     REDRAW_FALLBACK_GLOBAL_CONFIG.store(0, Ordering::Relaxed);
+    REDRAW_FALLBACK_GLOBAL_UI.store(0, Ordering::Relaxed);
 }
 
 pub fn note_queue_redraw_all() {
@@ -180,6 +184,12 @@ pub fn note_redraw_targeted_glass() {
     }
 }
 
+pub fn note_redraw_targeted_action() {
+    if is_enabled() {
+        REDRAW_TARGETED_ACTION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn note_redraw_fallback_unlocatable() {
     if is_enabled() {
         REDRAW_FALLBACK_UNLOCATABLE.fetch_add(1, Ordering::Relaxed);
@@ -195,6 +205,12 @@ pub fn note_redraw_fallback_output_teardown() {
 pub fn note_redraw_fallback_global_config() {
     if is_enabled() {
         REDRAW_FALLBACK_GLOBAL_CONFIG.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_redraw_fallback_global_ui() {
+    if is_enabled() {
+        REDRAW_FALLBACK_GLOBAL_UI.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -217,6 +233,8 @@ pub struct Snapshot {
     pub redraw_fallback_unlocatable: u64,
     pub redraw_fallback_output_teardown: u64,
     pub redraw_fallback_global_config: u64,
+    pub redraw_targeted_action: u64,
+    pub redraw_fallback_global_ui: u64,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -238,6 +256,8 @@ pub fn snapshot() -> Snapshot {
         redraw_fallback_unlocatable: REDRAW_FALLBACK_UNLOCATABLE.load(Ordering::Relaxed),
         redraw_fallback_output_teardown: REDRAW_FALLBACK_OUTPUT_TEARDOWN.load(Ordering::Relaxed),
         redraw_fallback_global_config: REDRAW_FALLBACK_GLOBAL_CONFIG.load(Ordering::Relaxed),
+        redraw_targeted_action: REDRAW_TARGETED_ACTION.load(Ordering::Relaxed),
+        redraw_fallback_global_ui: REDRAW_FALLBACK_GLOBAL_UI.load(Ordering::Relaxed),
     }
 }
 
