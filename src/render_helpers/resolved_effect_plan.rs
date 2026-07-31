@@ -6,7 +6,7 @@
 //! or depends on `update_config` / corner-radius setter ordering.
 
 use niri_config::CornerRadius;
-use smithay::utils::{Logical, Physical, Rectangle};
+use smithay::utils::{Logical, Physical, Point, Rectangle};
 
 use crate::render_helpers::background_effect::{GlassOptions, Options, RenderParams};
 use crate::render_helpers::blur::{self, BlurOptions};
@@ -72,20 +72,63 @@ pub struct ResolvedEffectCaptureKey {
     pub capture_geometry: Rectangle<i32, Physical>,
 }
 
+/// T-32 R-3a: capture band quantization cell (physical px).
+///
+/// While geometry is animating, the capture band is expanded outward to this
+/// grid before entering the capture key and the blit. The capture stays a
+/// strict superset of the true band (draw maps the precise sub-rectangle), so
+/// sub-cell band motion reuses the cached blur instead of re-blitting every
+/// pixel the spring crosses. This is not rest-anchored sampling: the capture
+/// still follows the band — just quantized, so a 1px move inside a cell never
+/// changes what the cached texture covers.
+pub const CAPTURE_BAND_QUANTUM: i32 = 8;
+
+/// Expand `band` outward to the [`CAPTURE_BAND_QUANTUM`] grid (strict superset).
+pub fn quantize_capture_band(band: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+    let q = CAPTURE_BAND_QUANTUM;
+    let loc = Point::from((band.loc.x.div_euclid(q) * q, band.loc.y.div_euclid(q) * q));
+    // Manual ceil division (stable toolchain): ceil(n / q) * q.
+    let ceil_q = |n: i32| (n + q - 1).div_euclid(q) * q;
+    let end = Point::from((
+        ceil_q(band.loc.x + band.size.w),
+        ceil_q(band.loc.y + band.size.h),
+    ));
+    Rectangle::from_extremities(loc, end)
+}
+
+impl ResolvedEffectPlan {
+    /// Resolve the capture band for this frame: the precise rounded physical band,
+    /// or its outward-expanded 8px-grid superset while geometry is animating
+    /// (T-32 R-3a). A/B switch: `NIRI_DISABLE_BAND_QUANTIZATION`.
+    pub fn resolve_capture_band(
+        band: Rectangle<i32, Physical>,
+        geometry_animating: bool,
+    ) -> Rectangle<i32, Physical> {
+        if geometry_animating && !blur::band_quantization_disabled() {
+            quantize_capture_band(band)
+        } else {
+            band
+        }
+    }
+}
+
 /// Resolve the blur on/off flag and kernel exactly once, shared between
 /// [`ResolvedEffectPlan::build`] and [`ResolvedEffectPlan::capture_key`].
 ///
 /// `geometry_animating` engages the P06 animation-period downsample tier on
-/// the resolved kernel. The tier lives inside [`BlurOptions`], and this helper
-/// is the only place that sets it, so `build` and `capture_key` can never
-/// disagree: a tier flip changes the capture key, which bumps the live effect
-/// commit (see `BackgroundEffect::note_plan_keys`) and guarantees both the
-/// engage and the disengage frame re-capture — even when nothing else damages
-/// the region (spring sub-pixel tails, alpha-only animation endings).
+/// the resolved kernel; `fast_motion` promotes to the T-32 tier2 downsample
+/// while the band moves more than three cells (24px) per frame. The tier lives inside
+/// [`BlurOptions`], and this helper is the only place that sets it, so `build`
+/// and `capture_key` can never disagree: a tier flip changes the capture key,
+/// which bumps the live effect commit (see `BackgroundEffect::note_plan_keys`)
+/// and guarantees both the engage and the disengage frame re-capture — even
+/// when nothing else damages the region (spring sub-pixel tails, alpha-only
+/// animation endings).
 fn resolve_blur(
     options: &Options,
     blur_config: niri_config::Blur,
     geometry_animating: bool,
+    fast_motion: bool,
 ) -> (bool, Option<BlurOptions>) {
     let blur = options.blur && !blur_config.off;
     let blur_options = blur.then(|| {
@@ -96,11 +139,23 @@ fn resolve_blur(
         // invisible. Single-pass kernels would double their radius instead,
         // so they stay on the static tier. The xray effect buffer builds its
         // own BlurOptions straight from config and is never affected.
-        if geometry_animating
-            && blur_config.passes.clamp(1, 31) > blur::ANIM_DOWNSAMPLE_SHIFT
-            && !blur::anim_downsample_disabled()
-        {
-            blur_options.downsample_shift = blur::ANIM_DOWNSAMPLE_SHIFT;
+        // T-32 R-3b tier selection. The fast tier engages only when a pass can
+        // be traded for it; otherwise it falls back to the animation tier
+        // (passes > 1 but not > 2), so a fast frame is never *more* expensive
+        // than a slow animation frame (F4). `NIRI_DISABLE_FAST_MOTION_DOWNSAMPLE`
+        // demotes fast frames to the animation tier — the A/B baseline is
+        // tier2-vs-tier1, not tier2-vs-static (F3).
+        let fast_active = fast_motion && !blur::fast_motion_downsample_disabled();
+        let passes = blur_config.passes.clamp(1, 31);
+        let shift = if fast_active && passes > blur::FAST_MOTION_DOWNSAMPLE_SHIFT {
+            blur::FAST_MOTION_DOWNSAMPLE_SHIFT
+        } else if (fast_active || geometry_animating) && passes > blur::ANIM_DOWNSAMPLE_SHIFT {
+            blur::ANIM_DOWNSAMPLE_SHIFT
+        } else {
+            0
+        };
+        if shift > 0 && !blur::anim_downsample_disabled() {
+            blur_options.downsample_shift = shift;
         }
         blur_options
     });
@@ -158,6 +213,10 @@ impl ResolvedEffectPlan {
     /// tiers would needlessly invalidate the capture. Callers must feed the
     /// same value to [`Self::capture_key`] — the tier is part of the capture
     /// fingerprint so engage/disengage frames force a re-capture.
+    ///
+    /// `fast_motion` (T-32 R-3b) promotes the pyramid to the two-step
+    /// fast-motion tier while the capture band moves more than three cells per
+    /// frame; it must be the same value fed to [`Self::capture_key`].
     pub fn build(
         blur_config: niri_config::Blur,
         effect: niri_config::BackgroundEffect,
@@ -165,6 +224,7 @@ impl ResolvedEffectPlan {
         corner_radius: CornerRadius,
         mut params: RenderParams,
         geometry_animating: bool,
+        fast_motion: bool,
     ) -> Option<Self> {
         let options = Self::resolve_options(blur_config, effect, has_blur_region);
         if !options.is_visible() {
@@ -177,7 +237,8 @@ impl ResolvedEffectPlan {
         }
         params.fit_clip_radius();
 
-        let (blur, blur_options) = resolve_blur(&options, blur_config, geometry_animating);
+        let (blur, blur_options) =
+            resolve_blur(&options, blur_config, geometry_animating, fast_motion);
         let noise = if blur { blur_config.noise } else { 0. };
         let noise = options.noise.unwrap_or(noise) as f32;
         let saturation = if blur { blur_config.saturation } else { 1. };
@@ -207,23 +268,26 @@ impl ResolvedEffectPlan {
         }
     }
 
-    /// `geometry_animating` must be the same value passed to [`Self::build`]
-    /// for this frame: the P06 downsample tier is part of the resolved kernel,
-    /// so a tier flip changes this key and forces a re-capture through the
-    /// live effect commit even on otherwise damage-free frames.
+    /// `geometry_animating` and `fast_motion` must be the same values passed to
+    /// [`Self::build`] for this frame: the downsample tiers are part of the
+    /// resolved kernel, so a tier flip changes this key and forces a
+    /// re-capture through the live effect commit even on otherwise
+    /// damage-free frames.
     ///
-    /// `capture_geometry` is the rounded physical band the blit will read
-    /// this frame (the element dst). Including it makes the
-    /// cached blurred texture valid only for the band it came from.
+    /// `capture_geometry` is the (possibly T-32-quantized) physical band the
+    /// blit will read this frame. Including it makes the cached blurred
+    /// texture valid only for the band it came from.
     pub fn capture_key(
         blur_config: niri_config::Blur,
         effect: niri_config::BackgroundEffect,
         has_blur_region: bool,
         geometry_animating: bool,
+        fast_motion: bool,
         capture_geometry: Rectangle<i32, Physical>,
     ) -> ResolvedEffectCaptureKey {
         let options = Self::resolve_options(blur_config, effect, has_blur_region);
-        let (blur, blur_options) = resolve_blur(&options, blur_config, geometry_animating);
+        let (blur, blur_options) =
+            resolve_blur(&options, blur_config, geometry_animating, fast_motion);
         ResolvedEffectCaptureKey {
             blur,
             blur_options,
@@ -280,6 +344,7 @@ mod tests {
             clip: clip.then_some((geo, CornerRadius::default())),
             scale: 1.0,
             draw_clip: None,
+            capture_band: None,
         }
     }
 
@@ -309,6 +374,7 @@ mod tests {
                 Rectangle::new(Point::from((0., 0.)), Size::from((100., 100.))),
                 true,
             ),
+            false,
             false,
         )
         .expect("visible");
@@ -342,6 +408,7 @@ mod tests {
                 Rectangle::new(Point::from((0., 0.)), Size::from((10., 10.))),
                 false,
             ),
+            false,
             false,
         )
         .unwrap();
@@ -387,6 +454,7 @@ mod tests {
             radius,
             base_params(geo, true),
             false,
+            false,
         )
         .unwrap();
 
@@ -412,6 +480,7 @@ mod tests {
                 false,
             ),
             false,
+            false,
         );
         assert!(plan.is_none());
     }
@@ -434,7 +503,7 @@ mod tests {
         base.lens_depth = Some(0.15);
 
         let key_base =
-            ResolvedEffectPlan::capture_key(blur, base, true, false, test_capture_band());
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, test_capture_band());
 
         // material_alpha = 0.5 fade.
         let mut faded = base;
@@ -447,7 +516,7 @@ mod tests {
         faded.lens_depth = Some(0.075);
         assert_eq!(
             key_base,
-            ResolvedEffectPlan::capture_key(blur, faded, true, false, test_capture_band())
+            ResolvedEffectPlan::capture_key(blur, faded, true, false, false, test_capture_band())
         );
 
         // interaction = 0.4 boost on top.
@@ -460,7 +529,7 @@ mod tests {
         boosted.lens_depth = Some(0.21);
         assert_eq!(
             key_base,
-            ResolvedEffectPlan::capture_key(blur, boosted, true, false, test_capture_band())
+            ResolvedEffectPlan::capture_key(blur, boosted, true, false, false, test_capture_band())
         );
 
         // The visual key must still see every one of those changes.
@@ -482,7 +551,8 @@ mod tests {
         effect.blur = Some(true);
         effect.xray = Some(false);
         let blur = Blur::default();
-        let key = ResolvedEffectPlan::capture_key(blur, effect, true, false, test_capture_band());
+        let key =
+            ResolvedEffectPlan::capture_key(blur, effect, true, false, false, test_capture_band());
 
         // passes / offset / off feed the pyramid — key must change.
         assert_ne!(
@@ -494,6 +564,7 @@ mod tests {
                 },
                 effect,
                 true,
+                false,
                 false,
                 test_capture_band()
             )
@@ -508,6 +579,7 @@ mod tests {
                 effect,
                 true,
                 false,
+                false,
                 test_capture_band()
             )
         );
@@ -518,7 +590,8 @@ mod tests {
                 effect,
                 true,
                 false,
-                test_capture_band(),
+                false,
+                test_capture_band()
             )
         );
 
@@ -534,6 +607,7 @@ mod tests {
                 effect,
                 true,
                 false,
+                false,
                 test_capture_band()
             )
         );
@@ -544,7 +618,7 @@ mod tests {
         no_blur.tint_amount = Some(0.2);
         assert_ne!(
             key,
-            ResolvedEffectPlan::capture_key(blur, no_blur, true, false, test_capture_band())
+            ResolvedEffectPlan::capture_key(blur, no_blur, true, false, false, test_capture_band())
         );
     }
 
@@ -558,8 +632,8 @@ mod tests {
 
         let blur = Blur::default();
         assert_ne!(
-            ResolvedEffectPlan::capture_key(blur, live, true, false, test_capture_band()),
-            ResolvedEffectPlan::capture_key(blur, xray, true, false, test_capture_band())
+            ResolvedEffectPlan::capture_key(blur, live, true, false, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, xray, true, false, false, test_capture_band())
         );
     }
 
@@ -577,9 +651,9 @@ mod tests {
         };
 
         let static_key =
-            ResolvedEffectPlan::capture_key(blur, effect, true, false, test_capture_band());
+            ResolvedEffectPlan::capture_key(blur, effect, true, false, false, test_capture_band());
         let anim_key =
-            ResolvedEffectPlan::capture_key(blur, effect, true, true, test_capture_band());
+            ResolvedEffectPlan::capture_key(blur, effect, true, true, false, test_capture_band());
         assert_ne!(static_key, anim_key);
         assert_eq!(
             static_key.blur_options.expect("blur on").downsample_shift,
@@ -590,10 +664,93 @@ mod tests {
             blur::ANIM_DOWNSAMPLE_SHIFT
         );
 
+        // T-32 R-3b: fast motion promotes to the two-step tier; the tier is
+        // part of the capture key so engage/disengage frames re-capture.
+        let fast_key =
+            ResolvedEffectPlan::capture_key(blur, effect, true, false, true, test_capture_band());
+        assert_ne!(fast_key, static_key);
+        assert_ne!(fast_key, anim_key);
+        assert_eq!(
+            fast_key.blur_options.expect("blur on").downsample_shift,
+            blur::FAST_MOTION_DOWNSAMPLE_SHIFT
+        );
+        // Fast motion engages regardless of the geometry-animation flag (temporary):
+        // the fast tier dominates the animation tier in the key.
+        let fast_static_geom =
+            ResolvedEffectPlan::capture_key(blur, effect, true, false, true, test_capture_band());
+        assert_eq!(fast_key, fast_static_geom);
+
+        // F4: a kernel that cannot trade two passes falls back to the animation tier
+        // (passes=2, fast frame) instead of dropping to static — a fast frame must never
+        // be *more* expensive than a slow animation frame.
+        let blur2 = Blur { passes: 2, ..blur };
+        let fast2 =
+            ResolvedEffectPlan::capture_key(blur2, effect, true, false, true, test_capture_band());
+        assert_eq!(
+            fast2.blur_options.expect("blur on").downsample_shift,
+            blur::ANIM_DOWNSAMPLE_SHIFT
+        );
+        assert_eq!(
+            fast2,
+            ResolvedEffectPlan::capture_key(blur2, effect, true, true, false, test_capture_band()),
+            "fast fallback must equal the animation tier"
+        );
+
         let off = Blur { off: true, ..blur };
         assert_eq!(
-            ResolvedEffectPlan::capture_key(off, effect, true, false, test_capture_band()),
-            ResolvedEffectPlan::capture_key(off, effect, true, true, test_capture_band()),
+            ResolvedEffectPlan::capture_key(off, effect, true, false, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(off, effect, true, true, false, test_capture_band()),
+        );
+        // Blur off: the tier must not change the key either (no kernel to tier).
+        assert_eq!(
+            ResolvedEffectPlan::capture_key(off, effect, true, false, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(off, effect, true, false, true, test_capture_band()),
+        );
+    }
+
+    /// T-32 R-3a: the quantized band is an outward-expanded strict superset,
+    /// idempotent, and stable for negative (edge-clamped) coordinates.
+    #[test]
+    fn quantize_capture_band_is_superset_and_idempotent() {
+        let band = Rectangle::new(Point::from((13, -7)), Size::from((203, 99)));
+        let q = quantize_capture_band(band);
+        assert!(q.loc.x <= band.loc.x && q.loc.y <= band.loc.y);
+        assert!(q.loc.x + q.size.w >= band.loc.x + band.size.w);
+        assert!(q.loc.y + q.size.h >= band.loc.y + band.size.h);
+        assert_eq!(q.loc.x % CAPTURE_BAND_QUANTUM, 0);
+        assert_eq!(q.loc.y % CAPTURE_BAND_QUANTUM, 0);
+        assert_eq!((q.loc.x + q.size.w) % CAPTURE_BAND_QUANTUM, 0);
+        assert_eq!((q.loc.y + q.size.h) % CAPTURE_BAND_QUANTUM, 0);
+        assert_eq!(quantize_capture_band(q), q, "idempotent");
+
+        // A band already aligned to the grid is unchanged.
+        let aligned = Rectangle::new(Point::from((16, 8)), Size::from((64, 40)));
+        assert_eq!(quantize_capture_band(aligned), aligned);
+
+        // Sub-cell motion keeps the same quantized band when both edges stay
+        // inside their grid cells (capture reuse during a spring's small moves).
+        let base = Rectangle::new(Point::from((18, 10)), Size::from((50, 30)));
+        let q_base = quantize_capture_band(base);
+        let moved = Rectangle::new(Point::from((18 + 3, 10)), Size::from((50, 30)));
+        assert_eq!(quantize_capture_band(moved), q_base);
+        // Crossing an 8px cell boundary changes the quantized band (re-capture).
+        let crossed = Rectangle::new(Point::from((18 + 7, 10)), Size::from((50, 30)));
+        assert_ne!(quantize_capture_band(crossed), q_base);
+    }
+
+    /// T-32 R-3a: quantization only engages while geometry is animating.
+    #[test]
+    fn resolve_capture_band_quantizes_only_while_animating() {
+        let band = Rectangle::new(Point::from((13, 17)), Size::from((203, 99)));
+        assert_eq!(
+            ResolvedEffectPlan::resolve_capture_band(band, false),
+            band,
+            "static bands stay precise"
+        );
+        assert_eq!(
+            ResolvedEffectPlan::resolve_capture_band(band, true),
+            quantize_capture_band(band),
+            "animating bands expand to the grid"
         );
     }
 
@@ -630,6 +787,7 @@ mod tests {
                     effect,
                     true,
                     geometry_animating,
+                    false,
                     test_capture_band(),
                 );
                 let plan = ResolvedEffectPlan::build(
@@ -642,6 +800,7 @@ mod tests {
                         true,
                     ),
                     geometry_animating,
+                    false,
                 )
                 .expect("blurred effect stays visible");
                 assert_eq!(key.blur, plan.blur);
@@ -670,6 +829,7 @@ mod tests {
                 Rectangle::new(Point::from((2., 3.)), Size::from((40., 60.))),
                 true,
             ),
+            false,
             false,
         )
         .unwrap();
@@ -705,6 +865,7 @@ mod tests {
             CornerRadius::default(),
             base_params(geo, true),
             false,
+            false,
         )
         .expect("visible");
         let anim_plan = ResolvedEffectPlan::build(
@@ -714,6 +875,7 @@ mod tests {
             CornerRadius::default(),
             base_params(geo, true),
             true,
+            false,
         )
         .expect("visible");
 
@@ -757,6 +919,7 @@ mod tests {
             CornerRadius::default(),
             base_params(geo, true),
             false,
+            false,
         )
         .expect("tinted glass stays visible");
         let anim_plan = ResolvedEffectPlan::build(
@@ -766,6 +929,7 @@ mod tests {
             CornerRadius::default(),
             base_params(geo, true),
             true,
+            false,
         )
         .expect("tinted glass stays visible");
 

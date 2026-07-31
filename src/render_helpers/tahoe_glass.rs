@@ -325,7 +325,7 @@ fn render_region(
     // visible halo. The `clip` flag only selects rounded vs rectangular
     // corner semantics inside that visible bound.
     let sample_geometry = expand_rect(geometry, sample_padding);
-    let params = glass_region_render_params(
+    let mut params = glass_region_render_params(
         geometry,
         sample_geometry,
         region.flags.clip,
@@ -353,12 +353,19 @@ fn render_region(
     let has_blur_region = region.flags.blur;
     let visual =
         ResolvedEffectPlan::visual_key(blur_kernel, effect, has_blur_region, visible_radius);
-    let capture_band = params.geometry.to_physical_precise_round(scale);
+    let precise_band = params.geometry.to_physical_precise_round(scale);
+    // T-32 R-3a: 8px-grid superset capture while the region animates.
+    let capture_band = ResolvedEffectPlan::resolve_capture_band(precise_band, geometry_animating);
+    if capture_band != precise_band {
+        params.capture_band = Some(capture_band);
+    }
+    let fast_motion = renderer.background_effect.is_fast_motion(capture_band);
     let capture = ResolvedEffectPlan::capture_key(
         blur_kernel,
         effect,
         has_blur_region,
         geometry_animating,
+        fast_motion,
         capture_band,
     );
     renderer.background_effect.note_plan_keys(visual, capture);
@@ -370,6 +377,7 @@ fn render_region(
         visible_radius,
         params,
         geometry_animating,
+        fast_motion,
     ) {
         let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
         renderer
@@ -452,6 +460,7 @@ fn glass_region_render_params(
         clip: Some((visible_geometry, corner)),
         scale,
         draw_clip,
+        capture_band: None,
     }
 }
 
@@ -600,6 +609,7 @@ mod tests {
             clip: clip.then_some((visible, radius)),
             scale,
             draw_clip,
+            capture_band: None,
         }
     }
 
@@ -632,15 +642,8 @@ mod tests {
             Point::from((90, 40)),
             Size::from((220, 100)),
         ));
-        let params = glass_region_render_params(
-            visible,
-            sample,
-            false,
-            radius,
-            0.85,
-            1.25,
-            draw_clip,
-        );
+        let params =
+            glass_region_render_params(visible, sample, false, radius, 0.85, 1.25, draw_clip);
 
         assert_eq!(params.geometry, sample, "capture stays on expanded sample");
         let (clip_geo, clip_radius) = params
@@ -676,15 +679,7 @@ mod tests {
             bottom_left: 2.0,
         };
         let sample = expand_rect(visible, 16.0);
-        let params = glass_region_render_params(
-            visible,
-            sample,
-            true,
-            radius,
-            1.0,
-            1.0,
-            None,
-        );
+        let params = glass_region_render_params(visible, sample, true, radius, 1.0, 1.0, None);
 
         assert_eq!(params.geometry, sample);
         let (clip_geo, clip_radius) = params.clip.expect("clip always Some");
@@ -704,15 +699,8 @@ mod tests {
             "documents the pre-fix wiring that painted sample padding"
         );
 
-        let fixed = glass_region_render_params(
-            visible,
-            sample,
-            false,
-            rounded_radius(),
-            1.0,
-            1.0,
-            None,
-        );
+        let fixed =
+            glass_region_render_params(visible, sample, false, rounded_radius(), 1.0, 1.0, None);
         assert!(
             fixed.clip.is_some(),
             "fixed wiring must always supply a visible clip"

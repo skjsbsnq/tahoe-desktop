@@ -13,7 +13,7 @@ use smithay::backend::renderer::{
 };
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::{GlassOptions, RenderParams};
@@ -45,6 +45,9 @@ pub struct FramebufferEffectElement {
     glass: GlassOptions,
     alpha: f32,
     draw_clip: Option<Rectangle<i32, Physical>>,
+    /// T-32 R-3a: quantized superset band the capture blit actually read
+    /// (`None` = precise element geometry, pre-T-32 behavior).
+    capture_band: Option<Rectangle<i32, Physical>>,
 }
 
 #[derive(Debug)]
@@ -55,6 +58,37 @@ struct Inner {
     intermediate: Option<GlesTexture>,
     /// Reusable storage for subregion-filtered damage rects.
     subregion_damage: Vec<Rectangle<i32, Physical>>,
+}
+
+/// T-32 R-3a: whether the element renders at its own geometry — i.e. no
+/// crop/rescale/relocate wrapper shifted the visible destination beyond the
+/// quantized cell. Wrapped elements must blit the *visible* (post-wrap) band:
+/// quantizing the un-wrapped geometry would sample the wrong backdrop (the
+/// 61138be-class "sampling band ≠ visible band" failure, which is why the
+/// pre-T-32 code always captured at `dst`).
+fn capture_band_applies(
+    dst: Rectangle<i32, Physical>,
+    own_geometry: Rectangle<i32, Physical>,
+) -> bool {
+    // Exact size, ≤1px location slack: covers f32-scale round-trip wobble on
+    // non-dyadic fractional scales without admitting real wrap offsets (a 1px
+    // relocation stays inside the 8px cell, so the superset still holds).
+    dst.size == own_geometry.size
+        && (dst.loc.x - own_geometry.loc.x).abs() <= 1
+        && (dst.loc.y - own_geometry.loc.y).abs() <= 1
+}
+
+/// T-32 R-3a: the band actually blitted — the quantized superset when the
+/// element renders unwrapped, else the precise (post-wrap) destination.
+fn resolve_capture_dst(
+    dst: Rectangle<i32, Physical>,
+    own_geometry: Rectangle<i32, Physical>,
+    capture_band: Option<Rectangle<i32, Physical>>,
+) -> Rectangle<i32, Physical> {
+    match capture_band {
+        Some(band) if capture_band_applies(dst, own_geometry) => band,
+        _ => dst,
+    }
 }
 
 impl FramebufferEffect {
@@ -101,6 +135,7 @@ impl FramebufferEffect {
             glass,
             alpha: params.alpha,
             draw_clip: params.draw_clip,
+            capture_band: params.capture_band,
         }
     }
 }
@@ -110,6 +145,7 @@ impl FramebufferEffectElement {
         &self,
         crop: Rectangle<f64, Logical>,
         transform: Transform,
+        band_subrect: Option<(Vec2, Vec2)>,
     ) -> [Uniform<'static>; 16] {
         let offset = crop.loc - (self.clip_geo.loc - self.geometry.loc);
         let offset = Vec2::new(offset.x as f32, offset.y as f32);
@@ -117,8 +153,19 @@ impl FramebufferEffectElement {
         let clip_size = Vec2::new(self.clip_geo.size.w as f32, self.clip_geo.size.h as f32);
 
         // Our v_coords are [0, 1] inside crop. We want them to be [0, 1] inside clip_geo.
-        let input_to_clip_geo =
+        let mut input_to_clip_geo =
             Mat3::from_scale(crop_size / clip_size) * Mat3::from_translation(offset / crop_size);
+
+        // T-32 R-3a: with a quantized superset capture, v_coords span only the
+        // sub-rectangle of the texture that holds the visible (precise) band.
+        // Remap them so geometry coords stay anchored to the visible band —
+        // otherwise the glass SDF (corner rounding, rim, highlights, clip)
+        // shifts by the band expansion (0–7px) and snaps at animation end.
+        // `band_subrect` = (q/p, -rel/q) per axis in texture-native units.
+        if let Some((scale, translate)) = band_subrect {
+            input_to_clip_geo =
+                input_to_clip_geo * Mat3::from_scale(scale) * Mat3::from_translation(translate);
+        }
 
         // Revert the effect of the texture transform.
         let transform_mat = Mat3::from_translation(Vec2::new(0.5, 0.5))
@@ -208,11 +255,27 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             // seems to skip out-of-bounds pixels, even though my reading of the docs suggests
             // otherwise (we use GL_LINEAR filter). So, clamp dst to the framebuffer bounds
             // ourselves.
-            let clamped_dst = match dst.intersection(output_rect) {
+            //
+            // T-32 R-3a: while the element carries a quantized superset band and renders at
+            // its own geometry (no wrap shifted the visible destination), blit that band —
+            // the capture key was built from it, so the cached texture stays valid for
+            // sub-cell band motion. Wrapped/cropped elements fall back to the precise
+            // (post-wrap) destination: the backdrop must be sampled where the band is
+            // actually visible (61138be lesson).
+            let own_geometry = self
+                .geometry
+                .to_physical_precise_round(Scale::from(f64::from(self.scale)));
+            let capture_dst = resolve_capture_dst(dst, own_geometry, self.capture_band);
+            // Rotated outputs keep the precise path: the sub-rectangle mapping is
+            // only derived/verified for the Normal transform (conservative).
+            let quantized = transform == Transform::Normal
+                && capture_band_applies(dst, own_geometry)
+                && self.capture_band.is_some();
+            let clamped_dst = match capture_dst.intersection(output_rect) {
                 Some(clamped) => clamped,
                 None => return Ok(()),
             };
-            let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
+            let clamp_scale = clamped_dst.size.to_f64() / capture_dst.size.to_f64();
 
             let dst = transform.transform_rect_in(clamped_dst, &output_rect.size);
 
@@ -234,11 +297,20 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             //
             // Here we use src.size rather than geometry directly because src takes into account
             // cropping.
-            let size = src
-                .size
-                .to_logical(1., Transform::Normal)
-                .upscale(clamp_scale)
-                .to_physical_precise_round(self.scale);
+            //
+            // T-32 R-3a: when the quantized band is blitted, size the capture texture from
+            // that band (1:1 with the blit source) instead of src.size — the overview
+            // zoom-out rationale does not apply (quantization only engages during geometry
+            // animations, never the overview), and src.size would squeeze the superset band
+            // into a precise-sized texture (visible softening on blur-off paths).
+            let size = if quantized {
+                clamped_dst.size
+            } else {
+                src.size
+                    .to_logical(1., Transform::Normal)
+                    .upscale(clamp_scale)
+                    .to_physical_precise_round(self.scale)
+            };
             let size = transform.transform_size(size);
 
             let size = size.to_logical(1).to_buffer(1, Transform::Normal);
@@ -390,6 +462,48 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         };
         let clamp_offset = clamped_dst.loc - dst.loc;
 
+        // T-32 R-3a: when the capture texture holds the quantized superset band, draw only
+        // the sub-rectangle covering the precise clamped destination. The mapping goes
+        // through the output transform so rotated outputs stay consistent with capture.
+        // Wrapped/cropped elements fall back to the full texture (capture also used the
+        // precise post-wrap destination).
+        let own_geometry = self
+            .geometry
+            .to_physical_precise_round(Scale::from(f64::from(self.scale)));
+        // Rotated outputs keep the precise path (see capture_framebuffer).
+        let unwrapped =
+            frame.transformation() == Transform::Normal && capture_band_applies(dst, own_geometry);
+        let texture_rect = match (unwrapped, self.capture_band) {
+            (true, Some(quantized)) => {
+                let Some(q_clamped) = quantized.intersection(output_rect) else {
+                    return Ok(());
+                };
+                // Precise clamped band relative to the quantized band, in output space.
+                let rel = Rectangle::new(clamped_dst.loc - q_clamped.loc, clamped_dst.size);
+                // Same transform the capture blit applied; maps into texture-native coords.
+                let rel = frame
+                    .transformation()
+                    .transform_rect_in(rel, &q_clamped.size);
+                let q_native = frame
+                    .transformation()
+                    .transform_size(q_clamped.size)
+                    .to_f64();
+                let x_ratio = texture.size().w as f64 / q_native.w;
+                let y_ratio = texture.size().h as f64 / q_native.h;
+                Rectangle::new(
+                    Point::<f64, Buffer>::from((
+                        rel.loc.x as f64 * x_ratio,
+                        rel.loc.y as f64 * y_ratio,
+                    )),
+                    Size::<f64, Buffer>::from((
+                        rel.size.w as f64 * x_ratio,
+                        rel.size.h as f64 * y_ratio,
+                    )),
+                )
+            }
+            _ => Rectangle::from_size(texture.size().to_f64()),
+        };
+
         // Filter damage by subregion, reusing the stored Vec to avoid allocation.
         let filtered = &mut inner.subregion_damage;
         filtered.clear();
@@ -440,14 +554,47 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         );
 
         let program = Shaders::get_from_frame(frame).postprocess_and_clip.clone();
-        let uniforms = program
-            .is_some()
-            .then(|| self.compute_uniforms(crop, frame.transformation()));
+        let uniforms = program.is_some().then(|| {
+            // T-32 R-3a: compensate the shader geometry mapping for the quantized
+            // sub-rectangle (q/p scale, -rel/q translation, texture-native units).
+            let band_subrect = match (unwrapped, self.capture_band) {
+                (true, Some(quantized)) => {
+                    if let Some(q_clamped) = quantized.intersection(output_rect) {
+                        let rel = Rectangle::new(clamped_dst.loc - q_clamped.loc, clamped_dst.size);
+                        let rel = frame
+                            .transformation()
+                            .transform_rect_in(rel, &q_clamped.size);
+                        let q_native = frame
+                            .transformation()
+                            .transform_size(q_clamped.size)
+                            .to_f64();
+                        let p_native = frame
+                            .transformation()
+                            .transform_size(clamped_dst.size)
+                            .to_f64();
+                        Some((
+                            Vec2::new(
+                                q_native.w as f32 / p_native.w as f32,
+                                q_native.h as f32 / p_native.h as f32,
+                            ),
+                            Vec2::new(
+                                -(rel.loc.x as f32) / q_native.w as f32,
+                                -(rel.loc.y as f32) / q_native.h as f32,
+                            ),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            self.compute_uniforms(crop, frame.transformation(), band_subrect)
+        });
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(
             texture,
-            Rectangle::from_size(texture.size().to_f64()),
+            texture_rect,
             clamped_dst,
             damage,
             &[],
@@ -522,6 +669,30 @@ mod tests {
 
     use super::*;
 
+    /// T-32 R-3a: quantization applies only when the element renders at its own
+    /// geometry; wrapped/cropped elements keep capturing the precise destination
+    /// (the backdrop must be sampled where the band is visible — 61138be lesson).
+    #[test]
+    fn resolve_capture_dst_quantizes_only_unwrapped() {
+        let own = Rectangle::new(Point::from((100, 40)), Size::from((360, 480)));
+        let quantized = Rectangle::new(Point::from((96, 40)), Size::from((368, 480)));
+
+        // Unwrapped (dst == own geometry): the quantized superset band is blitted.
+        assert_eq!(resolve_capture_dst(own, own, Some(quantized)), quantized);
+
+        // Wrapped (visible dst moved by a transform wrapper): precise dst wins.
+        let wrapped = Rectangle::new(Point::from((108, 40)), Size::from((360, 480)));
+        assert_eq!(resolve_capture_dst(wrapped, own, Some(quantized)), wrapped);
+
+        // No quantized band: dst always (pre-T-32 behavior).
+        assert_eq!(resolve_capture_dst(own, own, None), own);
+        assert_eq!(resolve_capture_dst(wrapped, own, None), wrapped);
+
+        // Cropped (visible dst smaller than own geometry): precise dst wins.
+        let cropped = Rectangle::new(Point::from((100, 40)), Size::from((200, 100)));
+        assert_eq!(resolve_capture_dst(cropped, own, Some(quantized)), cropped);
+    }
+
     #[test]
     fn draw_clip_is_relative_to_clamped_destination() {
         let dst = Rectangle::new(Point::from((90, 80)), Size::from((240, 160)));
@@ -564,6 +735,7 @@ mod tests {
                 clip: None,
                 scale: 1.25,
                 draw_clip: Some(draw_clip),
+                capture_band: None,
             },
             None,
             0.,
@@ -632,6 +804,7 @@ mod tests {
                 clip: None,
                 scale: 1.25,
                 draw_clip: None,
+                capture_band: None,
             },
             None,
             0.,
@@ -668,6 +841,7 @@ mod tests {
                 clip: Some((visible, radius)),
                 scale: 1.25,
                 draw_clip: None,
+                capture_band: None,
             },
             None,
             0.,

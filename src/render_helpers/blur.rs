@@ -41,6 +41,18 @@ pub struct BlurOptions {
 /// A named policy constant so plan resolution and tests agree on the tier.
 pub const ANIM_DOWNSAMPLE_SHIFT: u8 = 1;
 
+/// Depth of the fast-motion downsample tier (T-32 R-3b): two steps while the
+/// captured band moves more than [`FAST_MOTION_DISPLACEMENT_PX`] per frame.
+/// MAX_DOWNSAMPLE_SHIFT=4 leaves headroom; the tier is temporary — it flips
+/// back through the P06 capture-key invalidation contract. When the kernel
+/// cannot trade two passes, fast frames fall back to the animation tier.
+pub const FAST_MOTION_DOWNSAMPLE_SHIFT: u8 = 2;
+
+/// Band displacement per frame that promotes the capture to the fast-motion
+/// downsample tier. Measured as Manhattan distance between the *quantized*
+/// band locations (multiples of the 8px capture cell), i.e. three cells.
+pub const FAST_MOTION_DISPLACEMENT_PX: i32 = 24;
+
 /// Hard bound on `downsample_shift`; a 1/256-area capture is far past any
 /// sensible quality/perf trade and only guards programmatic misuse.
 const MAX_DOWNSAMPLE_SHIFT: u8 = 4;
@@ -53,6 +65,28 @@ pub fn anim_downsample_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
         std::env::var_os("NIRI_DISABLE_ANIM_BLUR_DOWNSAMPLE")
+            .is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// `NIRI_DISABLE_FAST_MOTION_DOWNSAMPLE=1` disables the T-32 fast-motion
+/// downsample tier for A/B measurement (same idiom as the P06 switch).
+pub fn fast_motion_downsample_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var_os("NIRI_DISABLE_FAST_MOTION_DOWNSAMPLE")
+            .is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// `NIRI_DISABLE_BAND_QUANTIZATION=1` disables the T-32 8px capture-band
+/// quantization for A/B measurement (strict superset capture stays off).
+pub fn band_quantization_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var_os("NIRI_DISABLE_BAND_QUANTIZATION")
             .is_some_and(|value| !value.is_empty() && value != "0")
     })
 }

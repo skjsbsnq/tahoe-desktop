@@ -5692,6 +5692,7 @@ impl<W: LayoutElement> Layout<W> {
                 clip: Some((rect, radius)),
                 scale,
                 draw_clip: None,
+                capture_band: None,
             };
             let elem = move_.snap_preview.effect.render(
                 None,

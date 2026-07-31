@@ -14,7 +14,7 @@ use crate::render_helpers::resolved_effect_plan::{
     ResolvedEffectCaptureKey, ResolvedEffectPlan, ResolvedEffectVisualKey,
 };
 use crate::render_helpers::xray::{XrayElement, XrayPos};
-use crate::render_helpers::RenderCtx;
+use crate::render_helpers::{blur, RenderCtx};
 use crate::utils::region::TransformedRegion;
 use crate::utils::surface_geo;
 
@@ -134,6 +134,13 @@ pub struct RenderParams {
     /// bounds for blur/refraction padding, while the panel itself must remain
     /// clipped to the reveal edge.
     pub draw_clip: Option<Rectangle<i32, smithay::utils::Physical>>,
+    /// T-32 R-3a: the physical capture band actually blitted this frame.
+    ///
+    /// `None` = the precise rounded geometry (pre-quantization behavior).
+    /// `Some(band)` = an outward-expanded 8px-grid superset used while geometry
+    /// is animating; the capture key, the blit source and the draw-side
+    /// sub-rectangle all agree on this band.
+    pub capture_band: Option<Rectangle<i32, smithay::utils::Physical>>,
 }
 
 /// Geometry to use when the client supplied an explicit blur region.
@@ -204,6 +211,20 @@ impl BackgroundEffect {
             self.last_capture = Some(capture);
             self.nonxray.damage();
         }
+    }
+
+    /// T-32 R-3b: whether the band moved more than the fast-motion threshold
+    /// since the last noted capture. Used to promote the downsample tier while
+    /// the band crosses cells quickly; the tier is temporary and flips back
+    /// through the capture-key invalidation contract (P06). Displacement is
+    /// measured on the *quantized* band locations (multiples of 8px), so the
+    /// 24px threshold corresponds to three 8px cells.
+    pub fn is_fast_motion(&self, capture_band: Rectangle<i32, smithay::utils::Physical>) -> bool {
+        self.last_capture.as_ref().is_some_and(|last| {
+            let dx = (last.capture_geometry.loc.x - capture_band.loc.x).abs();
+            let dy = (last.capture_geometry.loc.y - capture_band.loc.y).abs();
+            dx + dy > blur::FAST_MOTION_DISPLACEMENT_PX
+        })
     }
 
     /// Render using an immutable plan only. No config fallback or radius rewrite.
@@ -336,6 +357,7 @@ fn render_params_for_tile(
         clip,
         scale,
         draw_clip: None,
+        capture_band: None,
     })
 }
 
@@ -493,7 +515,7 @@ pub fn render_for_tile(
         let mut surface_geo = surface_geo(states).unwrap_or_default().to_f64();
         surface_geo.loc += surface_off;
 
-        let Some(params) = render_params_for_tile(
+        let Some(mut params) = render_params_for_tile(
             geometry,
             scale,
             clip_to_geometry,
@@ -509,12 +531,21 @@ pub fn render_for_tile(
 
         // R12: single resolve before GPU path — no update_config / radius rewrite order.
         let visual = ResolvedEffectPlan::visual_key(blur_config, effect, has_blur_region, radius);
-        let capture_band = params.geometry.to_physical_precise_round(scale);
+        let precise_band = params.geometry.to_physical_precise_round(scale);
+        // T-32 R-3a: while geometry animates, capture on an 8px-grid superset so sub-cell
+        // band motion reuses the cached blur (strict superset — draw maps the precise band).
+        let capture_band =
+            ResolvedEffectPlan::resolve_capture_band(precise_band, geometry_animating);
+        if capture_band != precise_band {
+            params.capture_band = Some(capture_band);
+        }
+        let fast_motion = background_effect.is_fast_motion(capture_band);
         let capture = ResolvedEffectPlan::capture_key(
             blur_config,
             effect,
             has_blur_region,
             geometry_animating,
+            fast_motion,
             capture_band,
         );
         background_effect.note_plan_keys(visual, capture);
@@ -526,6 +557,7 @@ pub fn render_for_tile(
             radius,
             params,
             geometry_animating,
+            fast_motion,
         ) else {
             return;
         };
@@ -541,7 +573,7 @@ mod tests {
     use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
     use super::{blur_region_bounding_box, transformed_blur_region_bounding_box, *};
-    use crate::render_helpers::resolved_effect_plan::ResolvedEffectPlan;
+    use crate::render_helpers::resolved_effect_plan::{quantize_capture_band, ResolvedEffectPlan};
 
     /// A live (non-xray) tahoe-like effect config: blur on, xray explicitly off.
     fn live_effect() -> niri_config::BackgroundEffect {
@@ -565,6 +597,7 @@ mod tests {
             )),
             scale: 1.,
             draw_clip: None,
+            capture_band: None,
         }
     }
 
@@ -603,7 +636,7 @@ mod tests {
         let base = live_effect();
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, CornerRadius::default()),
-            ResolvedEffectPlan::capture_key(blur, base, true, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, test_capture_band()),
         );
         let (fb0, dmg0) = commits(&effect);
 
@@ -615,7 +648,7 @@ mod tests {
         eased.contrast = Some(1.05);
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, eased, true, CornerRadius::default()),
-            ResolvedEffectPlan::capture_key(blur, eased, true, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, eased, true, false, false, test_capture_band()),
         );
         let (fb1, dmg1) = commits(&effect);
 
@@ -641,7 +674,7 @@ mod tests {
 
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, CornerRadius::default()),
-            ResolvedEffectPlan::capture_key(blur, base, true, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, test_capture_band()),
         );
         let (fb0, dmg0) = commits(&effect);
 
@@ -651,7 +684,14 @@ mod tests {
         };
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(stronger, base, true, CornerRadius::default()),
-            ResolvedEffectPlan::capture_key(stronger, base, true, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(
+                stronger,
+                base,
+                true,
+                false,
+                false,
+                test_capture_band(),
+            ),
         );
         let (fb1, dmg1) = commits(&effect);
 
@@ -690,14 +730,14 @@ mod tests {
         let band_a = Rectangle::new(Point::from((100, 40)), Size::from((360, 480)));
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, radius),
-            ResolvedEffectPlan::capture_key(blur, base, true, false, band_a),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, band_a),
         );
         let (fb0, dmg0) = commits(&effect);
 
         // Same band: cached blurred texture stays valid.
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, radius),
-            ResolvedEffectPlan::capture_key(blur, base, true, false, band_a),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, band_a),
         );
         let (fb1, _) = commits(&effect);
         assert_eq!(
@@ -711,7 +751,7 @@ mod tests {
         let band_b = Rectangle::new(Point::from((100, 39)), Size::from((360, 480)));
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, radius),
-            ResolvedEffectPlan::capture_key(blur, base, true, false, band_b),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, band_b),
         );
         let (fb2, dmg2) = commits(&effect);
         assert_eq!(
@@ -722,6 +762,118 @@ mod tests {
         // Repaint flows from the effect's own commit bump; the visual
         // fingerprint (material/kernel/radius) did not change.
         assert_eq!(dmg0.advanced_by(&dmg2), Some(0));
+    }
+
+    /// T-32 R-3a: while geometry animates, the capture band is the 8px-grid
+    /// superset — sub-cell band motion produces the same quantized band, so the
+    /// capture key (and the live effect commit) stays put; crossing a cell
+    /// forces a re-capture. (Runtime blits are additionally driven by the
+    /// damage tracker for i32-geometry changes; this test locks the key/commit
+    /// channel.)
+    #[test]
+    fn quantized_band_reuses_capture_within_cell() {
+        let mut effect = BackgroundEffect::new();
+        let blur = niri_config::Blur::default();
+        let base = live_effect();
+        let radius = CornerRadius::default();
+
+        let band = Rectangle::new(Point::from((100, 40)), Size::from((360, 480)));
+        let key = |b: Rectangle<i32, smithay::utils::Physical>| {
+            ResolvedEffectPlan::capture_key(blur, base, true, true, false, b)
+        };
+
+        // Sub-cell move: same quantized band → same key → cache reuse.
+        let q1 = quantize_capture_band(band);
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            key(q1),
+        );
+        let (fb0, _) = commits(&effect);
+        let moved = Rectangle::new(Point::from((100 + 3, 40)), Size::from((360, 480)));
+        let q2 = quantize_capture_band(moved);
+        assert_eq!(q1, q2, "3px move stays inside the same 8px cells");
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            key(q2),
+        );
+        let (fb1, _) = commits(&effect);
+        assert_eq!(
+            fb0.advanced_by(&fb1),
+            Some(0),
+            "same quantized band must reuse the cached texture"
+        );
+
+        // Cell crossing → key changes → re-capture.
+        let crossed = Rectangle::new(Point::from((100 + 8, 40)), Size::from((360, 480)));
+        let q3 = quantize_capture_band(crossed);
+        assert_ne!(q1, q3, "8px move crosses into the next cell");
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            key(q3),
+        );
+        let (fb2, _) = commits(&effect);
+        assert_eq!(
+            fb1.advanced_by(&fb2),
+            Some(1),
+            "a quantized band cell crossing must force a re-capture"
+        );
+    }
+
+    /// T-32 R-3b: the fast-motion tier flip engages and disengages through the
+    /// capture key (P06 contract), forcing a re-capture in both directions.
+    #[test]
+    fn fast_motion_tier_flip_forces_recapture_both_ways() {
+        let mut effect = BackgroundEffect::new();
+        let blur = niri_config::Blur {
+            passes: 3,
+            ..niri_config::Blur::default()
+        };
+        let base = live_effect();
+        let radius = CornerRadius::default();
+        let band = Rectangle::new(Point::from((100, 40)), Size::from((360, 480)));
+
+        let static_key = ResolvedEffectPlan::capture_key(blur, base, true, false, false, band);
+        let fast_key = ResolvedEffectPlan::capture_key(blur, base, true, false, true, band);
+
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            static_key,
+        );
+        let (fb0, _) = commits(&effect);
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            fast_key,
+        );
+        let (fb1, _) = commits(&effect);
+        assert_eq!(fb0.advanced_by(&fb1), Some(1), "engage must re-capture");
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            static_key,
+        );
+        let (fb2, _) = commits(&effect);
+        assert_eq!(fb1.advanced_by(&fb2), Some(1), "disengage must re-capture");
+    }
+
+    /// T-32 R-3b: fast-motion detection compares against the last noted band.
+    #[test]
+    fn is_fast_motion_threshold() {
+        let mut effect = BackgroundEffect::new();
+        let blur = niri_config::Blur::default();
+        let base = live_effect();
+        let radius = CornerRadius::default();
+        let band = Rectangle::new(Point::from((100, 40)), Size::from((360, 480)));
+
+        effect.note_plan_keys(
+            ResolvedEffectPlan::visual_key(blur, base, true, radius),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, band),
+        );
+
+        let near = Rectangle::new(Point::from((100 + 20, 40)), Size::from((360, 480)));
+        assert!(!effect.is_fast_motion(near), "20px is below the threshold");
+        let far = Rectangle::new(Point::from((100 + 25, 40)), Size::from((360, 480)));
+        assert!(effect.is_fast_motion(far), "25px exceeds the threshold");
+        // No previous note yet → never fast.
+        assert!(!BackgroundEffect::new().is_fast_motion(band));
     }
 
     /// P03: on the live path the ExtraDamage element must be pushed before
@@ -737,6 +889,7 @@ mod tests {
             true,
             CornerRadius::default(),
             live_params(),
+            false,
             false,
         )
         .expect("live plan must be visible");
@@ -774,14 +927,14 @@ mod tests {
 
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, radius),
-            ResolvedEffectPlan::capture_key(blur, base, true, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, test_capture_band()),
         );
         let (fb0, dmg0) = commits(&effect);
 
         // Engage frame: the open animation starts moving the surface.
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, radius),
-            ResolvedEffectPlan::capture_key(blur, base, true, true, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, base, true, true, false, test_capture_band()),
         );
         let (fb1, dmg1) = commits(&effect);
         assert_eq!(
@@ -793,7 +946,7 @@ mod tests {
         // Disengage frame: rest state after the animation completes.
         effect.note_plan_keys(
             ResolvedEffectPlan::visual_key(blur, base, true, radius),
-            ResolvedEffectPlan::capture_key(blur, base, true, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, test_capture_band()),
         );
         let (fb2, dmg2) = commits(&effect);
         assert_eq!(
@@ -819,8 +972,8 @@ mod tests {
             ..niri_config::Blur::default()
         };
         assert_eq!(
-            ResolvedEffectPlan::capture_key(blur, base, true, false, test_capture_band()),
-            ResolvedEffectPlan::capture_key(blur, base, true, true, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, base, true, false, false, test_capture_band()),
+            ResolvedEffectPlan::capture_key(blur, base, true, true, false, test_capture_band()),
         );
     }
 
