@@ -123,7 +123,10 @@ impl SeatHandler for State {
         }
         self.niri.cursor_manager.set_cursor_image(image);
         // T-31: the cursor is visible on the output under the pointer only.
-        let pos = self.niri.seat.get_pointer().unwrap().current_location();
+        // NB: cannot call pointer.current_location() here — smithay invokes
+        // cursor_image while PointerInternal's mutex is held, so re-locking
+        // deadlocks. Use the location cached by the input handlers.
+        let pos = self.niri.pointer_pos;
         self.niri.queue_redraw_output_under(pos);
     }
 
@@ -158,7 +161,8 @@ impl TabletSeatHandler for State {
         // FIXME: tablet tools should have their own cursors.
         self.niri.cursor_manager.set_cursor_image(image);
         // T-31: the cursor is visible on the output under the pointer only.
-        let pos = self.niri.seat.get_pointer().unwrap().current_location();
+        // NB: same PointerInternal re-entrancy constraint as cursor_image.
+        let pos = self.niri.pointer_pos;
         self.niri.queue_redraw_output_under(pos);
     }
 }
@@ -365,7 +369,8 @@ impl WaylandDndGrabHandler for State {
         }
 
         // T-31: the DnD icon appears at the pointer.
-        let pos = self.niri.seat.get_pointer().unwrap().current_location();
+        // NB: same PointerInternal re-entrancy constraint as cursor_image.
+        let pos = self.niri.pointer_pos;
         self.niri.queue_redraw_output_under(pos);
     }
 }
@@ -423,7 +428,8 @@ impl crate::niri::Niri {
         self.layout.dnd_end();
         self.dnd_icon = None;
         // T-31: the DnD icon was on the output under the pointer.
-        let pos = self.seat.get_pointer().unwrap().current_location();
+        // NB: same PointerInternal re-entrancy constraint as cursor_image.
+        let pos = self.pointer_pos;
         self.queue_redraw_output_under(pos);
     }
 }

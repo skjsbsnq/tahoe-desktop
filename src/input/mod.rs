@@ -2689,6 +2689,10 @@ impl State {
             }
         }
 
+        // Cache the final pointer location for smithay callback contexts that
+        // cannot re-lock PointerInternal (cursor_image re-entrancy, T-31 fix).
+        self.niri.pointer_pos = new_pos;
+
         self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);
@@ -2784,6 +2788,10 @@ impl State {
                 }
             }
         }
+
+        // Cache the final pointer location for smithay callback contexts that
+        // cannot re-lock PointerInternal (cursor_image re-entrancy, T-31 fix).
+        self.niri.pointer_pos = pos;
 
         let under = self.niri.contents_under(pos);
 

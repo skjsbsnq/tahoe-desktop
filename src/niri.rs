@@ -370,6 +370,12 @@ pub struct Niri {
     /// which passes it down through grabs, which decide what to do with it as they see fit.
     pub pointer_contents: PointContents,
     pub pointer_visibility: PointerVisibility,
+    /// Last known pointer location in global logical coordinates, cached by the
+    /// input handlers (on_pointer_motion/absolute). Smithay re-enters
+    /// PointerInternal's mutex when calling SeatHandler::cursor_image during
+    /// pointer.motion(); reading `current_location()` there deadlocks (T-31
+    /// regression), so smithay callback contexts must use this cache instead.
+    pub pointer_pos: Point<f64, Logical>,
     pub pointer_inactivity_timer: Option<RegistrationToken>,
     /// Whether the pointer inactivity timer got reset this event loop iteration.
     ///
@@ -2931,6 +2937,7 @@ impl Niri {
             dnd_icon: None,
             pointer_contents: PointContents::default(),
             pointer_visibility: PointerVisibility::Visible,
+            pointer_pos: Point::new(0., 0.),
             pointer_inactivity_timer: None,
             pointer_inactivity_timer_got_reset: false,
             notified_activity_this_iteration: false,
