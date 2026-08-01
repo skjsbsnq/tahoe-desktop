@@ -33,7 +33,9 @@ impl PickColorGrab {
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
         // Redraw to update the cursor on the output under it.
-        let pos = state.niri.seat.get_pointer().unwrap().current_location();
+        // NB: PointerGrab callbacks run while smithay holds PointerInternal's
+        // mutex — current_location() would re-lock and deadlock. Use the cache.
+        let pos = state.niri.pointer_pos;
         state.niri.queue_redraw_output_under(pos);
     }
 
@@ -132,7 +134,7 @@ impl PointerGrab<State> for PickColorGrab {
         data.niri.suppressed_buttons.insert(event.button);
 
         if let Some(tx) = data.niri.pick_color.take() {
-            let color = Self::pick_color_at_point(handle.current_location(), data);
+            let color = Self::pick_color_at_point(data.niri.pointer_pos, data);
             let _ = tx.send_blocking(color);
         }
 

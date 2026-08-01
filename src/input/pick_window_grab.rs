@@ -29,7 +29,9 @@ impl PickWindowGrab {
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
         // Redraw to update the cursor on the output under it.
-        let pos = state.niri.seat.get_pointer().unwrap().current_location();
+        // NB: PointerGrab callbacks run while smithay holds PointerInternal's
+        // mutex — current_location() would re-lock and deadlock. Use the cache.
+        let pos = state.niri.pointer_pos;
         state.niri.queue_redraw_output_under(pos);
     }
 }
@@ -71,7 +73,7 @@ impl PointerGrab<State> for PickWindowGrab {
         if let Some(tx) = data.niri.pick_window.take() {
             let _ = tx.send_blocking(
                 data.niri
-                    .window_under(handle.current_location())
+                    .window_under(data.niri.pointer_pos)
                     .map(Mapped::id),
             );
         }

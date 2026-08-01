@@ -130,7 +130,9 @@ impl MoveGrab {
         if let Some(rect) = move_rect {
             data.niri.queue_redraw_overlapping(rect);
         }
-        data.niri.queue_redraw_output_under(data.niri.seat.get_pointer().unwrap().current_location());
+        // NB: PointerGrab callbacks run while smithay holds PointerInternal's
+        // mutex — current_location() would re-lock and deadlock. Use the cache.
+        data.niri.queue_redraw_output_under(data.niri.pointer_pos);
     }
 
     fn begin_move(&mut self, data: &mut State) -> bool {

@@ -207,7 +207,9 @@ impl PointerConstraintsHandler for State {
             return;
         }
 
-        let pointer_pos = pointer.current_location();
+        // NB: smithay may invoke this from within the PointerInternal lock;
+        // current_location() would re-lock and deadlock. Use the cache.
+        let pointer_pos = self.niri.pointer_pos;
         let origin = {
             let live = self
                 .niri
