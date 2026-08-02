@@ -1111,9 +1111,25 @@ impl State {
         };
 
         // We're not changing the global cursor location here, so if the contents did not change,
-        // then nothing changed.
+        // then nothing changed. However, our cache can agree with `under` while smithay's own
+        // pointer focus is stale: ClickGrab releases with restore_focus=false, so after a click
+        // the focus stays pinned to the button-down surface even when a layer surface mapped
+        // under the pointer meanwhile (our cache already tracked it during the grab, so the
+        // equality check alone would skip the healing motion). The next zero-motion click (e.g.
+        // a touchpad tap on a freshly opened popup) would then be delivered to the stale
+        // surface. While a grab is active the divergence is intentional — heal only ungrabbed.
         if self.niri.pointer_contents == under {
-            return false;
+            if pointer.is_grabbed() {
+                return false;
+            }
+            let focus_matches = match (&under.surface, pointer.current_focus()) {
+                (Some((surface, _)), Some(focus)) => *surface == focus,
+                (None, None) => true,
+                _ => false,
+            };
+            if focus_matches {
+                return false;
+            }
         }
 
         // Disable the hidden pointer if the contents underneath have changed.
