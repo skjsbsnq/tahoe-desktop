@@ -36,6 +36,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
+use smithay::wayland::shell::wlr_layer;
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
 use touch_overview_grab::TouchOverviewGrab;
 
@@ -3134,9 +3135,35 @@ impl State {
 
         self.update_pointer_contents();
 
+        // T-29 first-click swallow: clearing on-demand layer focus while the
+        // press target belongs to the same client (shell popup / dismiss
+        // layer) put the holder's wl_keyboard.leave between press and
+        // release; QtWayland maps keyboard-focus loss to ApplicationInactive
+        // and Qt Quick then cancels the pressed MouseArea grab in every
+        // window of that app — the release arrived with no grabber and
+        // onClicked never fired. Defer exactly that case to the release.
+        // Presses on windows / the desktop still clear immediately: a leave
+        // to the shell cannot cancel a click owned by another client, and a
+        // deferred clear would leave a stale on-demand holder that kills the
+        // first xdg popup grab (context menus open on press). On-demand
+        // targets still focus on press (a keyboard enter cancels nothing).
+        // The release consumes only the press-time decision — the release
+        // position must never pick the focus target (slider drag-out and
+        // text-selection drags ending over the bar must not switch focus).
         if ButtonState::Pressed == button_state {
             let layer_under = self.niri.pointer_contents.layer.clone();
-            self.niri.focus_layer_surface_if_on_demand(layer_under);
+            let defer_clear = layer_under.as_ref().is_some_and(|layer| {
+                layer.cached_state().keyboard_interactivity
+                    != wlr_layer::KeyboardInteractivity::OnDemand
+            });
+            if defer_clear {
+                self.niri.pending_on_demand_focus_clear = true;
+            } else {
+                self.niri.pending_on_demand_focus_clear = false;
+                self.niri.focus_layer_surface_if_on_demand(layer_under);
+            }
+        } else if std::mem::take(&mut self.niri.pending_on_demand_focus_clear) {
+            self.niri.focus_layer_surface_if_on_demand(None);
         }
 
         if button == Some(MouseButton::Left) && self.niri.screenshot_ui.is_open() {

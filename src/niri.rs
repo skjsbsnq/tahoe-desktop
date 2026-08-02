@@ -344,6 +344,12 @@ pub struct Niri {
     pub bind_repeat: Option<BindRepeatState>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
+    // A press on a non-on-demand layer surface (shell popup / dismiss layer)
+    // defers its on-demand focus clear to the release: clearing mid-click
+    // put the holder's keyboard leave between press and release, and Qt
+    // cancels the pressed MouseArea grab app-wide on focus loss (T-29
+    // first-click swallow). Consumed by the matching release.
+    pub pending_on_demand_focus_clear: bool,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
     pub is_fdo_idle_inhibited: Arc<AtomicBool>,
     pub keyboard_shortcuts_inhibiting_surfaces: HashMap<WlSurface, KeyboardShortcutsInhibitor>,
@@ -2943,6 +2949,7 @@ impl Niri {
             seat,
             keyboard_focus: KeyboardFocus::Layout { surface: None },
             layer_shell_on_demand_focus: None,
+            pending_on_demand_focus_clear: false,
             idle_inhibiting_surfaces: HashSet::new(),
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
