@@ -643,7 +643,13 @@ impl<W: LayoutElement> Workspace<W> {
                 }
             }
             WorkspaceAddWindowTarget::NextTo(next_to) => {
-                let activate = activate.map_smart(|| self.active_window().unwrap().id() == next_to);
+                // The active window is `None` when every window on this workspace is minimized
+                // (e.g. the parent of this dialog was minimized). There is then no other legal
+                // focus owner, so the new window takes focus; with an active window, only a
+                // dialog of that window gets activated. Never abort over the missing active
+                // window: the window itself must still be placed.
+                let activate = activate
+                    .map_smart(|| self.active_window().is_none_or(|win| win.id() == next_to));
 
                 let floating_has_window = self.floating.has_window(next_to);
 

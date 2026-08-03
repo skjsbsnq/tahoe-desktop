@@ -18,5 +18,6 @@ mod r17_redraw_attribution;
 mod remove_output;
 mod tahoe_glass;
 mod transactions;
+mod window_lifecycle;
 mod window_opening;
 mod xdg_shell;
