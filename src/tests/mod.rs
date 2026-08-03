@@ -8,6 +8,7 @@ mod animations;
 mod floating;
 mod foreign_toplevel;
 mod fullscreen;
+mod layer_lock_scope;
 mod layer_shell;
 mod lifecycle_command;
 mod lifecycle_observe;

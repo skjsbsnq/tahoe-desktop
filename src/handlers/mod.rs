@@ -1134,14 +1134,26 @@ delegate_mutter_x11_interop!(State);
 impl TahoeGlassHandler for State {
     fn queue_redraw_for_tahoe_glass_surface(&mut self, surface: &WlSurface) {
         use crate::redraw_attribution::{RedrawFallbackReason, RedrawReason};
-        let attribution = if let Some(output) = self.niri.output_for_root(surface).cloned() {
+        // Resolve the root shell surface first: a commit on a subsurface (or a
+        // popup) must attribute to the root's output, not degrade to a
+        // full-output fallback (A03.3).
+        let root = self.niri.find_root_shell_surface(surface);
+        let attribution = if let Some(output) = self.niri.output_for_root(&root).cloned() {
             #[cfg(test)]
             crate::protocols::tahoe_glass::test_note_targeted_redraw();
             RedrawAttribution::outputs([output], RedrawReason::Glass)
-        } else {
+        } else if self.niri.layout.find_window_and_output(&root).is_some() {
+            // A mapped window on a workspace without an output: nothing
+            // renders it, keep the reviewed unlocatable fallback for parity.
             #[cfg(test)]
             crate::protocols::tahoe_glass::test_note_fallback_redraw_all();
             RedrawAttribution::all(RedrawFallbackReason::Unlocatable)
+        } else {
+            // Unmapped or destroyed surface (or a layer on a removed output):
+            // not rendered anywhere, so no frame is needed. Record the
+            // explicit skip disposition instead of queueing a full redraw.
+            crate::utils::lifecycle_diag::note_redraw_skip_unmapped();
+            RedrawAttribution::none()
         };
         self.niri.apply_redraw_attribution(attribution);
     }

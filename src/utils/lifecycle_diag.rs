@@ -41,6 +41,7 @@ static REDRAW_FALLBACK_UNLOCATABLE: AtomicU64 = AtomicU64::new(0);
 static REDRAW_FALLBACK_OUTPUT_TEARDOWN: AtomicU64 = AtomicU64::new(0);
 static REDRAW_FALLBACK_GLOBAL_CONFIG: AtomicU64 = AtomicU64::new(0);
 static REDRAW_FALLBACK_GLOBAL_UI: AtomicU64 = AtomicU64::new(0);
+static REDRAW_SKIP_UNMAPPED: AtomicU64 = AtomicU64::new(0);
 
 fn ensure_init() {
     // Fast path: avoid the atomic RMW on every hot-path is_enabled() call.
@@ -92,6 +93,7 @@ pub fn reset() {
     REDRAW_FALLBACK_OUTPUT_TEARDOWN.store(0, Ordering::Relaxed);
     REDRAW_FALLBACK_GLOBAL_CONFIG.store(0, Ordering::Relaxed);
     REDRAW_FALLBACK_GLOBAL_UI.store(0, Ordering::Relaxed);
+    REDRAW_SKIP_UNMAPPED.store(0, Ordering::Relaxed);
 }
 
 pub fn note_queue_redraw_all() {
@@ -214,6 +216,15 @@ pub fn note_redraw_fallback_global_ui() {
     }
 }
 
+/// Record a glass redraw request that was skipped because the surface is not
+/// rendered anywhere — unmapped, destroyed, or a layer whose output was
+/// removed: no frame is needed, and no fallback redraw was queued (A03.3).
+pub fn note_redraw_skip_unmapped() {
+    if is_enabled() {
+        REDRAW_SKIP_UNMAPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub queue_redraw_all: u64,
@@ -235,6 +246,7 @@ pub struct Snapshot {
     pub redraw_fallback_global_config: u64,
     pub redraw_targeted_action: u64,
     pub redraw_fallback_global_ui: u64,
+    pub redraw_skip_unmapped: u64,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -258,6 +270,7 @@ pub fn snapshot() -> Snapshot {
         redraw_fallback_global_config: REDRAW_FALLBACK_GLOBAL_CONFIG.load(Ordering::Relaxed),
         redraw_targeted_action: REDRAW_TARGETED_ACTION.load(Ordering::Relaxed),
         redraw_fallback_global_ui: REDRAW_FALLBACK_GLOBAL_UI.load(Ordering::Relaxed),
+        redraw_skip_unmapped: REDRAW_SKIP_UNMAPPED.load(Ordering::Relaxed),
     }
 }
 
@@ -364,6 +377,7 @@ mod tests {
             note_tahoe_region_request();
             note_tahoe_region_commit();
             note_tahoe_region_capture();
+            note_redraw_skip_unmapped();
 
             let s = snapshot();
             assert_eq!(s.queue_redraw_all, 1);
@@ -374,6 +388,7 @@ mod tests {
             assert_eq!(s.tahoe_region_request, 1);
             assert_eq!(s.tahoe_region_commit, 1);
             assert_eq!(s.tahoe_region_capture, 1);
+            assert_eq!(s.redraw_skip_unmapped, 1);
         });
     }
 

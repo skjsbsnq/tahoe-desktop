@@ -47,9 +47,12 @@ impl WlrLayerShellHandler for State {
         let is_new = self.niri.unmapped_layer_surfaces.insert(wl_surface);
         assert!(is_new);
 
+        // Construct the layer surface outside the layer-map guard; the guard
+        // only wraps the map write (STAB-04 phase separation).
+        let layer = LayerSurface::new(surface, namespace);
+
         let mut map = layer_map_for_output(&output);
-        map.map_layer(&LayerSurface::new(surface, namespace))
-            .unwrap();
+        map.map_layer(&layer).unwrap();
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
@@ -57,37 +60,38 @@ impl WlrLayerShellHandler for State {
         self.clear_foreign_toplevel_rects_for_source(wl_surface);
         self.niri.unmapped_layer_surfaces.remove(wl_surface);
 
+        // Phase 1 (map read, short guard): locate the layer and its geometry.
         let found = self.niri.layout.outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer = map
                 .layers()
                 .find(|&layer| layer.layer_surface() == &surface)
                 .cloned();
-            layer.map(|layer| (o.clone(), layer))
+            layer.map(|layer| {
+                let geo = map.layer_geometry(&layer);
+                (o.clone(), layer, geo)
+            })
         });
 
-        let output = if let Some((output, layer)) = found {
-            let mut map = layer_map_for_output(&output);
-            let geo = map.layer_geometry(&layer);
-
-            if let Some(mapped) = self.niri.mapped_layer_surfaces.remove(&layer) {
-                crate::protocols::tahoe_glass::clear_transform_directive_on_unmap(
-                    layer.wl_surface(),
-                );
-                if let Some(geo) = geo {
-                    self.start_close_animation_for_layer(&output, &layer, geo, mapped);
-                }
-            }
-
-            map.unmap_layer(&layer);
-            drop(map);
-            Some(output)
-        } else {
-            None
+        let Some((output, layer, geo)) = found else {
+            return;
         };
-        if let Some(output) = output {
-            self.niri.output_resized(&output);
+        // cleanup and the close animation (renderer snapshot) all run after
+        // the guard is released (STAB-04 phase separation).
+        if let Some(mapped) = self.niri.mapped_layer_surfaces.remove(&layer) {
+            crate::protocols::tahoe_glass::clear_transform_directive_on_unmap(layer.wl_surface());
+            if let Some(geo) = geo {
+                self.start_close_animation_for_layer(&output, &layer, geo, mapped);
+            }
         }
+
+        // Phase 3 (map write, short guard): remove the layer from the map.
+        {
+            let mut map = layer_map_for_output(&output);
+            map.unmap_layer(&layer);
+        }
+
+        self.niri.output_resized(&output);
     }
 
     fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
@@ -123,17 +127,29 @@ impl State {
             return true;
         }
 
-        let mut map = layer_map_for_output(&output);
-        let layer = map
-            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
-            .cloned()
-            .unwrap();
-        let close_geo = map.layer_geometry(&layer);
-
-        // Arrange the layers before sending the initial configure to respect any size the
-        // client may have sent. For already-mapped content-only commits this usually returns
-        // false, and we can avoid the heavier output_resized() path below.
-        let mut needs_output_resize = map.arrange();
+        // Phase 1 (map read/write, short guard): locate the layer, arrange the
+        // map and snapshot its geometry. The guard is block-scoped and dropped
+        // before any rules / pointer / renderer / foreign-rect / IPC work
+        // below (STAB-04 phase separation).
+        let (layer, mut needs_output_resize, close_geo) = {
+            let mut map = layer_map_for_output(&output);
+            let layer = map
+                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .cloned()
+                .unwrap();
+            // Snapshot the pre-arrange geometry: the close animation (started
+            // below, outside the guard) uses the same value the pre-split code
+            // preferred — the last rendered position — falling back to the
+            // position arrange assigns on this commit.
+            let pre_arrange_geo = map.layer_geometry(&layer);
+            // Arrange the layers before sending the initial configure to respect any size the
+            // client may have sent. For already-mapped content-only commits this usually returns
+            // false, and we can avoid the heavier output_resized() path below.
+            let needs_output_resize = map.arrange();
+            let post_arrange_geo = map.layer_geometry(&layer);
+            let close_geo = pre_arrange_geo.or(post_arrange_geo);
+            (layer, needs_output_resize, close_geo)
+        };
 
         if is_mapped(surface) {
             let mut reopen_start = None;
@@ -249,7 +265,7 @@ impl State {
                     }
                 }
 
-                if let Some(geo) = close_geo.or_else(|| map.layer_geometry(&layer)) {
+                if let Some(geo) = close_geo {
                     self.start_close_animation_for_layer(&output, &layer, geo, mapped);
                 } else {
                     warn!(
@@ -286,8 +302,6 @@ impl State {
                 // it a new configure, if needed.
             }
         }
-
-        drop(map);
 
         if needs_output_resize {
             // This will call queue_redraw() inside.

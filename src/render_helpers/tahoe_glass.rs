@@ -19,6 +19,13 @@ use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 
+/// Maximum number of pending damage rectangles stored per surface while it is
+/// not rendered (locked session, DPMS off, hidden layers). Past this budget
+/// the pending union collapses to its bounding box — a superset of the union,
+/// so the next render still repaints every damaged area, while the storage
+/// stays bounded (A03.2).
+const MAX_PENDING_DAMAGE_RECTS: usize = 32;
+
 struct SurfaceTahoeGlassRenderer(Mutex<TahoeGlassRenderer>);
 
 struct TahoeGlassRenderer {
@@ -64,6 +71,27 @@ impl TahoeGlassRenderer {
             let uncovered = rect.subtract_rects(self.damaged_regions.iter().copied());
             added |= !uncovered.is_empty();
             self.damaged_regions.extend(uncovered);
+        }
+
+        // A03.2: while the surface is not rendered the damage never drains, so
+        // cap the storage. Collapse to the union bounding box — a superset, so
+        // repainting it is correct — keeping the pending set bounded no matter
+        // how long the client keeps committing.
+        if self.damaged_regions.len() > MAX_PENDING_DAMAGE_RECTS {
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+            for rect in &self.damaged_regions {
+                min_x = min_x.min(rect.loc.x);
+                min_y = min_y.min(rect.loc.y);
+                max_x = max_x.max(rect.loc.x + rect.size.w);
+                max_y = max_y.max(rect.loc.y + rect.size.h);
+            }
+            self.damaged_regions = vec![Rectangle::new(
+                Point::new(min_x, min_y),
+                Size::new(max_x - min_x, max_y - min_y),
+            )];
         }
 
         if added {
@@ -209,6 +237,19 @@ fn render_regions_for_layer(
     }
 
     with_states(surface, |states| {
+        // A03.2: drain pending damage *before* the empty-regions check. A
+        // surface whose committed regions became empty still owes a repaint of
+        // the area its glass used to cover; early-returning here would leave
+        // the damage stored forever and the removed glass on screen.
+        let renderer = SurfaceTahoeGlassRenderer::get(states);
+        let mut renderer = renderer.0.lock().unwrap();
+        let damage = std::mem::take(&mut renderer.damaged_regions);
+        for rect in damage {
+            let rect = rect.to_f64();
+            let geometry = Rectangle::new(location + rect.loc, rect.size);
+            push(renderer.damage.render(geometry).into());
+        }
+
         if regions.is_empty() {
             return false;
         }
@@ -221,15 +262,6 @@ fn render_regions_for_layer(
             total_area,
             "rendering Tahoe glass regions"
         );
-
-        let renderer = SurfaceTahoeGlassRenderer::get(states);
-        let mut renderer = renderer.0.lock().unwrap();
-        let damage = std::mem::take(&mut renderer.damaged_regions);
-        for rect in damage {
-            let rect = rect.to_f64();
-            let geometry = Rectangle::new(location + rect.loc, rect.size);
-            push(renderer.damage.render(geometry).into());
-        }
 
         renderer
             .regions
@@ -588,6 +620,106 @@ mod tests {
         let damage = changed_region_damage(&[compact], &[expanded]);
         let output_area = 2560_i64 * 1600_i64;
         assert!(damage_area(&damage) * 100 < output_area * 15);
+    }
+
+    /// A03.2: on a locked session / DPMS-off / hidden layer, no render ever
+    /// drains `damaged_regions`, so 10,000 region commits must still keep the
+    /// storage bounded (the pending union is capped and collapses to its
+    /// bounding box), and the storage must drain on the next render.
+    #[test]
+    fn ten_thousand_region_commits_without_render_stay_bounded_and_recoverable() {
+        // The implementation collapses the union once the rect count exceeds
+        // MAX_PENDING_DAMAGE_RECTS; keep the assert headroom-bound so the
+        // test compiles and fails meaningfully on the pre-cap implementation
+        // (which grows the union without bound).
+        const BOUNDED: usize = 64;
+
+        let mut renderer = TahoeGlassRenderer::new();
+        let mut region = test_region(1, Rectangle::new(Point::from((0, 0)), Size::from((64, 32))));
+        for i in 0..10_000 {
+            // Deterministic walk across a 2560x1600 surface (a lock screen
+            // keeps committing regardless of rendering).
+            let x = (i * 73) % 2560;
+            let y = (i * 41) % 1600;
+            let mut new = region.clone();
+            new.rect.loc = Point::from((x as i32, y as i32));
+            let old = region;
+            renderer.damage_regions(&[old], std::slice::from_ref(&new));
+            region = new;
+        }
+
+        let count = renderer.damaged_regions.len();
+        assert!(
+            count <= BOUNDED,
+            "pending damage must stay bounded without renders, got {count} rects"
+        );
+
+        // Recovery: the render path drains the storage (`mem::take`) and the
+        // next burst accumulates from an empty union again.
+        let drained = std::mem::take(&mut renderer.damaged_regions);
+        assert!(
+            !drained.is_empty(),
+            "drain must return the accumulated damage"
+        );
+        assert!(
+            renderer.damaged_regions.is_empty(),
+            "storage must be empty after drain"
+        );
+
+        for i in 0..10_000 {
+            let x = (i * 89) % 2560;
+            let y = (i * 31) % 1600;
+            let mut new = region.clone();
+            new.rect.loc = Point::from((x as i32, y as i32));
+            let old = region;
+            renderer.damage_regions(&[old], std::slice::from_ref(&new));
+            region = new;
+        }
+        assert!(
+            renderer.damaged_regions.len() <= BOUNDED,
+            "post-drain burst must stay bounded, got {} rects",
+            renderer.damaged_regions.len()
+        );
+    }
+
+    /// A03.2: the capped storage must always remain a *covering superset* of
+    /// every damaged rect seen so far: the collapse to a bounding box may
+    /// over-cover, never under-cover.
+    #[test]
+    fn cap_collapse_keeps_union_coverage() {
+        let mut renderer = TahoeGlassRenderer::new();
+        let mut region = test_region(
+            1,
+            Rectangle::new(Point::from((100, 100)), Size::from((50, 40))),
+        );
+        let mut origins = Vec::new();
+        for i in 0..1_000 {
+            let x = 100 + (i % 100) * 90;
+            let y = 100 + (i % 50) * 70;
+            origins.push(Point::from((x as i32, y as i32)));
+            let mut new = region.clone();
+            new.rect.loc = Point::from((x as i32, y as i32));
+            let old = region;
+            renderer.damage_regions(&[old], std::slice::from_ref(&new));
+            region = new;
+        }
+
+        // Every rect origin ever damaged must be covered by the current
+        // storage (collapse is a superset of the pending union).
+        for origin in &origins {
+            assert!(
+                renderer
+                    .damaged_regions
+                    .iter()
+                    .any(|rect| rect.contains(*origin)),
+                "damage storage must cover every damaged rect origin: {origin:?} not covered"
+            );
+        }
+        assert!(
+            renderer.damaged_regions.len() <= 64,
+            "capped storage must stay within the budget, got {} rects",
+            renderer.damaged_regions.len()
+        );
     }
 
     /// Old broken wiring: `clip` only when the protocol flag is set. When the

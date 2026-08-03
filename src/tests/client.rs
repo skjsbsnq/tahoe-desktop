@@ -40,6 +40,8 @@ use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
+use wayland_client::protocol::wl_subsurface::WlSubsurface;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
@@ -61,6 +63,7 @@ pub struct State {
     pub outputs: HashMap<WlOutput, String>,
 
     pub compositor: Option<WlCompositor>,
+    pub subcompositor: Option<WlSubcompositor>,
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
@@ -216,6 +219,7 @@ impl Client {
             globals: Vec::new(),
             outputs: HashMap::new(),
             compositor: None,
+            subcompositor: None,
             xdg_wm_base: None,
             layer_shell: None,
             foreign_toplevel_manager: None,
@@ -695,6 +699,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 if interface == WlCompositor::interface().name {
                     let version = min(version, WlCompositor::interface().version);
                     state.compositor = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WlSubcompositor::interface().name {
+                    let version = min(version, WlSubcompositor::interface().version);
+                    state.subcompositor = Some(registry.bind(name, version, qh, ()));
                 } else if interface == XdgWmBase::interface().name {
                     let version = min(version, XdgWmBase::interface().version);
                     state.xdg_wm_base = Some(registry.bind(name, version, qh, ()));
@@ -768,6 +775,32 @@ impl Dispatch<WlCompositor, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<WlSubcompositor, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSubcompositor,
+        event: <WlSubcompositor as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let _ = event;
+    }
+}
+
+impl Dispatch<WlSubsurface, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSubsurface,
+        event: <WlSubsurface as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let _ = event;
     }
 }
 

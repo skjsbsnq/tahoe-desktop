@@ -24,6 +24,7 @@ use crate::protocols::tahoe_glass::{
 };
 use crate::render_helpers::shaders::Shaders;
 use crate::tests::client::LayerConfigureProps;
+use crate::utils::lifecycle_diag;
 
 #[test]
 fn postprocess_shader_compiles_and_invalid_source_is_rejected() {
@@ -90,6 +91,29 @@ fn committed_count(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 ) -> usize {
     with_states(surface, |states| get_committed_regions(states).len())
+}
+
+fn force_idle_redraw_states(niri: &mut crate::niri::Niri) {
+    use crate::niri::RedrawState;
+    for state in niri.output_state.values_mut() {
+        state.redraw_state = RedrawState::Idle;
+    }
+}
+
+fn count_outputs_queued(niri: &crate::niri::Niri) -> (usize, usize) {
+    use crate::niri::RedrawState;
+    let total = niri.output_state.len();
+    let queued = niri
+        .output_state
+        .values()
+        .filter(|s| {
+            matches!(
+                s.redraw_state,
+                RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+            )
+        })
+        .count();
+    (queued, total)
 }
 
 #[test]
@@ -502,10 +526,11 @@ fn commit_queues_redraw_via_unified_handler_on_root_output() {
     );
 }
 
-/// When the root cannot be located to an output, the production redraw owner
-/// falls back to queue_redraw_all.
+/// A destroyed/unmapped root must have a definite attribution result: no
+/// frame is needed (the surface is not rendered anywhere), so the redraw owner
+/// skips instead of degrading to a full `queue_redraw_all`.
 #[test]
-fn clear_with_unlocatable_root_queues_all_outputs() {
+fn unmapped_destroyed_root_skips_redraw_without_queueing_all() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1280, 720));
@@ -515,6 +540,10 @@ fn clear_with_unlocatable_root_queues_all_outputs() {
     let glass_manager = f.client(id).tahoe_glass_manager();
     let qh = f.client(id).qh.clone();
     let glass = glass_manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    // Hold the counter lock for every handler-triggering window of this test
+    // (region commit, clear): the global targeted/fallback counters must not
+    // interleave with other tests' reset→assert windows.
+    let _counter_guard = test_redraw_counter_lock();
     set_and_commit_region(&mut f, id, &client_surface, &glass, 1);
 
     let server_surface = server_surface_for_client_layer(&mut f, &client_surface);
@@ -540,19 +569,35 @@ fn clear_with_unlocatable_root_queues_all_outputs() {
     );
 
     // Drive the same State method the protocol Destroy path uses when clear
-    // requests a redraw for a still-alive but unmapped surface.
-    let _counter_guard = test_redraw_counter_lock();
+    // requests a redraw for a still-alive but unmapped surface. The result
+    // must be a recorded skip: no targeted path, no fallback, no output
+    // queued. Lifecycle-diag counters are asserted (serialized by their own
+    // test lock); the tahoe-glass TEST_* counters are deliberately not
+    // asserted strictly here because unlocked T01-era tests still write them
+    // in parallel (pre-existing race, tracked for T24).
+    force_idle_redraw_states(f.niri());
     test_reset_redraw_counters();
-    f.niri_state()
-        .queue_redraw_for_tahoe_glass_surface(&server_surface);
-    assert!(
-        test_fallback_redraw_all_count() >= 1,
-        "unlocatable root must fall back to queue_redraw_all"
-    );
+    lifecycle_diag::with_enabled_for_test(|| {
+        f.niri_state()
+            .queue_redraw_for_tahoe_glass_surface(&server_surface);
+        let diag = lifecycle_diag::snapshot();
+        assert_eq!(
+            diag.queue_redraw_all, 0,
+            "skip disposition must not queue any output"
+        );
+        assert_eq!(
+            diag.redraw_fallback_unlocatable, 0,
+            "skip disposition must not record an unlocatable fallback"
+        );
+        assert!(
+            diag.redraw_skip_unmapped >= 1,
+            "skip disposition must be recorded"
+        );
+    });
+    let (queued, _) = count_outputs_queued(f.niri());
     assert_eq!(
-        test_targeted_redraw_count(),
-        0,
-        "unlocatable root must not use the targeted path"
+        queued, 0,
+        "skip disposition must leave every output unqueued"
     );
 
     // Controller Destroy must still clear glass without panicking.
@@ -563,6 +608,62 @@ fn clear_with_unlocatable_root_queues_all_outputs() {
     if server_surface.alive() {
         assert_eq!(committed_count(&server_surface), 0);
     }
+}
+
+/// A glass commit riding a *subsurface* commit must be attributed through the
+/// existing root resolution (layer root), not degrade to queue_redraw_all.
+#[test]
+fn subsurface_glass_commit_attributes_to_root_output() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    // Desynced subsurface on the layer root. The transform directive is
+    // published by the child's FIRST commit: this exercises the compositor
+    // root-cache reorder (the cache must be populated before on_surface_commit
+    // so the very commit carrying the directive can resolve the root).
+    let (subsurface, child) = {
+        let client = f.client(id);
+        let compositor = client.state.compositor.as_ref().unwrap();
+        let subcompositor = client.state.subcompositor.as_ref().unwrap();
+        let child = compositor.create_surface(&client.qh, ());
+        let subsurface = subcompositor.get_subsurface(&child, &client_surface, &client.qh, ());
+        (subsurface, child)
+    };
+    subsurface.set_desync();
+
+    // Publish a transform directive on the child surface before its first
+    // commit: the directive rides that commit and must be attributed to the
+    // layer root's output.
+    let glass_manager = f.client(id).tahoe_glass_manager();
+    let qh = f.client(id).qh.clone();
+    let glass = glass_manager.get_tahoe_glass_surface(&child, &qh, ());
+    glass.set_transform(10.0.into(), 5.0.into(), 0.8.into(), 0.8.into());
+    f.client(id).connection.flush().unwrap();
+    f.roundtrip(id);
+
+    let _counter_guard = test_redraw_counter_lock();
+    test_reset_redraw_counters();
+    child.commit();
+    f.client(id).connection.flush().unwrap();
+    f.double_roundtrip(id);
+
+    let targeted = test_targeted_redraw_count();
+    let fallback = test_fallback_redraw_all_count();
+    assert!(
+        targeted >= 1,
+        "subsurface glass commit must attribute to the layer root's output (targeted={targeted}, fallback={fallback})"
+    );
+    assert_eq!(
+        fallback, 0,
+        "subsurface glass commit must not degrade to queue_redraw_all (targeted={targeted})"
+    );
+
+    glass.destroy();
+    f.client(id).connection.flush().unwrap();
+    f.roundtrip(id);
 }
 
 /// Destroy then a second claim/destroy cycle is idempotent: glass stays empty
@@ -603,5 +704,136 @@ fn destroy_is_idempotent_when_double_invoked() {
         committed_count(&server_surface),
         0,
         "idempotent clear must not resurrect glass on later surface commits"
+    );
+}
+
+/// A03.2: a surface whose committed regions became empty must still drain its
+/// pending damage on the next render — the old glass area needs repainting.
+/// The pre-fix early return (`regions.is_empty()`) skipped the drain, leaving
+/// the damage stored forever and the removed glass area without repaint.
+#[test]
+fn empty_regions_render_still_drains_pending_damage() {
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::utils::{Point, Scale};
+
+    let mut f = Fixture::new();
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let glass_manager = f.client(id).tahoe_glass_manager();
+    let qh = f.client(id).qh.clone();
+    let glass = glass_manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    // Hold the counter lock for every handler-triggering window of this test
+    // (region commit, clear): the global targeted/fallback counters must not
+    // interleave with other tests' reset→assert windows.
+    let _counter_guard = test_redraw_counter_lock();
+    set_and_commit_region(&mut f, id, &client_surface, &glass, 1);
+
+    let server_surface = server_surface_for_client_layer(&mut f, &client_surface);
+    assert_eq!(committed_count(&server_surface), 1);
+
+    use crate::render_helpers::tahoe_glass::{render_for_layer, TahoeGlassElement};
+    use crate::render_helpers::xray::XrayPos;
+    use crate::render_helpers::{RenderCtx, RenderTarget};
+
+    // Render the layer once while the region is present: this creates the
+    // per-surface damage renderer (production renders do the same), so the
+    // subsequent clear can record damage into it.
+    {
+        let mut pushed = Vec::new();
+        f.niri_state()
+            .backend
+            .with_primary_renderer(|renderer| {
+                let ctx = RenderCtx {
+                    renderer,
+                    target: RenderTarget::Output,
+                    xray: None,
+                };
+                let config = niri_config::TahoeGlass::default();
+                let _ = render_for_layer(
+                    ctx,
+                    None,
+                    &server_surface,
+                    "tahoe-glass-test",
+                    Point::from((0., 0.)),
+                    1.0,
+                    &config,
+                    1.0,
+                    None,
+                    XrayPos::default(),
+                    false,
+                    &mut |elem| pushed.push(elem),
+                );
+            })
+            .unwrap();
+        assert!(
+            pushed.iter().any(|elem| matches!(
+                elem,
+                TahoeGlassElement::BackgroundEffect(_)
+                    | TahoeGlassElement::Shadow(_)
+                    | TahoeGlassElement::ExtraDamage(_)
+            )),
+            "the pre-render must actually render the present region"
+        );
+    }
+
+    // Remove all regions: committed becomes empty and damage for the old
+    // rect is recorded into the surface's pending damage storage. The clear
+    // also triggers the production redraw handler; the counter lock acquired
+    // above is still held, so no other test's reset→assert window can
+    // interleave.
+    glass.destroy();
+    f.client(id).connection.flush().unwrap();
+    f.roundtrip(id);
+    assert_eq!(committed_count(&server_surface), 0);
+    assert!(
+        test_damage_old_region_count() >= 1,
+        "clear must have recorded damage for the removed region area"
+    );
+
+    // Render the layer with empty committed regions: the pending damage must
+    // still drain into render elements (an ExtraDamage element covering the
+    // old region rect), even though no glass region is present anymore.
+    let mut pushed = Vec::new();
+    f.niri_state()
+        .backend
+        .with_primary_renderer(|renderer| {
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            let config = niri_config::TahoeGlass::default();
+            let _ = render_for_layer(
+                ctx,
+                None,
+                &server_surface,
+                "tahoe-glass-test",
+                Point::from((0., 0.)),
+                1.0,
+                &config,
+                1.0,
+                None,
+                XrayPos::default(),
+                false,
+                &mut |elem| pushed.push(elem),
+            );
+        })
+        .unwrap();
+
+    let damage_geoms: Vec<_> = pushed
+        .iter()
+        .filter_map(|elem| match elem {
+            TahoeGlassElement::ExtraDamage(damage) => Some(damage.geometry(Scale::from(1.0))),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        damage_geoms
+            .iter()
+            .any(|geo| geo.contains(Point::from((8, 4))) && geo.contains(Point::from((135, 35)))),
+        "empty-region render must still push damage covering the removed glass area (8,4,128,32): {damage_geoms:?}"
     );
 }
