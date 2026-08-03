@@ -3364,14 +3364,26 @@ impl Niri {
 
     /// Release all layer-shell state owned by an output before it leaves the layout.
     ///
-    /// The layer map is collected up front under its mutex; the cleanup runs
-    /// after the guard is dropped. For each layer this releases the same set
-    /// of state as the regular teardown paths (layer destroy and the unmap
-    /// commit branch): foreign-toplevel rect hints, the `mapped_layer_surfaces`
-    /// entry (whose `Drop` removes the pre-commit hook), the Tahoe glass
-    /// transform directive, the `unmapped_layer_surfaces` entry, and the
-    /// layer-map slot. The steps touch independent containers, so their
-    /// relative order does not affect correctness.
+    /// The layer list is collected under the map mutex first; the guard is
+    /// dropped before any niri-level protocol send or window/surface state
+    /// mutation runs, so no niri-level IPC and no niri-level window/surface
+    /// state mutation ever happens under the layer-map lock. (Smithay's own
+    /// `unmap_layer` sends output-leave/configure events under the map mutex;
+    /// that matches the regular teardown paths and stays a single atomic map
+    /// operation per short guard.)
+    ///
+    /// For each layer this releases the same set of state as the regular
+    /// teardown paths (layer destroy and the unmap commit branch):
+    /// foreign-toplevel rect hints, the `mapped_layer_surfaces` entry (whose
+    /// `Drop` removes the pre-commit hook), the Tahoe glass directive, the
+    /// `unmapped_layer_surfaces` entry, and the layer-map slot. On top of
+    /// that, the surface's pending and
+    /// committed Tahoe glass state is wiped in full: the surface no longer
+    /// belongs to any output, so orphaned commits must not re-publish
+    /// directives or regions, and a future re-map of the same `wl_surface`
+    /// (new layer surface, possibly on a new output) must not inherit glass
+    /// state from the removed output. The steps touch independent containers,
+    /// so their relative order does not affect correctness.
     ///
     /// The output is about to become unrenderable, so no close snapshot
     /// animation is started for these layers and any animation already
@@ -3379,16 +3391,15 @@ impl Niri {
     /// stale output reference. `send_close()` is still sent to cooperating
     /// clients, but nothing here depends on them answering.
     fn teardown_layer_shell_for_removed_output(&mut self, output: &Output) {
-        // Tell cooperating clients to close, then collect the layers under
-        // the map lock; everything below runs without the guard held.
-        for layer in layer_map_for_output(output).layers() {
-            layer.layer_surface().send_close();
-        }
-
         let layers: Vec<LayerSurface> = {
             let map = layer_map_for_output(output);
             map.layers().cloned().collect()
         };
+
+        // Tell cooperating clients to close. Runs without the map guard held.
+        for layer in &layers {
+            layer.layer_surface().send_close();
+        }
 
         for layer in &layers {
             let wl_surface = layer.wl_surface();
@@ -3398,9 +3409,14 @@ impl Niri {
                 mapped.clear_foreign_toplevel_rect_for_source(wl_surface);
             });
 
-            if self.mapped_layer_surfaces.remove(layer).is_some() {
-                crate::protocols::tahoe_glass::clear_transform_directive_on_unmap(wl_surface);
-            }
+            // Remove the mapped entry (its `Drop` removes the pre-commit hook)
+            // before clearing the surface's Tahoe glass state.
+            self.mapped_layer_surfaces.remove(layer);
+
+            // The surface no longer belongs to any output: wipe its full
+            // Tahoe glass state (directive, pending and committed) so orphaned
+            // commits or a future re-map cannot resurrect removed-output state.
+            crate::protocols::tahoe_glass::clear_glass_state_on_output_removal(wl_surface);
             self.unmapped_layer_surfaces.remove(wl_surface);
 
             layer_map_for_output(output).unmap_layer(layer);

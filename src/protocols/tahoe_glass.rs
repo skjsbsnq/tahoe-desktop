@@ -379,6 +379,36 @@ pub fn clear_transform_directive_on_unmap(surface: &WlSurface) {
     });
 }
 
+/// Reset all Tahoe glass state on a surface that is being torn down because
+/// its output was removed.
+///
+/// Unlike [`clear_transform_directive_on_unmap`], this also drops the pending
+/// regions, the dirty flag, a pending transform request and the committed
+/// list. The surface no longer belongs to any output: orphaned commits must
+/// not keep re-publishing directives or re-committing regions, and a future
+/// re-map of the same `wl_surface` (a new layer surface, possibly on a new
+/// output) must not inherit glass state from the removed output. No damage is
+/// queued and no identity reset is published: the layer is leaving the layer
+/// map and nothing will render it, and the next mapping starts untransformed.
+/// The epoch is not rewound, so any later directive is still seen as fresh.
+pub fn clear_glass_state_on_output_removal(surface: &WlSurface) {
+    if !surface.is_alive() {
+        return;
+    }
+
+    with_states(surface, |states| {
+        let Some(data) = states.data_map.get::<TahoeGlassSurfaceData>() else {
+            return;
+        };
+        let mut guard = data.0.lock().unwrap();
+        guard.pending.clear();
+        guard.pending_dirty = false;
+        guard.pending_transform = None;
+        guard.committed = Arc::new(Vec::new());
+        guard.transform_directive = None;
+    });
+}
+
 fn mark_pending_dirty(surface: &WlSurface) {
     with_inner(surface, |inner| inner.pending_dirty = true);
 }
@@ -664,6 +694,21 @@ pub fn test_fallback_redraw_all_count() -> usize {
 #[cfg(test)]
 pub fn test_damage_old_region_count() -> usize {
     TEST_DAMAGE_OLD_REGION_COUNT.load(AtomicOrdering::SeqCst)
+}
+
+/// Test-only snapshot of the uncommitted Tahoe glass state: (pending regions,
+/// pending_dirty, pending transform request present).
+#[cfg(test)]
+pub fn test_pending_state(states: &SurfaceData) -> (usize, bool, bool) {
+    let Some(data) = states.data_map.get::<TahoeGlassSurfaceData>() else {
+        return (0, false, false);
+    };
+    let guard = data.0.lock().unwrap();
+    (
+        guard.pending.len(),
+        guard.pending_dirty,
+        guard.pending_transform.is_some(),
+    )
 }
 
 #[cfg(test)]

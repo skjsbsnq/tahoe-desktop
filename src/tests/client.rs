@@ -278,6 +278,22 @@ impl Client {
         self.state.layer(surface)
     }
 
+    pub fn destroy_layer(&mut self, surface: &WlSurface) -> WpViewport {
+        self.state.destroy_layer(surface)
+    }
+
+    pub fn create_layer_on_surface(
+        &mut self,
+        surface: &WlSurface,
+        output: Option<&WlOutput>,
+        layer: zwlr_layer_shell_v1::Layer,
+        namespace: &str,
+        viewport: &WpViewport,
+    ) -> &mut LayerSurface {
+        self.state
+            .create_layer_on_surface(surface, output, layer, namespace.to_owned(), viewport)
+    }
+
     pub fn foreign_toplevel(&self, idx: usize) -> ZwlrForeignToplevelHandleV1 {
         self.state.foreign_toplevels[idx].clone()
     }
@@ -430,6 +446,54 @@ impl State {
             .iter_mut()
             .find(|w| w.surface == *surface)
             .unwrap()
+    }
+
+    /// Drop the client-side bookkeeping for a layer surface whose
+    /// `zwlr_layer_surface_v1` object the test already destroyed, leaving the
+    /// `wl_surface` alive so it can take a new role binding. Returns the
+    /// surface's viewport proxy: a `wl_surface` may only have one viewport
+    /// object for its lifetime, so a re-bound layer surface must reuse it.
+    pub fn destroy_layer(&mut self, surface: &WlSurface) -> WpViewport {
+        let idx = self
+            .layers
+            .iter()
+            .position(|w| w.surface == *surface)
+            .expect("destroy_layer: unknown layer surface");
+        let layer = self.layers.remove(idx);
+        layer.viewport.clone()
+    }
+
+    /// Create a new layer surface object on an existing `wl_surface` (the
+    /// previous layer surface on it must have been destroyed first), reusing
+    /// the surface's existing viewport proxy.
+    pub fn create_layer_on_surface(
+        &mut self,
+        surface: &WlSurface,
+        output: Option<&WlOutput>,
+        layer: zwlr_layer_shell_v1::Layer,
+        namespace: String,
+        viewport: &WpViewport,
+    ) -> &mut LayerSurface {
+        let layer_shell = self.layer_shell.as_ref().unwrap();
+
+        let layer_surface =
+            layer_shell.get_layer_surface(surface, output, layer, namespace, &self.qh, ());
+
+        let layer_surface = LayerSurface {
+            qh: self.qh.clone(),
+            spbm: self.spbm.clone().unwrap(),
+
+            surface: surface.clone(),
+            layer_surface,
+            viewport: viewport.clone(),
+            configures_received: Vec::new(),
+            close_requested: false,
+
+            configures_looked_at: 0,
+        };
+
+        self.layers.push(layer_surface);
+        self.layers.last_mut().unwrap()
     }
 }
 
