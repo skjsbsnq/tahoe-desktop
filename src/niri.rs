@@ -3288,9 +3288,7 @@ impl Niri {
     }
 
     pub fn remove_output(&mut self, output: &Output) {
-        for layer in layer_map_for_output(output).layers() {
-            layer.layer_surface().send_close();
-        }
+        self.teardown_layer_shell_for_removed_output(output);
 
         self.layout.remove_output(output);
         self.global_space.unmap_output(output);
@@ -3362,6 +3360,54 @@ impl Niri {
         if self.window_mru_ui.output() == Some(output) {
             self.cancel_mru();
         }
+    }
+
+    /// Release all layer-shell state owned by an output before it leaves the layout.
+    ///
+    /// The layer map is collected up front under its mutex; the cleanup runs
+    /// after the guard is dropped. For each layer this releases the same set
+    /// of state as the regular teardown paths (layer destroy and the unmap
+    /// commit branch): foreign-toplevel rect hints, the `mapped_layer_surfaces`
+    /// entry (whose `Drop` removes the pre-commit hook), the Tahoe glass
+    /// transform directive, the `unmapped_layer_surfaces` entry, and the
+    /// layer-map slot. The steps touch independent containers, so their
+    /// relative order does not affect correctness.
+    ///
+    /// The output is about to become unrenderable, so no close snapshot
+    /// animation is started for these layers and any animation already
+    /// running on this output is cancelled instead of kept alive with a
+    /// stale output reference. `send_close()` is still sent to cooperating
+    /// clients, but nothing here depends on them answering.
+    fn teardown_layer_shell_for_removed_output(&mut self, output: &Output) {
+        // Tell cooperating clients to close, then collect the layers under
+        // the map lock; everything below runs without the guard held.
+        for layer in layer_map_for_output(output).layers() {
+            layer.layer_surface().send_close();
+        }
+
+        let layers: Vec<LayerSurface> = {
+            let map = layer_map_for_output(output);
+            map.layers().cloned().collect()
+        };
+
+        for layer in &layers {
+            let wl_surface = layer.wl_surface();
+
+            // Drop foreign-toplevel rect hints pointing at this layer surface.
+            self.layout.with_windows_mut(|mapped, _| {
+                mapped.clear_foreign_toplevel_rect_for_source(wl_surface);
+            });
+
+            if self.mapped_layer_surfaces.remove(layer).is_some() {
+                crate::protocols::tahoe_glass::clear_transform_directive_on_unmap(wl_surface);
+            }
+            self.unmapped_layer_surfaces.remove(wl_surface);
+
+            layer_map_for_output(output).unmap_layer(layer);
+        }
+
+        self.closing_layers
+            .retain(|closing| closing.output != *output);
     }
 
     pub fn output_resized(&mut self, output: &Output) {

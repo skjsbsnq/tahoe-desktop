@@ -11,6 +11,7 @@ mod fullscreen;
 mod layer_shell;
 mod lifecycle_command;
 mod lifecycle_observe;
+mod output_teardown;
 mod r15_perf_baseline;
 mod r16_genie_identity;
 mod r17_redraw_attribution;
