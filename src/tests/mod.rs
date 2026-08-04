@@ -13,6 +13,7 @@ mod layer_shell;
 mod lifecycle_command;
 mod lifecycle_observe;
 mod output_teardown;
+mod pointer_focus_transaction;
 mod r15_perf_baseline;
 mod r16_genie_identity;
 mod r17_redraw_attribution;

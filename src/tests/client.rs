@@ -12,6 +12,10 @@ use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_surface_v1::Taho
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+use smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_locked_pointer_v1::ZwpLockedPointerV1,
+    zwp_pointer_constraints_v1::{self, ZwpPointerConstraintsV1},
+};
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
@@ -39,7 +43,9 @@ use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_client::protocol::wl_subsurface::WlSubsurface;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
@@ -64,6 +70,9 @@ pub struct State {
 
     pub compositor: Option<WlCompositor>,
     pub subcompositor: Option<WlSubcompositor>,
+    pub seat: Option<WlSeat>,
+    pub pointer: Option<WlPointer>,
+    pub pointer_constraints: Option<ZwpPointerConstraintsV1>,
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
@@ -74,6 +83,7 @@ pub struct State {
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
+    pub locked_pointers: Vec<ZwpLockedPointerV1>,
     pub foreign_toplevels: Vec<ZwlrForeignToplevelHandleV1>,
     /// Creation-order records for coordinated ext ↔ wlr pairing tests (R11).
     pub wlr_foreign_toplevel_meta: Vec<WlrForeignToplevelMeta>,
@@ -220,6 +230,9 @@ impl Client {
             outputs: HashMap::new(),
             compositor: None,
             subcompositor: None,
+            seat: None,
+            pointer: None,
+            pointer_constraints: None,
             xdg_wm_base: None,
             layer_shell: None,
             foreign_toplevel_manager: None,
@@ -229,6 +242,7 @@ impl Client {
             viewporter: None,
             windows: Vec::new(),
             layers: Vec::new(),
+            locked_pointers: Vec::new(),
             foreign_toplevels: Vec::new(),
             wlr_foreign_toplevel_meta: Vec::new(),
             ext_foreign_toplevels: Vec::new(),
@@ -376,6 +390,30 @@ impl Client {
 }
 
 impl State {
+    /// Lock the pointer on `surface` (one-shot lifetime) through the real
+    /// pointer-constraints protocol, so `PointerConstraintsHandler::
+    /// cursor_position_hint` can be driven by a real client commit.
+    pub fn lock_pointer(&mut self, surface: &WlSurface) -> ZwpLockedPointerV1 {
+        let constraints = self
+            .pointer_constraints
+            .as_ref()
+            .expect("zwp_pointer_constraints_v1 global not bound");
+        let seat = self.seat.as_ref().expect("wl_seat global not bound");
+        let pointer = self
+            .pointer
+            .get_or_insert_with(|| seat.get_pointer(&self.qh, ()));
+        let locked = constraints.lock_pointer(
+            surface,
+            pointer,
+            None,
+            zwp_pointer_constraints_v1::Lifetime::Oneshot,
+            &self.qh,
+            (),
+        );
+        self.locked_pointers.push(locked.clone());
+        locked
+    }
+
     pub fn create_window(&mut self) -> &mut Window {
         let compositor = self.compositor.as_ref().unwrap();
         let xdg_wm_base = self.xdg_wm_base.as_ref().unwrap();
@@ -702,6 +740,12 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WlSubcompositor::interface().name {
                     let version = min(version, WlSubcompositor::interface().version);
                     state.subcompositor = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WlSeat::interface().name {
+                    let version = min(version, WlSeat::interface().version);
+                    state.seat = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwpPointerConstraintsV1::interface().name {
+                    let version = min(version, ZwpPointerConstraintsV1::interface().version);
+                    state.pointer_constraints = Some(registry.bind(name, version, qh, ()));
                 } else if interface == XdgWmBase::interface().name {
                     let version = min(version, XdgWmBase::interface().version);
                     state.xdg_wm_base = Some(registry.bind(name, version, qh, ()));
@@ -796,6 +840,58 @@ impl Dispatch<WlSubsurface, ()> for State {
         _state: &mut Self,
         _proxy: &WlSubsurface,
         event: <WlSubsurface as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let _ = event;
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSeat,
+        event: <WlSeat as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let _ = event;
+    }
+}
+
+impl Dispatch<WlPointer, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlPointer,
+        event: <WlPointer as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let _ = event;
+    }
+}
+
+impl Dispatch<ZwpPointerConstraintsV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpPointerConstraintsV1,
+        event: <ZwpPointerConstraintsV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let _ = event;
+    }
+}
+
+impl Dispatch<ZwpLockedPointerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpLockedPointerV1,
+        event: <ZwpLockedPointerV1 as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,

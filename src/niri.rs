@@ -20,7 +20,7 @@ use niri_config::{
     WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::input::Keycode;
+use smithay::backend::input::{Keycode, TabletToolDescriptor, TouchSlot};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -200,6 +200,30 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
 
+/// The input identity of a press whose on-demand focus clear is deferred.
+///
+/// Keys the pending clear so interleaved presses and releases (multiple
+/// pointer buttons held at once, multiple touch slots) only consume their own
+/// pairs (T04 / A04.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingOnDemandFocusClearKind {
+    PointerButton { button: u32 },
+    Touch { slot: TouchSlot },
+    TabletTip { tool: TabletToolDescriptor },
+}
+
+/// A single deferred on-demand focus clear: the press identity that made it,
+/// the pressed layer surface it is bound to (surface destroy resolves the
+/// transaction) and the input device that made it (device removal resolves
+/// only that device's presses, so an unrelated still-alive press on another
+/// device keeps its deferral).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingOnDemandFocusClear {
+    pub kind: PendingOnDemandFocusClearKind,
+    pub surface: WlSurface,
+    pub device: String,
+}
+
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
 
@@ -348,8 +372,18 @@ pub struct Niri {
     // defers its on-demand focus clear to the release: clearing mid-click
     // put the holder's keyboard leave between press and release, and Qt
     // cancels the pressed MouseArea grab app-wide on focus loss (T-29
-    // first-click swallow). Consumed by the matching release.
-    pub pending_on_demand_focus_clear: bool,
+    // first-click swallow).
+    //
+    // The transaction is keyed by the input identity that made the press
+    // (pointer button / touch slot / tablet tool) and the input device, and
+    // bound to the pressed surface, so interleaved presses/releases only
+    // consume their own pairs and the death of the press itself (lock, VT
+    // switch, surface destroy, touch cancel, tablet proximity-out, device
+    // removal) resolves it without leaving residue that a stale release
+    // could later consume. Grab swaps (pick color, screenshot, popup grab)
+    // do *not* resolve it: the held press's release still arrives at the
+    // input layer and completes the pair (T04 / A04.2).
+    pub pending_on_demand_focus_clear: Vec<PendingOnDemandFocusClear>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
     pub is_fdo_idle_inhibited: Arc<AtomicBool>,
     pub keyboard_shortcuts_inhibiting_surfaces: HashMap<WlSurface, KeyboardShortcutsInhibitor>,
@@ -376,11 +410,14 @@ pub struct Niri {
     /// which passes it down through grabs, which decide what to do with it as they see fit.
     pub pointer_contents: PointContents,
     pub pointer_visibility: PointerVisibility,
-    /// Last known pointer location in global logical coordinates, cached by the
-    /// input handlers (on_pointer_motion/absolute). Smithay re-enters
+    /// Last known pointer location in global logical coordinates, cached by
+    /// every path that changes the pointer location: the input handlers
+    /// (on_pointer_motion/absolute), the warp path (move_cursor) and pointer
+    /// constraints (cursor_position_hint). Smithay re-enters
     /// PointerInternal's mutex when calling SeatHandler::cursor_image during
     /// pointer.motion(); reading `current_location()` there deadlocks (T-31
-    /// regression), so smithay callback contexts must use this cache instead.
+    /// regression), so smithay callback contexts must use this cache instead
+    /// (T04 / A04.1 / A04.5).
     pub pointer_pos: Point<f64, Logical>,
     pub pointer_inactivity_timer: Option<RegistrationToken>,
     /// Whether the pointer inactivity timer got reset this event loop iteration.
@@ -893,6 +930,12 @@ impl State {
         // T-31: remember where the cursor was so we can redraw both the output it leaves and
         // the one it lands on.
         let old_location = self.niri.seat.get_pointer().unwrap().current_location();
+        // T-31: keep the smithay-callback location cache in sync. move_cursor
+        // is the warp path shared by focus-window actions, IPC focus actions,
+        // confirm-mru and tablet proximity-out; smithay callbacks (cursor_image
+        // and the grabs) must see the new location without re-locking
+        // PointerInternal (T04 / A04.1).
+        self.niri.pointer_pos = location;
         let mut under = match self.niri.pointer_visibility {
             PointerVisibility::Disabled => PointContents::default(),
             _ => self.niri.contents_under(location),
@@ -2949,7 +2992,7 @@ impl Niri {
             seat,
             keyboard_focus: KeyboardFocus::Layout { surface: None },
             layer_shell_on_demand_focus: None,
-            pending_on_demand_focus_clear: false,
+            pending_on_demand_focus_clear: Vec::new(),
             idle_inhibiting_surfaces: HashSet::new(),
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
@@ -6637,6 +6680,12 @@ impl Niri {
     }
 
     pub fn lock(&mut self, confirmation: SessionLocker) {
+        // T04: the session is about to be locked (or is already locked, when
+        // this call refuses as a duplicate); any in-flight press on a
+        // non-on-demand layer is dead, so its deferred focus clear must fire
+        // now instead of lingering for a stale release to consume.
+        self.resolve_pending_on_demand_focus_clear();
+
         // Check if another client is in the process of locking.
         if matches!(
             self.lock_state,
@@ -6936,6 +6985,167 @@ impl Niri {
                 self.queue_redraw(&output);
             }
         }
+    }
+
+    /// Handle a press on the given contents layer, deferring the on-demand
+    /// focus clear when the press target is a non-on-demand layer surface
+    /// (T-29 first-click swallow) and resolving it immediately otherwise.
+    ///
+    /// Deferred presses are recorded keyed by `kind` and bound to the pressed
+    /// surface; `handle_on_demand_focus_release` and the resolve hooks below
+    /// complete or cancel the transaction (T04 / A04.2).
+    ///
+    /// The T-29 rationale: clearing on-demand layer focus while the press
+    /// target belongs to the same client (shell popup / dismiss layer) put
+    /// the holder's wl_keyboard.leave between press and release; QtWayland
+    /// maps keyboard-focus loss to ApplicationInactive and Qt Quick then
+    /// cancels the pressed MouseArea grab in every window of that app — the
+    /// release arrived with no grabber and onClicked never fired.
+    ///
+    /// The focus decision of a new press applies immediately, except for two
+    /// cases:
+    ///
+    /// - A press on a non-on-demand layer defers its clear to the matching release (the case
+    ///   above).
+    /// - A desktop press while another input's press is still held on a non-on-demand layer defers
+    ///   the clear to the last pending release: clearing now would put the leave between *that*
+    ///   press and its release (same first-click swallow, A04.2 multi-button interleave). No window
+    ///   is involved, so no xdg popup grab is at risk.
+    ///
+    /// Window presses always clear immediately, even with another press
+    /// held: a deferred clear would leave a stale on-demand holder that
+    /// kills the window's first xdg popup grab (context menus open on press)
+    /// — the original T-29 trade-off. On-demand targets still focus on press
+    /// (a keyboard enter cancels nothing). The release consumes only the
+    /// press-time decision — the release position must never pick the focus
+    /// target (slider drag-out and text-selection drags ending over the bar
+    /// must not switch focus).
+    pub fn handle_on_demand_focus_press(
+        &mut self,
+        kind: PendingOnDemandFocusClearKind,
+        layer_under: Option<LayerSurface>,
+        press_on_window: bool,
+        device: &str,
+    ) {
+        let defer_clear = layer_under.as_ref().is_some_and(|layer| {
+            layer.cached_state().keyboard_interactivity
+                != wlr_layer::KeyboardInteractivity::OnDemand
+        });
+        if defer_clear {
+            if let Some(layer) = layer_under {
+                self.pending_on_demand_focus_clear
+                    .push(PendingOnDemandFocusClear {
+                        kind,
+                        surface: layer.wl_surface().clone(),
+                        device: device.to_owned(),
+                    });
+            }
+            return;
+        }
+
+        let press_is_on_demand = layer_under.as_ref().is_some_and(|layer| {
+            layer.cached_state().keyboard_interactivity
+                == wlr_layer::KeyboardInteractivity::OnDemand
+        });
+        if press_is_on_demand || self.pending_on_demand_focus_clear.is_empty() || press_on_window {
+            // A press on the on-demand surface itself, a window press, or any
+            // press with no other press in flight, resolves any deferred
+            // clears and applies the focus decision immediately.
+            self.pending_on_demand_focus_clear.clear();
+            self.focus_layer_surface_if_on_demand(layer_under);
+        }
+        // Otherwise a desktop press is held while another press is still
+        // pending: keep the transaction and let the last pending release fire
+        // the clear, so this press does not put the keyboard leave between
+        // that press and its release (T-29 first-click swallow).
+    }
+
+    /// Complete the deferred presses of the given input identity and device.
+    /// The clear fires only when the *last* pending press overall is
+    /// released, so interleaved presses and releases never consume each
+    /// other's transactions (the device scoping keeps an entry of a second
+    /// device with the same button from being consumed by the other device's
+    /// release).
+    pub fn handle_on_demand_focus_release(
+        &mut self,
+        kind: PendingOnDemandFocusClearKind,
+        device: &str,
+    ) {
+        let was_pending = !self.pending_on_demand_focus_clear.is_empty();
+        self.pending_on_demand_focus_clear
+            .retain(|pending| pending.kind != kind || pending.device != device);
+        if was_pending && self.pending_on_demand_focus_clear.is_empty() {
+            self.focus_layer_surface_if_on_demand(None);
+        }
+    }
+
+    /// Resolve the deferred clears for which `should_resolve` returns true.
+    ///
+    /// When the last pending press is resolved (the click can never complete:
+    /// the session locked or paused, the pressed surface destroyed, the touch
+    /// slots cancelled, the tablet tool left proximity, or the input device
+    /// was removed), the deferred clear fires immediately so no residue
+    /// remains for a stale release to consume later. Grab swaps do not
+    /// resolve: the held press's release still arrives at the input layer and
+    /// completes the pair (A04.2).
+    fn resolve_pending_on_demand_focus_clear_where(
+        &mut self,
+        mut should_resolve: impl FnMut(&PendingOnDemandFocusClear) -> bool,
+    ) {
+        let was_pending = !self.pending_on_demand_focus_clear.is_empty();
+        self.pending_on_demand_focus_clear
+            .retain(|pending| !should_resolve(pending));
+        if was_pending && self.pending_on_demand_focus_clear.is_empty() {
+            self.focus_layer_surface_if_on_demand(None);
+        }
+    }
+
+    /// Resolve all deferred on-demand focus clears (lock, VT switch). No-op
+    /// when nothing is pending.
+    pub fn resolve_pending_on_demand_focus_clear(&mut self) {
+        self.resolve_pending_on_demand_focus_clear_where(|_| true);
+    }
+
+    /// Resolve deferred clears made by the given input device (device
+    /// removal). Only that device's presses are dead; an unrelated
+    /// still-alive press on another device keeps its deferral (T-29
+    /// first-click swallow must not be reintroduced).
+    pub fn resolve_pending_on_demand_focus_clear_for_device(&mut self, device: &str) {
+        self.resolve_pending_on_demand_focus_clear_where(|pending| pending.device == device);
+    }
+
+    /// Resolve the *touch* deferred clears of the given input device (touch
+    /// cancel). Only the canceling device's touch presses are dead; a
+    /// still-alive press of another input kind on the same device (a
+    /// mixed touchscreen/pen device) keeps its deferral.
+    pub fn resolve_pending_on_demand_focus_clear_for_touch(&mut self, device: &str) {
+        self.resolve_pending_on_demand_focus_clear_where(|pending| {
+            pending.device == device
+                && matches!(pending.kind, PendingOnDemandFocusClearKind::Touch { .. })
+        });
+    }
+
+    /// Resolve deferred clears bound to the given surface (layer destroy).
+    pub fn resolve_pending_on_demand_focus_clear_for_surface(&mut self, surface: &WlSurface) {
+        self.resolve_pending_on_demand_focus_clear_where(|pending| &pending.surface == surface);
+    }
+
+    /// Resolve deferred clears of the given tablet tool on the given device
+    /// (proximity out). Matching the device too keeps two devices with
+    /// identical tool descriptors from resolving each other's presses.
+    pub fn resolve_pending_on_demand_focus_clear_for_tool(
+        &mut self,
+        tool: &TabletToolDescriptor,
+        device: &str,
+    ) {
+        self.resolve_pending_on_demand_focus_clear_where(|pending| {
+            pending.device == device
+                && matches!(
+                    &pending.kind,
+                    PendingOnDemandFocusClearKind::TabletTip { tool: pending_tool }
+                        if pending_tool == tool
+                )
+        });
     }
 
     /// Tries to find and return the root shell surface for a given surface.

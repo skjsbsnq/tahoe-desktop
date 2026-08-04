@@ -600,6 +600,11 @@ impl Tty {
             SessionEvent::PauseSession => {
                 debug!("pausing session");
 
+                // T04: the session is being suspended (VT switch); an
+                // in-flight press on a non-on-demand layer is dead, so
+                // resolve its deferred focus clear.
+                niri.resolve_pending_on_demand_focus_clear();
+
                 self.libinput.suspend();
 
                 for device in self.devices.values_mut() {

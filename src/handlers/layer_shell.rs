@@ -59,6 +59,11 @@ impl WlrLayerShellHandler for State {
         let wl_surface = surface.wl_surface();
         self.clear_foreign_toplevel_rects_for_source(wl_surface);
         self.niri.unmapped_layer_surfaces.remove(wl_surface);
+        // T04: a press held on this surface can never complete now; resolve
+        // its deferred on-demand focus clear so no stale release can consume
+        // a future holder's transaction.
+        self.niri
+            .resolve_pending_on_demand_focus_clear_for_surface(wl_surface);
 
         // Phase 1 (map read, short guard): locate the layer and its geometry.
         let found = self.niri.layout.outputs().find_map(|o| {

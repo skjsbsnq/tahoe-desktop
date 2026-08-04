@@ -162,7 +162,16 @@ impl TabletSeatHandler for State {
         self.niri.cursor_manager.set_cursor_image(image);
         // T-31: the cursor is visible on the output under the pointer only.
         // NB: same PointerInternal re-entrancy constraint as cursor_image.
-        let pos = self.niri.pointer_pos;
+        //
+        // T04: while the tablet cursor is active (tool in proximity and no
+        // mouse event has taken over — mouse motion/absolute/axis/buttons
+        // clear tablet_cursor_location), the tablet cursor image belongs to
+        // the output under the *tablet* cursor, not the last mouse position;
+        // fall back to the mouse cache otherwise.
+        let pos = self
+            .niri
+            .tablet_cursor_location
+            .unwrap_or(self.niri.pointer_pos);
         self.niri.queue_redraw_output_under(pos);
     }
 }
@@ -236,10 +245,16 @@ impl PointerConstraintsHandler for State {
                 (origin + location).constrain(output_geometry.to_f64())
             });
         pointer.set_location(target);
+        // T04: pointer-constraint hints move the pointer like a warp; keep
+        // the smithay-callback location cache in sync so grab/cursor_image
+        // contexts read the hinted position.
+        self.niri.pointer_pos = target;
 
         // Redraw to update the cursor position if it's visible.
+        // NB: use the *hinted* target, not the pre-hint cache value: the hint
+        // moved the pointer, and the visible cursor lives there now (A04.1).
         if self.niri.pointer_visibility.is_visible() {
-            self.niri.queue_redraw_output_under(pointer_pos);
+            self.niri.queue_redraw_output_under(target);
         }
     }
 }

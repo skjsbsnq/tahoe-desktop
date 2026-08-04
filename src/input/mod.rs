@@ -36,7 +36,6 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
-use smithay::wayland::shell::wlr_layer;
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
 use touch_overview_grab::TouchOverviewGrab;
 
@@ -51,7 +50,7 @@ use crate::redraw_attribution::{RedrawAttribution, RedrawFallbackReason, RedrawR
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::lifecycle_command::{LifecycleAnchorInput, LifecycleCommand, LifecycleInvocationSource};
-use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::niri::{CastTarget, PendingOnDemandFocusClearKind, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -359,6 +358,16 @@ impl State {
     }
 
     fn on_device_removed(&mut self, device: impl Device) {
+        // T04: a press held on a device that is being removed can never
+        // complete (no release will arrive), so resolve its deferred
+        // on-demand focus clears; otherwise the stale entry would poison the
+        // transaction and stop outside-dismiss for later clicks (A04.2
+        // hot-plug / device removal). Only the removed device's presses are
+        // resolved — an unrelated still-alive press on another device keeps
+        // its deferral.
+        self.niri
+            .resolve_pending_on_demand_focus_clear_for_device(&device.id());
+
         if device.has_capability(DeviceCapability::TabletTool) {
             let tablet_seat = self.niri.seat.tablet_seat();
 
@@ -2862,6 +2871,20 @@ impl State {
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
+        // T04: complete the deferred press pair before the suppressed-buttons
+        // early return. A release can be suppressed by a grab (e.g. pick
+        // color) even though its press recorded a deferred on-demand focus
+        // clear; the pair must still complete, otherwise the entry would
+        // linger until an unrelated event absorbs it (A04.2).
+        if ButtonState::Released == button_state {
+            self.niri.handle_on_demand_focus_release(
+                PendingOnDemandFocusClearKind::PointerButton {
+                    button: button_code,
+                },
+                &event.device().id(),
+            );
+        }
+
         // Ignore release events for mouse clicks that triggered a bind.
         if self.niri.suppressed_buttons.remove(&button_code) {
             return;
@@ -3135,35 +3158,24 @@ impl State {
 
         self.update_pointer_contents();
 
-        // T-29 first-click swallow: clearing on-demand layer focus while the
-        // press target belongs to the same client (shell popup / dismiss
-        // layer) put the holder's wl_keyboard.leave between press and
-        // release; QtWayland maps keyboard-focus loss to ApplicationInactive
-        // and Qt Quick then cancels the pressed MouseArea grab in every
-        // window of that app — the release arrived with no grabber and
-        // onClicked never fired. Defer exactly that case to the release.
-        // Presses on windows / the desktop still clear immediately: a leave
-        // to the shell cannot cancel a click owned by another client, and a
-        // deferred clear would leave a stale on-demand holder that kills the
-        // first xdg popup grab (context menus open on press). On-demand
-        // targets still focus on press (a keyboard enter cancels nothing).
-        // The release consumes only the press-time decision — the release
-        // position must never pick the focus target (slider drag-out and
-        // text-selection drags ending over the bar must not switch focus).
+        // T-29 first-click swallow handling lives in
+        // Niri::handle_on_demand_focus_press/release (T04): presses on
+        // non-on-demand layer surfaces defer the on-demand focus clear to
+        // the matching release, keyed by the button and the device so
+        // interleaved multi-button / multi-device presses consume only their
+        // own releases. (The release half runs before the suppressed-buttons
+        // early return above.)
         if ButtonState::Pressed == button_state {
             let layer_under = self.niri.pointer_contents.layer.clone();
-            let defer_clear = layer_under.as_ref().is_some_and(|layer| {
-                layer.cached_state().keyboard_interactivity
-                    != wlr_layer::KeyboardInteractivity::OnDemand
-            });
-            if defer_clear {
-                self.niri.pending_on_demand_focus_clear = true;
-            } else {
-                self.niri.pending_on_demand_focus_clear = false;
-                self.niri.focus_layer_surface_if_on_demand(layer_under);
-            }
-        } else if std::mem::take(&mut self.niri.pending_on_demand_focus_clear) {
-            self.niri.focus_layer_surface_if_on_demand(None);
+            let press_on_window = self.niri.pointer_contents.window.is_some();
+            self.niri.handle_on_demand_focus_press(
+                PendingOnDemandFocusClearKind::PointerButton {
+                    button: button_code,
+                },
+                layer_under,
+                press_on_window,
+                &event.device().id(),
+            );
         }
 
         if button == Some(MouseButton::Left) && self.niri.screenshot_ui.is_open() {
@@ -3785,6 +3797,7 @@ impl State {
 
                 if let Some(pos) = self.niri.tablet_cursor_location {
                     let under = self.niri.contents_under(pos);
+                    let press_on_window = under.window.is_some();
 
                     if self.niri.screenshot_ui.is_open() {
                         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
@@ -3870,7 +3883,14 @@ impl State {
                         self.niri.apply_layout_dirty_redraw(RedrawReason::Activate);
                         self.niri.queue_redraw_output_under(pos);
                     }
-                    self.niri.focus_layer_surface_if_on_demand(under.layer);
+                    // T04: same first-click-swallow deferral as the pointer
+                    // path, keyed by the tool and the device.
+                    self.niri.handle_on_demand_focus_press(
+                        PendingOnDemandFocusClearKind::TabletTip { tool: event.tool() },
+                        under.layer,
+                        press_on_window,
+                        &event.device().id(),
+                    );
                 }
             }
             TabletToolTipState::Up => {
@@ -3883,6 +3903,12 @@ impl State {
                         ));
                     }
                 }
+
+                // T04: complete this tool's deferred on-demand focus clear.
+                self.niri.handle_on_demand_focus_release(
+                    PendingOnDemandFocusClearKind::TabletTip { tool: event.tool() },
+                    &event.device().id(),
+                );
 
                 tool.tip_up(event.time_msec());
             }
@@ -3920,6 +3946,14 @@ impl State {
                 }
                 ProximityState::Out => {
                     tool.proximity_out(event.time_msec());
+
+                    // T04: the tool left proximity with its click in flight;
+                    // resolve its deferred focus clear (other tools' pending
+                    // presses are still live).
+                    self.niri.resolve_pending_on_demand_focus_clear_for_tool(
+                        &event.tool(),
+                        &event.device().id(),
+                    );
 
                     // Move the mouse pointer here to avoid discontinuity.
                     //
@@ -4334,6 +4368,7 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
 
         let under = self.niri.contents_under(pos);
+        let press_on_window = under.window.is_some();
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
@@ -4440,7 +4475,12 @@ impl State {
                 self.niri.apply_layout_dirty_redraw(RedrawReason::Activate);
                 self.niri.queue_redraw_output_under(pos);
             }
-            self.niri.focus_layer_surface_if_on_demand(under.layer);
+            self.niri.handle_on_demand_focus_press(
+                PendingOnDemandFocusClearKind::Touch { slot },
+                under.layer,
+                press_on_window,
+                &evt.device().id(),
+            );
         };
 
         handle.down(
@@ -4481,7 +4521,14 @@ impl State {
                 serial,
                 time: evt.time_msec(),
             },
-        )
+        );
+
+        // T04: complete this slot's deferred on-demand focus clear (a no-op
+        // unless this slot's down was deferred).
+        self.niri.handle_on_demand_focus_release(
+            PendingOnDemandFocusClearKind::Touch { slot },
+            &evt.device().id(),
+        );
     }
     fn on_touch_motion<I: InputBackend>(&mut self, evt: I::TouchMotionEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
@@ -4530,11 +4577,20 @@ impl State {
         };
         handle.frame(self);
     }
-    fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
+    fn on_touch_cancel<I: InputBackend>(&mut self, evt: I::TouchCancelEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
         handle.cancel(self);
+        // T04: a touch cancel ends the canceling device's in-flight *touch*
+        // clicks; resolve only that device's touch-kind deferred on-demand
+        // focus clears so an unrelated still-alive click — a held pointer
+        // button, another touch device's press, or a pen tip of a mixed
+        // touchscreen/pen device — keeps its deferral and does not get a
+        // keyboard leave mid-click (T-29 first-click swallow must not be
+        // reintroduced).
+        self.niri
+            .resolve_pending_on_demand_focus_clear_for_touch(&evt.device().id());
     }
 
     fn on_switch_toggle<I: InputBackend>(&mut self, evt: I::SwitchToggleEvent) {
