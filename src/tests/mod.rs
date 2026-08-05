@@ -19,6 +19,7 @@ mod r16_genie_identity;
 mod r17_redraw_attribution;
 mod remove_output;
 mod tahoe_glass;
+mod thumbnail_budget;
 mod transactions;
 mod window_lifecycle;
 mod window_opening;

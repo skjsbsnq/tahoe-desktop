@@ -94,6 +94,7 @@ pub fn reset() {
     REDRAW_FALLBACK_GLOBAL_CONFIG.store(0, Ordering::Relaxed);
     REDRAW_FALLBACK_GLOBAL_UI.store(0, Ordering::Relaxed);
     REDRAW_SKIP_UNMAPPED.store(0, Ordering::Relaxed);
+    THUMBNAIL_RENDER.store(0, Ordering::Relaxed);
 }
 
 pub fn note_queue_redraw_all() {
@@ -225,6 +226,17 @@ pub fn note_redraw_skip_unmapped() {
     }
 }
 
+// T05: how many times the thumbnail pipeline performed a real GPU capture
+// (cache hits and rejected/skipped requests are not counted).
+static THUMBNAIL_RENDER: AtomicU64 = AtomicU64::new(0);
+
+/// Record a real thumbnail GPU capture (T05).
+pub fn note_thumbnail_render() {
+    if is_enabled() {
+        THUMBNAIL_RENDER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub queue_redraw_all: u64,
@@ -247,6 +259,7 @@ pub struct Snapshot {
     pub redraw_targeted_action: u64,
     pub redraw_fallback_global_ui: u64,
     pub redraw_skip_unmapped: u64,
+    pub thumbnail_render: u64,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -271,6 +284,7 @@ pub fn snapshot() -> Snapshot {
         redraw_targeted_action: REDRAW_TARGETED_ACTION.load(Ordering::Relaxed),
         redraw_fallback_global_ui: REDRAW_FALLBACK_GLOBAL_UI.load(Ordering::Relaxed),
         redraw_skip_unmapped: REDRAW_SKIP_UNMAPPED.load(Ordering::Relaxed),
+        thumbnail_render: THUMBNAIL_RENDER.load(Ordering::Relaxed),
     }
 }
 

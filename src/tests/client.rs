@@ -1,7 +1,12 @@
 use std::cmp::min;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt;
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Seek as _;
+use std::io::Write as _;
+use std::os::unix::io::{AsFd as _, FromRawFd as _};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,6 +24,10 @@ use smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::client:
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_positioner::{
+    self, XdgPositioner,
+};
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_popup::{self, XdgPopup};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
@@ -46,6 +55,8 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_client::protocol::wl_shm::{self, WlShm};
+use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_client::protocol::wl_subsurface::WlSubsurface;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
@@ -80,10 +91,18 @@ pub struct State {
     pub tahoe_glass_manager: Option<TahoeGlassManagerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
+    pub shm: Option<WlShm>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
     pub locked_pointers: Vec<ZwpLockedPointerV1>,
+    /// Keep-alive for subsurface proxies created by tests.
+    pub subsurfaces: Vec<WlSubsurface>,
+    /// Popups created by tests.
+    pub popups: Vec<TestPopup>,
+    /// Keep-alive fds for wl_shm pools: the fd must stay open until the
+    /// compositor processed `create_pool` (it duplicates it server-side).
+    pub pool_files: Vec<File>,
     pub foreign_toplevels: Vec<ZwlrForeignToplevelHandleV1>,
     /// Creation-order records for coordinated ext ↔ wlr pairing tests (R11).
     pub wlr_foreign_toplevel_meta: Vec<WlrForeignToplevelMeta>,
@@ -109,6 +128,19 @@ pub struct ExtForeignToplevelMeta {
     pub app_id: Option<String>,
     pub done: bool,
     pub closed: bool,
+}
+
+/// Client-side xdg popup snapshot: proxies plus the last configure the
+/// compositor sent.
+#[derive(Debug, Clone)]
+pub struct TestPopup {
+    pub surface: WlSurface,
+    pub xdg_surface: XdgSurface,
+    /// Keep-alive: the popup proxy must stay alive for the popup to stay
+    /// mapped; tests access the popup through [`Self::surface`].
+    #[allow(dead_code)]
+    pub popup: XdgPopup,
+    pub configure_serial: Option<u32>,
 }
 
 pub struct Window {
@@ -240,9 +272,13 @@ impl Client {
             tahoe_glass_manager: None,
             spbm: None,
             viewporter: None,
+            shm: None,
+            pool_files: Vec::new(),
             windows: Vec::new(),
             layers: Vec::new(),
             locked_pointers: Vec::new(),
+            subsurfaces: Vec::new(),
+            popups: Vec::new(),
             foreign_toplevels: Vec::new(),
             wlr_foreign_toplevel_meta: Vec::new(),
             ext_foreign_toplevels: Vec::new(),
@@ -449,6 +485,95 @@ impl State {
             .iter_mut()
             .find(|w| w.surface == *surface)
             .unwrap()
+    }
+
+    /// Attach a real wl_shm ARGB8888 buffer with the given pixel data to a
+    /// surface.
+    ///
+    /// `pixels` must be `width * height * 4` bytes in wl_shm ARGB8888 memory
+    /// order (`B, G, R, A` per pixel in little-endian memory). The pool fd is
+    /// kept alive in [`Self::pool_files`] until the compositor processed the
+    /// `create_pool` request.
+    pub fn attach_shm_buffer(
+        &mut self,
+        surface: &WlSurface,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) {
+        let shm = self.shm.as_ref().expect("wl_shm global not bound");
+        let name = CString::new("niri-test-shm-pool").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create failed");
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(pixels).expect("error writing shm pool");
+        file.seek(std::io::SeekFrom::Start(0))
+            .expect("error rewinding shm pool");
+
+        let pool = shm.create_pool(file.as_fd(), pixels.len() as i32, &self.qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            (width * 4) as i32,
+            wl_shm::Format::Argb8888,
+            &self.qh,
+            (),
+        );
+        self.pool_files.push(file);
+        surface.attach(Some(&buffer), 0, 0);
+        // Damage the whole surface like a real client that visibly updates its
+        // content (the compositor's content version advances on damaged
+        // commits).
+        surface.damage(0, 0, width as i32, height as i32);
+    }
+
+    /// Create a desynced subsurface of `parent` (kept alive in
+    /// [`Self::subsurfaces`]) and return its surface.
+    pub fn create_subsurface(&mut self, parent: &WlSurface) -> WlSurface {
+        let subcompositor = self
+            .subcompositor
+            .as_ref()
+            .expect("wl_subcompositor not bound");
+        let compositor = self.compositor.as_ref().expect("wl_compositor not bound");
+        let surface = compositor.create_surface(&self.qh, ());
+        let subsurface = subcompositor.get_subsurface(&surface, parent, &self.qh, ());
+        subsurface.set_desync();
+        self.subsurfaces.push(subsurface);
+        surface
+    }
+
+    /// Create an xdg popup of the given parent xdg surface (kept alive in
+    /// [`Self::popups`]) and return its surface.
+    ///
+    /// The popup is not committed yet: the caller must commit once (to get
+    /// the initial configure), ack it, then attach a buffer and commit again
+    /// to map the popup.
+    pub fn create_popup(
+        &mut self,
+        parent: &XdgSurface,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> WlSurface {
+        let compositor = self.compositor.as_ref().expect("wl_compositor not bound");
+        let xdg_wm_base = self.xdg_wm_base.as_ref().expect("xdg_wm_base not bound");
+        let surface = compositor.create_surface(&self.qh, ());
+        let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &self.qh, ());
+        let positioner = xdg_wm_base.create_positioner(&self.qh, ());
+        positioner.set_size(width as i32, height as i32);
+        positioner.set_anchor_rect(x, y, 1, 1);
+        positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+        let popup = xdg_surface.get_popup(Some(parent), &positioner, &self.qh, ());
+        self.popups.push(TestPopup {
+            surface: surface.clone(),
+            xdg_surface: xdg_surface.clone(),
+            popup,
+            configure_serial: None,
+        });
+        surface
     }
 
     pub fn create_layer(
@@ -767,6 +892,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WpViewporter::interface().name {
                     let version = min(version, WpViewporter::interface().version);
                     state.viewporter = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WlShm::interface().name {
+                    let version = min(version, WlShm::interface().version);
+                    state.shm = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WlOutput::interface().name {
                     let version = min(version, WlOutput::interface().version);
                     let output = registry.bind(name, version, qh, ());
@@ -1118,6 +1246,14 @@ impl Dispatch<XdgSurface, ()> for State {
     ) {
         match event {
             xdg_surface::Event::Configure { serial } => {
+                if let Some(popup) = state
+                    .popups
+                    .iter_mut()
+                    .find(|p| p.xdg_surface == *xdg_surface)
+                {
+                    popup.configure_serial = Some(serial);
+                    return;
+                }
                 let window = state
                     .windows
                     .iter_mut()
@@ -1128,6 +1264,40 @@ impl Dispatch<XdgSurface, ()> for State {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+impl Dispatch<XdgPopup, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &XdgPopup,
+        event: <XdgPopup as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_popup::Event::Configure {
+                x: _,
+                y: _,
+                width: _,
+                height: _,
+            } => (),
+            _ => (),
+        }
+    }
+}
+
+impl Dispatch<XdgPositioner, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &XdgPositioner,
+        event: <XdgPositioner as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let _ = event;
     }
 }
 
@@ -1225,6 +1395,35 @@ impl Dispatch<WlBuffer, ()> for State {
             wl_buffer::Event::Release => (),
             _ => unreachable!(),
         }
+    }
+}
+
+impl Dispatch<WlShm, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlShm,
+        event: <WlShm as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_shm::Event::Format { .. } => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WlShmPool, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlShmPool,
+        event: <WlShmPool as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let _ = event;
     }
 }
 

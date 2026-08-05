@@ -404,6 +404,14 @@ impl Mapped {
         self.window.toplevel().expect("no X11 support")
     }
 
+    /// The resolved blur config this window renders popup glass with.
+    ///
+    /// Part of the thumbnail cache content version (rule-driven, changes
+    /// without any surface commit).
+    pub fn blur_config(&self) -> niri_config::Blur {
+        self.blur_config
+    }
+
     /// Recomputes the resolved window rules and returns whether they changed.
     pub fn recompute_window_rules(&mut self, rules: &[WindowRule], is_at_startup: bool) -> bool {
         self.need_to_recompute_rules = false;

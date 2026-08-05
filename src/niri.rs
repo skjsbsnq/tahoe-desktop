@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -173,7 +173,10 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
-use crate::thumbnail::{ThumbnailCapture, ThumbnailPublisher, ThumbnailReply};
+use crate::thumbnail::{
+    ThumbnailCapture, ThumbnailPublisher, ThumbnailReply, ThumbnailRequest, ThumbnailRequestQueue,
+    MAX_PENDING_THUMBNAIL_REQUESTS, MAX_THUMBNAIL_CACHE_BYTES, MAX_THUMBNAIL_CACHE_ENTRIES,
+};
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
@@ -459,6 +462,12 @@ pub struct Niri {
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
     thumbnail_publisher: ThumbnailPublisher,
+    thumbnail_queue: ThumbnailRequestQueue,
+    /// Content epoch per window root surface: advanced on every commit of any
+    /// surface in the window's tree (toplevel, subsurfaces, popups) and on
+    /// every surface destruction. The thumbnail cache version reads it so a
+    /// cached capture can never outlive a content change (T05).
+    thumbnail_content_epochs: HashMap<WlSurface, u64>,
 
     pub debug_draw_opaque_regions: bool,
     pub debug_draw_damage: bool,
@@ -2173,6 +2182,12 @@ impl State {
             .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
     }
 
+    /// Submit a window thumbnail request to the bounded capture queue.
+    ///
+    /// The request is answered asynchronously like before (the reply channel
+    /// is shared with the caller), but the entry itself no longer performs a
+    /// synchronous GPU render + readback: the capture is budgeted, deduplicated
+    /// and paced to at most one per event-loop iteration (T05).
     pub fn window_thumbnail(
         &mut self,
         id: u64,
@@ -2181,31 +2196,18 @@ impl State {
         max_height: u32,
         reply: async_channel::Sender<ThumbnailReply>,
     ) {
-        let mut windows = self.niri.layout.windows();
-        let window = windows.find(|(_, mapped)| mapped.id().get() == id);
-        let Some((Some(monitor), mapped)) = window else {
-            let _ = reply.try_send(Err(format!("window not found or not on an output: {id}")));
-            return;
-        };
-
-        let output = monitor.output();
-        let capture = self
-            .backend
-            .with_primary_renderer(|renderer| {
-                self.niri
-                    .window_thumbnail(renderer, output, mapped, path, max_width, max_height)
-            })
-            .context("primary renderer unavailable")
-            .and_then(|result| result);
-        match capture {
-            Ok(capture) => self.niri.thumbnail_publisher.publish(capture, reply),
-            Err(err) => {
-                let _ = reply.try_send(Err(err.to_string()));
-            }
-        }
+        self.niri.thumbnail_queue.submit(ThumbnailRequest {
+            window_id: id,
+            path: PathBuf::from(path),
+            max_width,
+            max_height,
+            replies: vec![reply],
+        });
+        self.niri.schedule_thumbnail_capture();
     }
 
     pub fn cancel_window_thumbnail(&mut self, id: u64) {
+        self.niri.thumbnail_queue.cancel_window(id);
         self.niri.thumbnail_publisher.cancel_window(id);
     }
 
@@ -2641,6 +2643,121 @@ impl State {
 }
 
 impl Niri {
+    /// Number of pending thumbnail capture requests (test observation).
+    #[cfg(test)]
+    pub(crate) fn thumbnail_queue_test_pending_len(&self) -> usize {
+        self.thumbnail_queue.pending_len()
+    }
+
+    /// Schedule the thumbnail capture idle, if one is not already scheduled.
+    ///
+    /// The idle is re-scheduled from inside the capture driver while requests
+    /// remain, so at most one capture happens per event-loop iteration and
+    /// pointer/frame events are serviced between captures.
+    fn schedule_thumbnail_capture(&mut self) {
+        if self.thumbnail_queue.capture_scheduled() {
+            return;
+        }
+        if !self.thumbnail_queue.has_pending() {
+            return;
+        }
+        self.thumbnail_queue.set_capture_scheduled(true);
+        let handle = self.event_loop.clone();
+        handle.insert_idle(move |state| state.niri.run_thumbnail_capture(&mut state.backend));
+    }
+
+    /// Perform at most one thumbnail capture (or serve one from the cache).
+    ///
+    /// This runs inside a single event-loop idle callback; while requests
+    /// remain it schedules the next capture for the following iteration.
+    fn run_thumbnail_capture(&mut self, backend: &mut Backend) {
+        self.thumbnail_queue.set_capture_scheduled(false);
+
+        let Some(request) = self.thumbnail_queue.pop_pending() else {
+            return;
+        };
+
+        // A request nobody is waiting for anymore (client disconnected) must
+        // not waste a GPU capture.
+        if request.replies.iter().all(|reply| reply.is_closed()) {
+            if self.thumbnail_queue.has_pending() {
+                self.schedule_thumbnail_capture();
+            }
+            return;
+        }
+
+        let mut windows = self.layout.windows();
+        let window = windows.find(|(_, mapped)| mapped.id().get() == request.window_id);
+        let Some((Some(monitor), mapped)) = window else {
+            drop(windows);
+            for reply in &request.replies {
+                let _ = reply.try_send(Err(format!(
+                    "window not found or not on an output: {}",
+                    request.window_id
+                )));
+            }
+            if self.thumbnail_queue.has_pending() {
+                self.schedule_thumbnail_capture();
+            }
+            return;
+        };
+
+        let output = monitor.output();
+        let content_epoch = self
+            .thumbnail_content_epochs
+            .get(mapped.toplevel().wl_surface())
+            .copied()
+            .unwrap_or(0);
+        let version = crate::thumbnail::thumbnail_content_version(mapped, &output, content_epoch);
+        if let Some(capture) = self.thumbnail_queue.cache_get(
+            request.window_id,
+            request.max_width,
+            request.max_height,
+            version,
+            &request.path,
+        ) {
+            drop(windows);
+            self.thumbnail_publisher.publish(capture, request.replies);
+        } else {
+            let path = request.path.clone();
+            let max_width = request.max_width;
+            let max_height = request.max_height;
+            let capture = backend
+                .with_primary_renderer(|renderer| {
+                    Niri::render_window_thumbnail(
+                        renderer, &output, mapped, &path, max_width, max_height,
+                    )
+                })
+                .context("primary renderer unavailable")
+                .and_then(|result| result);
+            drop(windows);
+            match capture {
+                Ok(capture) => {
+                    crate::utils::lifecycle_diag::note_thumbnail_render();
+                    self.thumbnail_queue.cache_put(
+                        request.window_id,
+                        request.max_width,
+                        request.max_height,
+                        version,
+                        capture.width,
+                        capture.height,
+                        capture.pixels.clone(),
+                    );
+                    self.thumbnail_publisher.publish(capture, request.replies);
+                }
+                Err(err) => {
+                    for reply in &request.replies {
+                        let _ = reply.try_send(Err(err.to_string()));
+                    }
+                }
+            }
+        }
+
+        if self.thumbnail_queue.has_pending() {
+            self.schedule_thumbnail_capture();
+        }
+    }
+
     pub fn new(
         config: Rc<RefCell<Config>>,
         event_loop: LoopHandle<'static, State>,
@@ -3036,6 +3153,12 @@ impl Niri {
             pick_window: None,
             pick_color: None,
             thumbnail_publisher: ThumbnailPublisher::new(),
+            thumbnail_queue: ThumbnailRequestQueue::new(
+                MAX_PENDING_THUMBNAIL_REQUESTS,
+                MAX_THUMBNAIL_CACHE_ENTRIES,
+                MAX_THUMBNAIL_CACHE_BYTES,
+            ),
+            thumbnail_content_epochs: HashMap::new(),
 
             debug_draw_opaque_regions: false,
             debug_draw_damage: false,
@@ -6415,26 +6538,25 @@ impl Niri {
             .context("error saving screenshot")
     }
 
-    fn window_thumbnail(
-        &self,
+    /// Render a window thumbnail and read the pixels back.
+    ///
+    /// Runs inside the capture idle under the primary renderer. The alpha and
+    /// scale are mirrored by [`crate::thumbnail::thumbnail_content_version`]
+    /// so cached captures stay pixel-identical.
+    fn render_window_thumbnail(
         renderer: &mut GlesRenderer,
         output: &Output,
         mapped: &Mapped,
-        path: String,
+        path: &Path,
         max_width: u32,
         max_height: u32,
     ) -> anyhow::Result<ThumbnailCapture> {
-        let _span = tracy_client::span!("Niri::window_thumbnail");
+        let _span = tracy_client::span!("Niri::render_window_thumbnail");
 
         ensure!(max_width > 0 && max_height > 0);
 
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let alpha =
-            if mapped.sizing_mode().is_fullscreen() || mapped.is_ignoring_opacity_window_rule() {
-                1.
-            } else {
-                mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
-            };
+        let alpha = crate::thumbnail::thumbnail_alpha(mapped);
 
         let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
         let ctx = RenderCtx {
@@ -6485,10 +6607,10 @@ impl Niri {
 
         Ok(ThumbnailCapture {
             window_id: mapped.id().get(),
-            path: PathBuf::from(path),
+            path: path.to_owned(),
             width: size.w as u32,
             height: size.h as u32,
-            pixels,
+            pixels: Arc::new(pixels),
         })
     }
 
@@ -7162,6 +7284,39 @@ impl Niri {
         }
 
         root.clone()
+    }
+
+    /// Advance the thumbnail content epoch of the window owning `surface`.
+    ///
+    /// Called from the compositor commit and surface-destroyed handlers for
+    /// every surface (toplevel, subsurfaces and popups alike), so any change
+    /// to the window's rendered content — including popup/subsurface commits
+    /// that leave the toplevel untouched — invalidates the thumbnail cache.
+    /// The epoch map is keyed by the window's root surface; dead roots are
+    /// pruned once the map grows past a fixed bound (see
+    /// [`crate::thumbnail::MAX_THUMBNAIL_EPOCH_ENTRIES`]), keeping the
+    /// per-commit cost O(1) amortized while the map stays memory-bounded.
+    pub fn bump_thumbnail_content_epoch(&mut self, surface: &WlSurface) {
+        let root = self.find_root_shell_surface(surface);
+        let entry = self
+            .thumbnail_content_epochs
+            .entry(root.clone())
+            .or_insert(0);
+        *entry = entry.wrapping_add(1);
+        if *entry == 0 {
+            // The epoch wrapped around: no stored epoch value can be trusted
+            // anymore. Clearing forces every cached capture to miss (safe
+            // direction), so a stale value can never collide again.
+            self.thumbnail_content_epochs.clear();
+            self.thumbnail_content_epochs.insert(root, 1);
+        }
+        // Prune dead roots only once the map grew past a fixed bound, so the
+        // per-commit cost stays O(1) on average while dead entries cannot
+        // accumulate indefinitely.
+        if self.thumbnail_content_epochs.len() > crate::thumbnail::MAX_THUMBNAIL_EPOCH_ENTRIES {
+            self.thumbnail_content_epochs
+                .retain(|surface, _| surface.alive());
+        }
     }
 
     #[cfg(feature = "dbus")]

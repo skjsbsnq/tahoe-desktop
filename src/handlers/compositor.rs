@@ -74,6 +74,12 @@ impl CompositorHandler for State {
             .root_surface
             .insert(surface.clone(), root_surface.clone());
 
+        // Every commit of any surface in a window's tree (toplevel,
+        // subsurfaces, popups) advances the window's thumbnail content epoch,
+        // so the thumbnail cache never serves a capture that misses a commit
+        // (T05).
+        self.niri.bump_thumbnail_content_epoch(surface);
+
         // After on_commit_buffer_handler so region validation sees the surface
         // geometry attached by THIS commit (a post-commit hook would see the
         // previous one); before layer_shell_handle_commit so a transform
@@ -499,6 +505,11 @@ impl CompositorHandler for State {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        // A destroyed surface changes the window's rendered content even
+        // without any following commit: advance the thumbnail content epoch
+        // before the root-surface cache below drops the lookup key.
+        self.niri.bump_thumbnail_content_epoch(surface);
+
         self.clear_foreign_toplevel_rects_for_source(surface);
 
         // Clients may destroy their subsurfaces before the main surface. Ensure we have a snapshot
