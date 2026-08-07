@@ -17,12 +17,12 @@ use crate::niri::State;
 use crate::utils::surface_geo;
 
 // Version of the *manager* interface global. Kept in lockstep with the
-// tahoe_glass_surface_v1 interface version (both 4 in the XML) because surface
+// tahoe_glass_surface_v1 interface version (both 5 in the XML) because surface
 // objects inherit the manager's bound version: version negotiation for the
-// since="4" presentation-transform requests only works when the manager global
-// advertises the same number. wayland-backend rejects a global version above
+// since="4" presentation-transform requests and since="5" feedback only work when the manager
+// global advertises the same number. wayland-backend rejects a global version above
 // the manager interface's XML version, so both must be bumped together.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 pub const MAX_REGIONS_PER_SURFACE: usize = 32;
 
 /// Presentation transform of a glass surface in surface-local logical
@@ -117,6 +117,26 @@ enum PendingTransformRequest {
     RegionMorph(u32, TahoeTransformCurve),
 }
 
+#[derive(Debug, Clone)]
+struct TransformFeedbackToken {
+    resource: TahoeGlassSurfaceV1,
+    serial: u32,
+}
+
+impl TransformFeedbackToken {
+    fn finish(self, status: tahoe_glass_surface_v1::FeedbackStatus) {
+        if self.resource.is_alive() && self.resource.version() >= 5 {
+            self.resource.transform_feedback(self.serial, status);
+        }
+    }
+}
+
+enum FeedbackTagDisposition {
+    Stored(Option<TransformFeedbackToken>),
+    Stale(TransformFeedbackToken),
+    Duplicate,
+}
+
 /// A committed transform directive for the layer machinery to consume.
 ///
 /// Published by [`on_surface_commit`] (or by controller destroy, which resets
@@ -196,10 +216,16 @@ struct TahoeGlassSurfaceInner {
     controller_generation: u64,
     /// Wire transform request pending until the next commit. Last one wins.
     pending_transform: Option<PendingTransformRequest>,
+    /// A v5 serial waiting to be consumed by the next transform request.
+    pending_feedback_tag: Option<TransformFeedbackToken>,
+    /// Feedback token paired with `pending_transform`, when the request was tagged.
+    pending_transform_feedback: Option<TransformFeedbackToken>,
     /// Latest committed transform directive, tagged with a monotonically
     /// increasing epoch so the layer machinery can consume it exactly once.
     transform_directive: Option<TahoeGlassTransformDirective>,
     transform_epoch: u64,
+    /// Feedback for the latest published directive, keyed by its epoch.
+    active_transform_feedback: Option<(u64, TransformFeedbackToken)>,
 }
 
 impl TahoeGlassSurfaceInner {
@@ -211,40 +237,55 @@ impl TahoeGlassSurfaceInner {
     ///
     /// Advances the generation and clears any glass state left by a previous
     /// controller so recreate never inherits pending/committed regions.
-    /// Returns `(generation, previous_committed)` — the previous committed list
-    /// is always returned so the caller can damage old visible glass when
-    /// non-empty.
-    fn claim_controller(&mut self) -> (u64, Arc<Vec<TahoeGlassRegion>>) {
+    /// Returns the generation, previous committed regions, and feedback tokens
+    /// cancelled by the ownership replacement. The previous committed list is
+    /// always returned so the caller can damage old visible glass when non-empty.
+    fn claim_controller(
+        &mut self,
+    ) -> (u64, Arc<Vec<TahoeGlassRegion>>, Vec<TransformFeedbackToken>) {
         self.controller_generation = self.controller_generation.wrapping_add(1);
         self.pending.clear();
         self.pending_dirty = false;
-        self.reset_transform();
+        let cancelled = self.reset_transform();
         let old = std::mem::replace(&mut self.committed, Arc::new(Vec::new()));
-        (self.controller_generation, old)
+        (self.controller_generation, old, cancelled)
     }
 
     /// If `generation` still owns this surface state, clear pending and
     /// committed glass regions. Returns the previous committed regions when
     /// this controller was authorized to clear (including when they were
     /// already empty), or `None` when a newer controller owns the state.
-    fn clear_if_owner(&mut self, generation: u64) -> Option<Arc<Vec<TahoeGlassRegion>>> {
+    fn clear_if_owner(
+        &mut self,
+        generation: u64,
+    ) -> Option<(Arc<Vec<TahoeGlassRegion>>, Vec<TransformFeedbackToken>)> {
         if !self.is_owner(generation) {
             return None;
         }
 
         self.pending.clear();
         self.pending_dirty = false;
-        self.reset_transform();
+        let cancelled = self.reset_transform();
         let old = std::mem::replace(&mut self.committed, Arc::new(Vec::new()));
-        Some(old)
+        Some((old, cancelled))
     }
 
     /// Drop any pending transform request and publish an identity reset so a
     /// destroyed or replaced controller cannot leave a stale presentation
     /// transform on screen. Idempotent: publishes nothing when no directive
     /// was ever published or the last one is already an identity reset.
-    fn reset_transform(&mut self) {
+    fn reset_transform(&mut self) -> Vec<TransformFeedbackToken> {
+        let mut cancelled = Vec::new();
+        if let Some(token) = self.pending_feedback_tag.take() {
+            cancelled.push(token);
+        }
         self.pending_transform = None;
+        if let Some(token) = self.pending_transform_feedback.take() {
+            cancelled.push(token);
+        }
+        if let Some((_, token)) = self.active_transform_feedback.take() {
+            cancelled.push(token);
+        }
         let reset = TahoeGlassTransformDirective::Set(PresentationAffine::IDENTITY);
         match self.transform_directive {
             None => {}
@@ -254,6 +295,60 @@ impl TahoeGlassSurfaceInner {
                 self.transform_epoch = self.transform_epoch.wrapping_add(1);
             }
         }
+        cancelled
+    }
+
+    /// Cancel v5 feedback identities that cannot survive an unmap.
+    ///
+    /// Untagged pending requests retain the v1-v4 double-buffered behavior,
+    /// while a tagged pending request is removed with its terminal feedback so
+    /// it cannot publish after the same wl_surface is mapped again.
+    fn cancel_transform_feedback_on_unmap(&mut self) -> Vec<TransformFeedbackToken> {
+        let mut cancelled = Vec::new();
+        if let Some(token) = self.pending_feedback_tag.take() {
+            cancelled.push(token);
+        }
+        if let Some(token) = self.pending_transform_feedback.take() {
+            self.pending_transform = None;
+            cancelled.push(token);
+        }
+        if let Some((_, token)) = self.active_transform_feedback.take() {
+            cancelled.push(token);
+        }
+        cancelled
+    }
+
+    fn set_feedback_tag_if_owner(
+        &mut self,
+        generation: u64,
+        token: TransformFeedbackToken,
+    ) -> FeedbackTagDisposition {
+        if !self.is_owner(generation) {
+            return FeedbackTagDisposition::Stale(token);
+        }
+        let serial = token.serial;
+        if self
+            .pending_feedback_tag
+            .as_ref()
+            .is_some_and(|pending| pending.serial == serial)
+            || self
+                .pending_transform_feedback
+                .as_ref()
+                .is_some_and(|pending| pending.serial == serial)
+            || self
+                .active_transform_feedback
+                .as_ref()
+                .is_some_and(|(_, active)| active.serial == serial)
+        {
+            return FeedbackTagDisposition::Duplicate;
+        }
+        FeedbackTagDisposition::Stored(self.pending_feedback_tag.replace(token))
+    }
+
+    fn take_feedback_tag_if_owner(&mut self, generation: u64) -> Option<TransformFeedbackToken> {
+        self.is_owner(generation)
+            .then(|| self.pending_feedback_tag.take())
+            .flatten()
     }
 
     /// Store a wire transform request through the same ownership gate as
@@ -262,19 +357,33 @@ impl TahoeGlassSurfaceInner {
         &mut self,
         generation: u64,
         request: PendingTransformRequest,
-    ) -> bool {
+    ) -> Option<Option<TransformFeedbackToken>> {
         if !self.is_owner(generation) {
-            return false;
+            return None;
         }
 
+        let superseded = self.pending_transform_feedback.take();
         self.pending_transform = Some(request);
-        true
+        self.pending_transform_feedback = self.pending_feedback_tag.take();
+        Some(superseded)
     }
 
     /// Publish a committed transform directive with a fresh epoch.
-    fn publish_transform_directive(&mut self, directive: TahoeGlassTransformDirective) {
+    fn publish_transform_directive(
+        &mut self,
+        directive: TahoeGlassTransformDirective,
+        feedback: Option<TransformFeedbackToken>,
+    ) -> Option<TransformFeedbackToken> {
+        let superseded = self
+            .active_transform_feedback
+            .take()
+            .map(|(_, token)| token);
         self.transform_directive = Some(directive);
         self.transform_epoch = self.transform_epoch.wrapping_add(1);
+        if let Some(token) = feedback {
+            self.active_transform_feedback = Some((self.transform_epoch, token));
+        }
+        superseded
     }
 
     /// Apply a mutation to pending regions only when `generation` still owns
@@ -356,27 +465,55 @@ pub fn get_transform_directive(
     Some((guard.transform_epoch, directive))
 }
 
+/// Complete feedback for a transform directive after the mapped layer has
+/// applied an immediate transform or its animation has settled. Epoch matching
+/// makes late completion from a superseded animation a no-op.
+pub fn complete_transform_feedback(states: &SurfaceData, epoch: u64) {
+    let Some(data) = states.data_map.get::<TahoeGlassSurfaceData>() else {
+        return;
+    };
+    let token = {
+        let mut guard = data.0.lock().unwrap();
+        match guard.active_transform_feedback.as_ref() {
+            Some((active_epoch, _)) if *active_epoch == epoch => guard
+                .active_transform_feedback
+                .take()
+                .map(|(_, token)| token),
+            _ => None,
+        }
+    };
+    if let Some(token) = token {
+        token.finish(tahoe_glass_surface_v1::FeedbackStatus::Completed);
+    }
+}
+
 /// Drop the published transform directive when a layer surface unmaps.
 ///
 /// A new mapping starts untransformed by definition; clearing here (instead of
 /// absorbing the epoch at map time) is what lets a directive carried by the
 /// mapping commit itself still be applied — [`on_surface_commit`] runs at the
 /// top of `CompositorHandler::commit`, before the layer-shell commit handling,
-/// so at `MappedLayer::new` time that directive is already published. Pending
-/// (uncommitted) requests are left untouched: they are regular double-buffered
-/// protocol state. The epoch is not rewound, so the next published directive
-/// is always seen as fresh.
+/// so at `MappedLayer::new` time that directive is already published. Untagged
+/// pending requests are left untouched for v1-v4 compatibility. Tagged v5
+/// requests and feedback are cancelled so a healable request cannot survive
+/// unmap and complete after remap. The epoch is not rewound, so the next
+/// published directive is always seen as fresh.
 pub fn clear_transform_directive_on_unmap(surface: &WlSurface) {
     if !surface.is_alive() {
         return;
     }
 
-    with_states(surface, |states| {
+    let cancelled = with_states(surface, |states| {
         let Some(data) = states.data_map.get::<TahoeGlassSurfaceData>() else {
-            return;
+            return Vec::new();
         };
-        data.0.lock().unwrap().transform_directive = None;
+        let mut guard = data.0.lock().unwrap();
+        guard.transform_directive = None;
+        guard.cancel_transform_feedback_on_unmap()
     });
+    for token in cancelled {
+        token.finish(tahoe_glass_surface_v1::FeedbackStatus::Cancelled);
+    }
 }
 
 /// Reset all Tahoe glass state on a surface that is being torn down because
@@ -396,17 +533,21 @@ pub fn clear_glass_state_on_output_removal(surface: &WlSurface) {
         return;
     }
 
-    with_states(surface, |states| {
+    let cancelled = with_states(surface, |states| {
         let Some(data) = states.data_map.get::<TahoeGlassSurfaceData>() else {
-            return;
+            return Vec::new();
         };
         let mut guard = data.0.lock().unwrap();
         guard.pending.clear();
         guard.pending_dirty = false;
-        guard.pending_transform = None;
+        let cancelled = guard.reset_transform();
         guard.committed = Arc::new(Vec::new());
         guard.transform_directive = None;
+        cancelled
     });
+    for token in cancelled {
+        token.finish(tahoe_glass_surface_v1::FeedbackStatus::Cancelled);
+    }
 }
 
 fn mark_pending_dirty(surface: &WlSurface) {
@@ -448,20 +589,31 @@ fn with_inner<R>(surface: &WlSurface, f: impl FnOnce(&mut TahoeGlassSurfaceInner
 /// It must still run before `layer_shell_handle_commit`: a transform directive
 /// riding the mapping commit has to be published before `MappedLayer::new`.
 pub fn on_surface_commit(state: &mut State, surface: &WlSurface) {
-    let (regions_changed, transform_published) = with_states(surface, |states| {
+    let (regions_changed, transform_published, feedback) = with_states(surface, |states| {
         let Some(data) = states.data_map.get::<TahoeGlassSurfaceData>() else {
-            return (false, false);
+            return (false, false, Vec::new());
         };
 
         let mut guard = data.0.lock().unwrap();
         let mut regions_changed = false;
+        let mut feedback = Vec::new();
+        if let Some(token) = guard.pending_feedback_tag.take() {
+            feedback.push((token, tahoe_glass_surface_v1::FeedbackStatus::Rejected));
+        }
         // Pre-commit committed list, kept when this commit replaces it
         // so a region morph can resolve its old geometry.
         let mut old_regions: Option<Arc<Vec<TahoeGlassRegion>>> = None;
+        let mut rejected_region_ids = Vec::new();
 
         if guard.pending_dirty {
             let validated = validate_regions(states, &guard.pending, &guard.committed);
-            if let Some((committed, complete)) = validated {
+            if let Some(outcome) = validated {
+                let RegionValidationOutcome {
+                    committed,
+                    complete,
+                    rejected_region_ids: rejected,
+                } = outcome;
+                rejected_region_ids = rejected;
                 // Geometry-healable rejections (a region briefly exceeding the
                 // not-yet-resized buffer during an animated grow) keep the
                 // dirty flag so the commit attaching the caught-up buffer
@@ -516,11 +668,14 @@ pub fn on_surface_commit(state: &mut State, surface: &WlSurface) {
             ) {
             None
         } else {
-            guard.pending_transform.take()
+            guard
+                .pending_transform
+                .take()
+                .map(|request| (request, guard.pending_transform_feedback.take()))
         };
 
         let mut transform_published = false;
-        if let Some(request) = pending_transform {
+        if let Some((request, request_feedback)) = pending_transform {
             let directive = match request {
                 PendingTransformRequest::Set(affine) => {
                     Some(TahoeGlassTransformDirective::Set(affine))
@@ -529,33 +684,42 @@ pub fn on_surface_commit(state: &mut State, surface: &WlSurface) {
                     Some(TahoeGlassTransformDirective::Target(affine, curve))
                 }
                 PendingTransformRequest::RegionMorph(id, curve) => {
-                    let old_rect = old_regions
-                        .as_ref()
-                        .map(|old| old.as_slice())
-                        .unwrap_or(guard.committed.as_slice())
-                        .iter()
-                        .find(|region| region.id == id)
-                        .map(|region| region.rect);
-                    let new_rect = guard
-                        .committed
-                        .iter()
-                        .find(|region| region.id == id)
-                        .map(|region| region.rect);
-                    match (old_rect, new_rect) {
-                        (Some(old), Some(new)) if old != new => {
-                            Some(TahoeGlassTransformDirective::Morph {
-                                old_rect: old.to_f64(),
-                                new_rect: new.to_f64(),
-                                curve,
-                            })
-                        }
-                        _ => {
-                            debug!(
-                                surface = %surface.id(),
-                                region_id = id,
-                                "discarding Tahoe glass region morph without a geometry change"
-                            );
-                            None
+                    if rejected_region_ids.contains(&id) {
+                        debug!(
+                            surface = %surface.id(),
+                            region_id = id,
+                            "rejecting Tahoe glass region morph for permanently rejected region"
+                        );
+                        None
+                    } else {
+                        let old_rect = old_regions
+                            .as_ref()
+                            .map(|old| old.as_slice())
+                            .unwrap_or(guard.committed.as_slice())
+                            .iter()
+                            .find(|region| region.id == id)
+                            .map(|region| region.rect);
+                        let new_rect = guard
+                            .committed
+                            .iter()
+                            .find(|region| region.id == id)
+                            .map(|region| region.rect);
+                        match (old_rect, new_rect) {
+                            (Some(old), Some(new)) if old != new => {
+                                Some(TahoeGlassTransformDirective::Morph {
+                                    old_rect: old.to_f64(),
+                                    new_rect: new.to_f64(),
+                                    curve,
+                                })
+                            }
+                            _ => {
+                                debug!(
+                                    surface = %surface.id(),
+                                    region_id = id,
+                                    "discarding Tahoe glass region morph without a geometry change"
+                                );
+                                None
+                            }
                         }
                     }
                 }
@@ -567,13 +731,22 @@ pub fn on_surface_commit(state: &mut State, surface: &WlSurface) {
                     ?directive,
                     "committed Tahoe glass transform directive"
                 );
-                guard.publish_transform_directive(directive);
+                if let Some(token) = guard.publish_transform_directive(directive, request_feedback)
+                {
+                    feedback.push((token, tahoe_glass_surface_v1::FeedbackStatus::Superseded));
+                }
                 transform_published = true;
+            } else if let Some(token) = request_feedback {
+                feedback.push((token, tahoe_glass_surface_v1::FeedbackStatus::Rejected));
             }
         }
 
-        (regions_changed, transform_published)
+        (regions_changed, transform_published, feedback)
     });
+
+    for (token, status) in feedback {
+        token.finish(status);
+    }
 
     if regions_changed {
         crate::utils::lifecycle_diag::note_tahoe_region_commit();
@@ -601,13 +774,17 @@ fn clear_surface_data_if_owner(states: &SurfaceData, generation: u64) -> bool {
 
     let mut guard = data.0.lock().unwrap();
     let epoch_before = guard.transform_epoch;
-    let Some(old) = guard.clear_if_owner(generation) else {
+    let Some((old, cancelled)) = guard.clear_if_owner(generation) else {
         return false;
     };
-
+    let transform_reset = guard.transform_epoch != epoch_before;
+    drop(guard);
+    // A protocol destructor makes the client proxy unusable before this clear
+    // runs, so terminal events cannot be delivered here. Quickshell cancels its
+    // attached-object state locally before destroying the wrapper.
+    drop(cancelled);
     // A published identity reset needs a redraw even with no visible regions:
     // the surface may still be rendered with an active presentation transform.
-    let transform_reset = guard.transform_epoch != epoch_before;
 
     if old.is_empty() && !transform_reset {
         return false;
@@ -747,8 +924,15 @@ fn validate_regions(
     states: &SurfaceData,
     pending: &[TahoeGlassRegion],
     previous: &[TahoeGlassRegion],
-) -> Option<(Vec<TahoeGlassRegion>, bool)> {
-    validate_regions_for_surface_geo(surface_geo(states), pending, previous)
+) -> Option<RegionValidationOutcome> {
+    validate_regions_for_surface_geo_with_rejections(surface_geo(states), pending, previous)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RegionValidationOutcome {
+    committed: Vec<TahoeGlassRegion>,
+    complete: bool,
+    rejected_region_ids: Vec<u32>,
 }
 
 /// Validate pending regions against the current surface geometry.
@@ -784,13 +968,27 @@ fn validate_regions(
 /// area budget) keep the pre-existing drop-and-move-on semantics: growth
 /// cannot heal them, and marking them incomplete would leave the surface
 /// permanently dirty (revalidating every commit and starving region morphs).
+#[cfg(test)]
 fn validate_regions_for_surface_geo(
     surface_geo: Option<Rectangle<i32, Logical>>,
     pending: &[TahoeGlassRegion],
     previous: &[TahoeGlassRegion],
 ) -> Option<(Vec<TahoeGlassRegion>, bool)> {
+    validate_regions_for_surface_geo_with_rejections(surface_geo, pending, previous)
+        .map(|outcome| (outcome.committed, outcome.complete))
+}
+
+fn validate_regions_for_surface_geo_with_rejections(
+    surface_geo: Option<Rectangle<i32, Logical>>,
+    pending: &[TahoeGlassRegion],
+    previous: &[TahoeGlassRegion],
+) -> Option<RegionValidationOutcome> {
     if pending.is_empty() {
-        return Some((Vec::new(), true));
+        return Some(RegionValidationOutcome {
+            committed: Vec::new(),
+            complete: true,
+            rejected_region_ids: Vec::new(),
+        });
     }
 
     let surface_geo = surface_geo?;
@@ -798,21 +996,26 @@ fn validate_regions_for_surface_geo(
     let surface_area = i64::from(surface_geo.size.w.max(0)) * i64::from(surface_geo.size.h.max(0));
     let mut total_area = 0i64;
     let mut committed = Vec::new();
+    let mut rejected_region_ids = Vec::new();
     let mut complete = true;
     let mut budget_exhausted = false;
 
     for region in pending.iter().take(MAX_REGIONS_PER_SURFACE) {
         if region.rect.is_empty() {
+            rejected_region_ids.push(region.id);
             continue;
         }
 
         let Some(x2) = region.rect.loc.x.checked_add(region.rect.size.w) else {
+            rejected_region_ids.push(region.id);
             continue;
         };
         let Some(y2) = region.rect.loc.y.checked_add(region.rect.size.h) else {
+            rejected_region_ids.push(region.id);
             continue;
         };
         if x2 <= region.rect.loc.x || y2 <= region.rect.loc.y {
+            rejected_region_ids.push(region.id);
             continue;
         }
 
@@ -823,6 +1026,7 @@ fn validate_regions_for_surface_geo(
                 && region.rect.loc.y >= surface_geo.loc.y;
             if !origin_inside {
                 // Fully outside or negative-origin: structural, permanent drop.
+                rejected_region_ids.push(region.id);
                 continue;
             }
 
@@ -863,6 +1067,7 @@ fn validate_regions_for_surface_geo(
         // geometry-healable classification above so a briefly-overflowing
         // region does not lose its revalidation.
         if budget_exhausted {
+            rejected_region_ids.push(region.id);
             continue;
         }
         let area = i64::from(region.rect.size.w) * i64::from(region.rect.size.h);
@@ -872,6 +1077,7 @@ fn validate_regions_for_surface_geo(
                 total_area, "dropping Tahoe glass regions exceeding surface area"
             );
             budget_exhausted = true;
+            rejected_region_ids.push(region.id);
             continue;
         }
         total_area = total_area.saturating_add(area);
@@ -879,7 +1085,18 @@ fn validate_regions_for_surface_geo(
         committed.push(region.clone());
     }
 
-    Some((committed, complete))
+    rejected_region_ids.extend(
+        pending
+            .iter()
+            .skip(MAX_REGIONS_PER_SURFACE)
+            .map(|region| region.id),
+    );
+
+    Some(RegionValidationOutcome {
+        committed,
+        complete,
+        rejected_region_ids,
+    })
 }
 
 fn make_region(
@@ -969,8 +1186,57 @@ fn queue_transform_request(surface: &WlSurface, generation: u64, request: Pendin
         inner.set_pending_transform_if_owner(generation, request)
     });
 
-    if stored {
-        debug!(surface = %surface.id(), ?request, "queued Tahoe glass transform request");
+    match stored {
+        Some(superseded) => {
+            if let Some(token) = superseded {
+                token.finish(tahoe_glass_surface_v1::FeedbackStatus::Superseded);
+            }
+            debug!(surface = %surface.id(), ?request, "queued Tahoe glass transform request");
+        }
+        None => {}
+    }
+}
+
+fn set_transform_feedback_tag(
+    surface: &WlSurface,
+    generation: u64,
+    resource: &TahoeGlassSurfaceV1,
+    serial: u32,
+) {
+    if serial == 0 {
+        resource.post_error(
+            tahoe_glass_surface_v1::Error::InvalidSerial,
+            "TahoeGlass transform serial must be non-zero",
+        );
+        return;
+    }
+    let token = TransformFeedbackToken {
+        resource: resource.clone(),
+        serial,
+    };
+
+    match with_inner(surface, |inner| {
+        inner.set_feedback_tag_if_owner(generation, token)
+    }) {
+        FeedbackTagDisposition::Stored(Some(superseded)) => {
+            superseded.finish(tahoe_glass_surface_v1::FeedbackStatus::Superseded)
+        }
+        FeedbackTagDisposition::Stored(None) => {}
+        FeedbackTagDisposition::Stale(token) => {
+            token.finish(tahoe_glass_surface_v1::FeedbackStatus::Cancelled)
+        }
+        FeedbackTagDisposition::Duplicate => resource.post_error(
+            tahoe_glass_surface_v1::Error::InvalidSerial,
+            format!("TahoeGlass transform serial {serial} is already in flight"),
+        ),
+    }
+}
+
+fn reject_pending_feedback_tag(surface: &WlSurface, generation: u64) {
+    if let Some(token) = with_inner(surface, |inner| {
+        inner.take_feedback_tag_if_owner(generation)
+    }) {
+        token.finish(tahoe_glass_surface_v1::FeedbackStatus::Rejected);
     }
 }
 
@@ -1022,40 +1288,49 @@ where
                 // previous controller cannot clear this new controller's state.
                 // Also drop any glass left by a previous controller so recreate
                 // never inherits pending/committed regions.
-                let (controller_generation, needs_redraw) = with_states(&surface, |states| {
-                    let data = states
-                        .data_map
-                        .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
-                    let mut guard = data.0.lock().unwrap();
-                    let epoch_before = guard.transform_epoch;
-                    let (generation, old) = guard.claim_controller();
-                    let had_visible = !old.is_empty();
-                    if had_visible {
-                        crate::render_helpers::tahoe_glass::damage_surface_regions(
-                            states,
-                            old.as_ref(),
-                            &[],
-                        );
-                    }
-                    // Claiming also resets an active presentation transform;
-                    // that needs a redraw even when no regions were visible.
-                    (
-                        generation,
-                        had_visible || guard.transform_epoch != epoch_before,
-                    )
-                });
+                let (controller_generation, needs_redraw, cancelled) =
+                    with_states(&surface, |states| {
+                        let data = states
+                            .data_map
+                            .get_or_insert_threadsafe(TahoeGlassSurfaceData::default);
+                        let mut guard = data.0.lock().unwrap();
+                        let epoch_before = guard.transform_epoch;
+                        let (generation, old, cancelled) = guard.claim_controller();
+                        let had_visible = !old.is_empty();
+                        if had_visible {
+                            crate::render_helpers::tahoe_glass::damage_surface_regions(
+                                states,
+                                old.as_ref(),
+                                &[],
+                            );
+                        }
+                        // Claiming also resets an active presentation transform;
+                        // that needs a redraw even when no regions were visible.
+                        (
+                            generation,
+                            had_visible || guard.transform_epoch != epoch_before,
+                            cancelled,
+                        )
+                    });
                 debug!(
                     surface = %surface.id(),
                     controller_generation,
                     "created Tahoe glass surface controller"
                 );
-                data_init.init(
+                let surface_resource = data_init.init(
                     id,
                     TahoeGlassSurfaceUserData {
                         surface: surface.clone(),
                         controller_generation,
                     },
                 );
+                for token in cancelled {
+                    token.finish(tahoe_glass_surface_v1::FeedbackStatus::Cancelled);
+                }
+                if surface_resource.version() >= 5 {
+                    surface_resource
+                        .capabilities(tahoe_glass_surface_v1::Capability::TransformFeedback);
+                }
                 if needs_redraw {
                     state.queue_redraw_for_tahoe_glass_surface(&surface);
                 }
@@ -1073,7 +1348,7 @@ where
     fn request(
         state: &mut D,
         _client: &Client,
-        _resource: &TahoeGlassSurfaceV1,
+        resource: &TahoeGlassSurfaceV1,
         request: <TahoeGlassSurfaceV1 as Resource>::Request,
         data: &TahoeGlassSurfaceUserData,
         _dhandle: &DisplayHandle,
@@ -1193,6 +1468,14 @@ where
                     mark_pending_dirty(&data.surface);
                 }
             }
+            tahoe_glass_surface_v1::Request::SetTransformSerial { serial } => {
+                set_transform_feedback_tag(
+                    &data.surface,
+                    data.controller_generation,
+                    resource,
+                    serial,
+                );
+            }
             tahoe_glass_surface_v1::Request::SetTransform {
                 x,
                 y,
@@ -1223,6 +1506,7 @@ where
                         surface = %data.surface.id(),
                         "discarding Tahoe glass transform target with invalid curve"
                     );
+                    reject_pending_feedback_tag(&data.surface, data.controller_generation);
                     return;
                 };
                 let affine = PresentationAffine::sanitized(x, y, scale_x, scale_y);
@@ -1247,6 +1531,7 @@ where
                         region_id,
                         "discarding Tahoe glass region morph with invalid curve"
                     );
+                    reject_pending_feedback_tag(&data.surface, data.controller_generation);
                     return;
                 };
                 queue_transform_request(
@@ -1349,6 +1634,37 @@ mod tests {
             validate_regions_for_surface_geo(Some(surface_geo), &[inside.clone(), overflowing], &[]),
             Some((vec![inside, clamped], false))
         );
+    }
+
+    #[test]
+    fn permanent_overflow_reports_rejected_region_identity() {
+        let surface_geo = Rectangle::new(Point::new(0, 0), Size::new(100, 40));
+        let accepted = region(1, 0, 0, 80, 40);
+        let over_budget = region(9, 0, 0, 30, 40);
+
+        let outcome = validate_regions_for_surface_geo_with_rejections(
+            Some(surface_geo),
+            &[accepted.clone(), over_budget],
+            &[],
+        )
+        .expect("surface geometry exists");
+
+        assert!(outcome.complete);
+        assert_eq!(outcome.committed, vec![accepted]);
+        assert_eq!(outcome.rejected_region_ids, vec![9]);
+    }
+
+    #[test]
+    fn healable_overflow_is_not_reported_as_terminal_rejection() {
+        let surface_geo = Rectangle::new(Point::new(0, 0), Size::new(100, 40));
+        let growing = region(7, 0, 0, 120, 40);
+
+        let outcome =
+            validate_regions_for_surface_geo_with_rejections(Some(surface_geo), &[growing], &[])
+                .expect("surface geometry exists");
+
+        assert!(!outcome.complete);
+        assert!(outcome.rejected_region_ids.is_empty());
     }
 
     /// Region ahead of buffer during an animated grow: the pending target is
@@ -1571,13 +1887,13 @@ mod tests {
     #[test]
     fn destroy_clears_pending_and_committed_for_owner() {
         let mut inner = surface_with_committed(vec![region(1, 0, 0, 64, 32)]);
-        let (generation, _) = inner.claim_controller();
+        let (generation, _, _) = inner.claim_controller();
         // Simulate set + commit under this controller.
         inner.pending = vec![region(7, 4, 4, 40, 20)];
         inner.committed = Arc::new(inner.pending.clone());
         inner.pending_dirty = false;
 
-        let old = inner
+        let (old, _) = inner
             .clear_if_owner(generation)
             .expect("owner must be authorized to clear");
         assert_eq!(old.len(), 1);
@@ -1592,12 +1908,12 @@ mod tests {
     fn recreate_does_not_inherit_previous_controller_state() {
         let mut inner =
             surface_with_committed(vec![region(1, 0, 0, 64, 32), region(2, 8, 8, 16, 16)]);
-        let (old_gen, _) = inner.claim_controller();
+        let (old_gen, _, _) = inner.claim_controller();
         inner.pending = vec![region(1, 0, 0, 64, 32)];
         inner.committed = Arc::new(vec![region(1, 0, 0, 64, 32)]);
         inner.pending_dirty = true;
 
-        let (new_gen, old_committed) = inner.claim_controller();
+        let (new_gen, old_committed, _) = inner.claim_controller();
         assert_ne!(old_gen, new_gen);
         assert_eq!(old_committed.len(), 1);
         assert!(inner.pending.is_empty());
@@ -1610,11 +1926,11 @@ mod tests {
     #[test]
     fn stale_controller_destroy_cannot_clear_new_owner() {
         let mut inner = TahoeGlassSurfaceInner::default();
-        let (old_gen, _) = inner.claim_controller();
+        let (old_gen, _, _) = inner.claim_controller();
         inner.pending = vec![region(1, 0, 0, 10, 10)];
         inner.committed = Arc::new(vec![region(1, 0, 0, 10, 10)]);
 
-        let (new_gen, _) = inner.claim_controller();
+        let (new_gen, _, _) = inner.claim_controller();
         // New owner sets its own regions.
         inner.pending = vec![region(9, 1, 1, 20, 20)];
         inner.committed = Arc::new(vec![region(9, 1, 1, 20, 20)]);
@@ -1633,15 +1949,15 @@ mod tests {
     #[test]
     fn clear_for_owner_is_idempotent() {
         let mut inner = TahoeGlassSurfaceInner::default();
-        let (generation, _) = inner.claim_controller();
+        let (generation, _, _) = inner.claim_controller();
         inner.pending = vec![region(3, 0, 0, 8, 8)];
         inner.committed = Arc::new(vec![region(3, 0, 0, 8, 8)]);
         inner.pending_dirty = true;
 
-        let first = inner.clear_if_owner(generation).expect("first clear");
+        let (first, _) = inner.clear_if_owner(generation).expect("first clear");
         assert_eq!(first.len(), 1);
 
-        let second = inner
+        let (second, _) = inner
             .clear_if_owner(generation)
             .expect("same generation remains authorized");
         assert!(second.is_empty());
@@ -1657,8 +1973,8 @@ mod tests {
     #[test]
     fn stale_controller_writes_are_rejected_via_write_gate() {
         let mut inner = TahoeGlassSurfaceInner::default();
-        let (old_gen, _) = inner.claim_controller();
-        let (new_gen, _) = inner.claim_controller();
+        let (old_gen, _, _) = inner.claim_controller();
+        let (new_gen, _, _) = inner.claim_controller();
         assert_ne!(old_gen, new_gen);
 
         // Current owner can set.
@@ -1716,7 +2032,7 @@ mod tests {
         let data = TahoeGlassSurfaceData::default();
         let generation = {
             let mut guard = data.0.lock().unwrap();
-            let (generation, _) = guard.claim_controller();
+            let (generation, _, _) = guard.claim_controller();
             guard.pending = vec![region(7, 0, 0, 32, 16)];
             guard.committed = Arc::new(vec![region(7, 0, 0, 32, 16)]);
             guard.pending_dirty = false;
@@ -1727,7 +2043,7 @@ mod tests {
         let needs_redraw = {
             let mut guard = data.0.lock().unwrap();
             match guard.clear_if_owner(generation) {
-                Some(old) => !old.is_empty(),
+                Some((old, _)) => !old.is_empty(),
                 None => false,
             }
         };
@@ -1750,14 +2066,14 @@ mod tests {
         let data = TahoeGlassSurfaceData::default();
         let old_gen = {
             let mut guard = data.0.lock().unwrap();
-            let (generation, _) = guard.claim_controller();
+            let (generation, _, _) = guard.claim_controller();
             guard.pending = vec![region(1, 0, 0, 10, 10)];
             guard.committed = Arc::new(vec![region(1, 0, 0, 10, 10)]);
             generation
         };
         let new_gen = {
             let mut guard = data.0.lock().unwrap();
-            let (generation, old) = guard.claim_controller();
+            let (generation, old, _) = guard.claim_controller();
             assert_eq!(old.len(), 1, "claim must surface previous committed");
             assert!(guard.pending.is_empty());
             assert!(guard.committed.is_empty());
@@ -1769,7 +2085,7 @@ mod tests {
         let needs_redraw = {
             let mut guard = data.0.lock().unwrap();
             match guard.clear_if_owner(old_gen) {
-                Some(old) => !old.is_empty(),
+                Some((old, _)) => !old.is_empty(),
                 None => false,
             }
         };
@@ -1792,7 +2108,7 @@ mod tests {
         let data = TahoeGlassSurfaceData::default();
         let generation = {
             let mut guard = data.0.lock().unwrap();
-            let (generation, _) = guard.claim_controller();
+            let (generation, _, _) = guard.claim_controller();
             guard.pending = vec![region(3, 0, 0, 8, 8)];
             guard.committed = Arc::new(vec![region(3, 0, 0, 8, 8)]);
             generation
@@ -1802,14 +2118,14 @@ mod tests {
             let mut guard = data.0.lock().unwrap();
             guard
                 .clear_if_owner(generation)
-                .map(|old| !old.is_empty())
+                .map(|(old, _)| !old.is_empty())
                 .unwrap_or(false)
         };
         let second = {
             let mut guard = data.0.lock().unwrap();
             guard
                 .clear_if_owner(generation)
-                .map(|old| !old.is_empty())
+                .map(|(old, _)| !old.is_empty())
                 .unwrap_or(false)
         };
         assert!(first);
@@ -1825,7 +2141,7 @@ mod tests {
     #[test]
     fn write_gate_propagates_hard_reject_for_region_limit() {
         let mut inner = TahoeGlassSurfaceInner::default();
-        let (generation, _) = inner.claim_controller();
+        let (generation, _, _) = inner.claim_controller();
         for id in 0..MAX_REGIONS_PER_SURFACE as u32 {
             inner.pending.push(region(id, 0, 0, 1, 1));
         }
@@ -1855,8 +2171,8 @@ mod tests {
     #[test]
     fn stale_controller_transform_writes_are_rejected() {
         let mut inner = TahoeGlassSurfaceInner::default();
-        let (old_gen, _) = inner.claim_controller();
-        let (new_gen, _) = inner.claim_controller();
+        let (old_gen, _, _) = inner.claim_controller();
+        let (new_gen, _, _) = inner.claim_controller();
 
         let target = PendingTransformRequest::Target(
             PresentationAffine {
@@ -1867,10 +2183,14 @@ mod tests {
             },
             spring_curve(),
         );
-        assert!(!inner.set_pending_transform_if_owner(old_gen, target));
+        assert!(inner
+            .set_pending_transform_if_owner(old_gen, target)
+            .is_none());
         assert!(inner.pending_transform.is_none());
 
-        assert!(inner.set_pending_transform_if_owner(new_gen, target));
+        assert!(inner
+            .set_pending_transform_if_owner(new_gen, target)
+            .is_some());
         assert_eq!(inner.pending_transform, Some(target));
     }
 
@@ -1880,10 +2200,10 @@ mod tests {
     #[test]
     fn claim_and_clear_reset_transform_state() {
         let mut inner = TahoeGlassSurfaceInner::default();
-        let (generation, _) = inner.claim_controller();
+        let (generation, _, _) = inner.claim_controller();
         let epoch_after_claim = inner.transform_epoch;
 
-        inner.set_pending_transform_if_owner(
+        let _ = inner.set_pending_transform_if_owner(
             generation,
             PendingTransformRequest::Set(PresentationAffine {
                 x: 10.,
@@ -1892,12 +2212,15 @@ mod tests {
                 scale_y: 1.,
             }),
         );
-        inner.publish_transform_directive(TahoeGlassTransformDirective::Set(PresentationAffine {
-            x: 10.,
-            y: 0.,
-            scale_x: 1.,
-            scale_y: 1.,
-        }));
+        inner.publish_transform_directive(
+            TahoeGlassTransformDirective::Set(PresentationAffine {
+                x: 10.,
+                y: 0.,
+                scale_x: 1.,
+                scale_y: 1.,
+            }),
+            None,
+        );
         let epoch_after_publish = inner.transform_epoch;
         assert_ne!(epoch_after_claim, epoch_after_publish);
 
@@ -1917,16 +2240,19 @@ mod tests {
     #[test]
     fn transform_reset_is_idempotent_across_double_clear() {
         let mut inner = TahoeGlassSurfaceInner::default();
-        let (generation, _) = inner.claim_controller();
-        inner.publish_transform_directive(TahoeGlassTransformDirective::Target(
-            PresentationAffine {
-                x: 0.,
-                y: 88.,
-                scale_x: 1.,
-                scale_y: 1.,
-            },
-            spring_curve(),
-        ));
+        let (generation, _, _) = inner.claim_controller();
+        inner.publish_transform_directive(
+            TahoeGlassTransformDirective::Target(
+                PresentationAffine {
+                    x: 0.,
+                    y: 88.,
+                    scale_x: 1.,
+                    scale_y: 1.,
+                },
+                spring_curve(),
+            ),
+            None,
+        );
 
         inner.clear_if_owner(generation).expect("first clear");
         let epoch = inner.transform_epoch;

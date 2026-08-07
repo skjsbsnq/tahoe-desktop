@@ -1,4 +1,4 @@
-//! Integration tests for Tahoe glass controller lifecycle (Task 05 / Task 19).
+//! Integration tests for Tahoe glass controller lifecycle and v5 feedback.
 //!
 //! These exercise the real protocol path: client Destroy must clear
 //! committed regions on a still-alive wl_surface, and recreate must not
@@ -16,7 +16,9 @@ use smithay::wayland::compositor::with_states;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::*;
-use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_surface_v1::TahoeGlassSurfaceV1;
+use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_surface_v1::{
+    self, TahoeGlassSurfaceV1,
+};
 use crate::protocols::tahoe_glass::{
     get_committed_regions, test_damage_old_region_count, test_fallback_redraw_all_count,
     test_last_damaged_old_rects, test_redraw_counter_lock, test_reset_redraw_counters,
@@ -114,6 +116,452 @@ fn count_outputs_queued(niri: &crate::niri::Niri) -> (usize, usize) {
         })
         .count();
     (queued, total)
+}
+
+fn glass_events(
+    f: &mut Fixture,
+    id: client::ClientId,
+    glass: &TahoeGlassSurfaceV1,
+) -> client::TahoeGlassSurfaceEvents {
+    f.client(id)
+        .state
+        .tahoe_glass_surface_events
+        .get(glass)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn commit_layer(f: &mut Fixture, id: client::ClientId, surface: &WlSurface) {
+    f.client(id).connection.flush().unwrap();
+    f.roundtrip(id);
+    f.client(id).layer(surface).commit();
+    f.double_roundtrip(id);
+}
+
+#[test]
+fn v4_transform_path_remains_silent_and_usable() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let manager = f.client(id).bind_tahoe_glass_manager(4);
+    let qh = f.client(id).qh.clone();
+    let glass = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.double_roundtrip(id);
+    assert_eq!(glass_events(&mut f, id, &glass), Default::default());
+
+    glass.set_transform(12.0.into(), 4.0.into(), 0.9.into(), 0.9.into());
+    commit_layer(&mut f, id, &client_surface);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(glass_events(&mut f, id, &glass), Default::default());
+}
+
+#[test]
+fn v5_capability_and_transform_completion_arrive_on_wire_once() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let manager = f.client(id).bind_tahoe_glass_manager(5);
+    let qh = f.client(id).qh.clone();
+    let glass = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.double_roundtrip(id);
+    assert_eq!(
+        glass_events(&mut f, id, &glass).capabilities,
+        vec![u32::from(
+            tahoe_glass_surface_v1::Capability::TransformFeedback
+        )]
+    );
+
+    glass.set_transform_serial(42);
+    glass.set_transform_target(
+        20.0.into(),
+        8.0.into(),
+        0.8.into(),
+        0.8.into(),
+        tahoe_glass_surface_v1::TransformCurve::Eased,
+        200.0.into(),
+        0.2.into(),
+        0.0.into(),
+        0.2.into(),
+        1.0.into(),
+    );
+    commit_layer(&mut f, id, &client_surface);
+    assert!(
+        glass_events(&mut f, id, &glass)
+            .transform_feedback
+            .is_empty(),
+        "animated transform must not complete at commit"
+    );
+
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        glass_events(&mut f, id, &glass).transform_feedback,
+        vec![(
+            42,
+            u32::from(tahoe_glass_surface_v1::FeedbackStatus::Completed)
+        )]
+    );
+
+    f.client(id).layer(&client_surface).commit();
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        glass_events(&mut f, id, &glass).transform_feedback.len(),
+        1,
+        "later commits and animation ticks must not repeat terminal feedback"
+    );
+}
+
+#[test]
+fn v5_controller_replacement_cancels_active_serial_and_blocks_late_completion() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let manager = f.client(id).bind_tahoe_glass_manager(5);
+    let qh = f.client(id).qh.clone();
+    let glass_a = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.double_roundtrip(id);
+    glass_a.set_transform_serial(301);
+    glass_a.set_transform_target(
+        20.0.into(),
+        8.0.into(),
+        0.8.into(),
+        0.8.into(),
+        tahoe_glass_surface_v1::TransformCurve::Eased,
+        200.0.into(),
+        0.2.into(),
+        0.0.into(),
+        0.2.into(),
+        1.0.into(),
+    );
+    commit_layer(&mut f, id, &client_surface);
+
+    let glass_b = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.client(id).connection.flush().unwrap();
+    f.double_roundtrip(id);
+    assert_eq!(
+        glass_events(&mut f, id, &glass_a).transform_feedback,
+        vec![(
+            301,
+            u32::from(tahoe_glass_surface_v1::FeedbackStatus::Cancelled)
+        )]
+    );
+    assert_eq!(
+        glass_events(&mut f, id, &glass_b).capabilities,
+        vec![u32::from(
+            tahoe_glass_surface_v1::Capability::TransformFeedback
+        )]
+    );
+
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        glass_events(&mut f, id, &glass_a).transform_feedback.len(),
+        1,
+        "the superseded animation epoch must not complete after controller replacement"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Protocol error 1 on object tahoe_glass_surface_v1")]
+fn v5_reusing_an_in_flight_serial_is_a_protocol_error() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let manager = f.client(id).bind_tahoe_glass_manager(5);
+    let qh = f.client(id).qh.clone();
+    let glass = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.double_roundtrip(id);
+    glass.set_transform_serial(42);
+    glass.set_transform_target(
+        20.0.into(),
+        8.0.into(),
+        0.8.into(),
+        0.8.into(),
+        tahoe_glass_surface_v1::TransformCurve::Eased,
+        200.0.into(),
+        0.2.into(),
+        0.0.into(),
+        0.2.into(),
+        1.0.into(),
+    );
+    commit_layer(&mut f, id, &client_surface);
+
+    glass.set_transform_serial(42);
+    f.client(id).connection.flush().unwrap();
+    f.roundtrip(id);
+}
+
+#[test]
+fn v5_supersede_and_reject_are_correlated_on_wire() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let manager = f.client(id).bind_tahoe_glass_manager(5);
+    let qh = f.client(id).qh.clone();
+    let glass = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.double_roundtrip(id);
+
+    glass.set_transform_serial(101);
+    glass.set_transform_target(
+        20.0.into(),
+        8.0.into(),
+        0.8.into(),
+        0.8.into(),
+        tahoe_glass_surface_v1::TransformCurve::Eased,
+        200.0.into(),
+        0.2.into(),
+        0.0.into(),
+        0.2.into(),
+        1.0.into(),
+    );
+    glass.set_transform_serial(102);
+    glass.set_transform(0.0.into(), 0.0.into(), 1.0.into(), 1.0.into());
+    commit_layer(&mut f, id, &client_surface);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    glass.set_transform_serial(103);
+    glass.set_region_morph(
+        999,
+        tahoe_glass_surface_v1::TransformCurve::Eased,
+        200.0.into(),
+        0.2.into(),
+        0.0.into(),
+        0.2.into(),
+        1.0.into(),
+    );
+    commit_layer(&mut f, id, &client_surface);
+
+    assert_eq!(
+        glass_events(&mut f, id, &glass).transform_feedback,
+        vec![
+            (
+                101,
+                u32::from(tahoe_glass_surface_v1::FeedbackStatus::Superseded),
+            ),
+            (
+                102,
+                u32::from(tahoe_glass_surface_v1::FeedbackStatus::Completed),
+            ),
+            (
+                103,
+                u32::from(tahoe_glass_surface_v1::FeedbackStatus::Rejected),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn v5_healable_region_morph_waits_for_surface_growth_then_completes_once() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let manager = f.client(id).bind_tahoe_glass_manager(5);
+    let qh = f.client(id).qh.clone();
+    let glass = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.double_roundtrip(id);
+    set_and_commit_region(&mut f, id, &client_surface, &glass, 1);
+
+    glass.set_region(
+        1,
+        8,
+        4,
+        240,
+        32,
+        8,
+        8,
+        8,
+        8,
+        String::from("panel"),
+        7,
+        0.0.into(),
+        1.0.into(),
+    );
+    glass.set_transform_serial(201);
+    glass.set_region_morph(
+        1,
+        tahoe_glass_surface_v1::TransformCurve::Eased,
+        200.0.into(),
+        0.2.into(),
+        0.0.into(),
+        0.2.into(),
+        1.0.into(),
+    );
+    commit_layer(&mut f, id, &client_surface);
+    assert!(
+        glass_events(&mut f, id, &glass)
+            .transform_feedback
+            .is_empty(),
+        "geometry-healable overflow must remain pending"
+    );
+
+    {
+        let layer = f.client(id).layer(&client_surface);
+        layer.set_size(300, 100);
+        layer.attach_new_buffer();
+        layer.commit();
+    }
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        glass_events(&mut f, id, &glass).transform_feedback,
+        vec![(
+            201,
+            u32::from(tahoe_glass_surface_v1::FeedbackStatus::Completed)
+        )]
+    );
+
+    f.client(id).layer(&client_surface).commit();
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(glass_events(&mut f, id, &glass).transform_feedback.len(), 1);
+}
+
+#[test]
+fn v5_unmap_cancels_healable_region_morph_without_late_completion() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+
+    let manager = f.client(id).bind_tahoe_glass_manager(5);
+    let qh = f.client(id).qh.clone();
+    let glass = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.double_roundtrip(id);
+    set_and_commit_region(&mut f, id, &client_surface, &glass, 1);
+
+    glass.set_region(
+        1,
+        8,
+        4,
+        240,
+        32,
+        8,
+        8,
+        8,
+        8,
+        String::from("panel"),
+        7,
+        0.0.into(),
+        1.0.into(),
+    );
+    glass.set_transform_serial(202);
+    glass.set_region_morph(
+        1,
+        tahoe_glass_surface_v1::TransformCurve::Eased,
+        200.0.into(),
+        0.2.into(),
+        0.0.into(),
+        0.2.into(),
+        1.0.into(),
+    );
+    commit_layer(&mut f, id, &client_surface);
+    assert!(
+        glass_events(&mut f, id, &glass)
+            .transform_feedback
+            .is_empty(),
+        "geometry-healable overflow must remain pending before unmap"
+    );
+
+    f.unmap_layer(id, &client_surface);
+    assert_eq!(
+        glass_events(&mut f, id, &glass).transform_feedback,
+        vec![(
+            202,
+            u32::from(tahoe_glass_surface_v1::FeedbackStatus::Cancelled)
+        )]
+    );
+
+    f.remap_layer(
+        id,
+        &client_surface,
+        LayerConfigureProps {
+            anchor: Some(Anchor::Left | Anchor::Top),
+            size: Some((300, 100)),
+            ..Default::default()
+        },
+        (300, 100),
+    );
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        glass_events(&mut f, id, &glass).transform_feedback.len(),
+        1,
+        "the pre-unmap morph must not complete after remap and surface growth"
+    );
+}
+
+#[test]
+fn v5_transform_on_never_mapped_layer_is_cancelled_without_late_completion() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let layer = f
+        .client(id)
+        .create_layer(None, Layer::Top, "tahoe-glass-never-mapped");
+    let client_surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        anchor: Some(Anchor::Left | Anchor::Top),
+        size: Some((200, 100)),
+        ..Default::default()
+    });
+
+    let manager = f.client(id).bind_tahoe_glass_manager(5);
+    let qh = f.client(id).qh.clone();
+    let glass = manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    f.double_roundtrip(id);
+
+    glass.set_transform_serial(203);
+    glass.set_transform_target(
+        20.0.into(),
+        8.0.into(),
+        0.8.into(),
+        0.8.into(),
+        tahoe_glass_surface_v1::TransformCurve::Eased,
+        200.0.into(),
+        0.2.into(),
+        0.0.into(),
+        0.2.into(),
+        1.0.into(),
+    );
+    commit_layer(&mut f, id, &client_surface);
+    assert_eq!(
+        glass_events(&mut f, id, &glass).transform_feedback,
+        vec![(
+            203,
+            u32::from(tahoe_glass_surface_v1::FeedbackStatus::Cancelled)
+        )]
+    );
+
+    {
+        let layer = f.client(id).layer(&client_surface);
+        layer.attach_new_buffer();
+        layer.set_size(200, 100);
+        layer.ack_last_and_commit();
+    }
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        glass_events(&mut f, id, &glass).transform_feedback.len(),
+        1,
+        "the never-mapped transform must not complete after the layer maps"
+    );
 }
 
 #[test]

@@ -24,8 +24,8 @@ use crate::layer::transform_animation::PresentationTransformAnimation;
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
 use crate::protocols::tahoe_glass::{
-    get_committed_regions, get_transform_directive, PresentationAffine, TahoeGlassRegion,
-    TahoeGlassTransformDirective,
+    complete_transform_feedback, get_committed_regions, get_transform_directive,
+    PresentationAffine, TahoeGlassRegion, TahoeGlassTransformDirective,
 };
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -87,6 +87,10 @@ pub struct MappedLayer {
     /// published directive on unmap, not by absorbing the epoch here (the
     /// mapping commit itself may legitimately carry a directive).
     seen_transform_epoch: u64,
+
+    /// Epoch of the currently applied tracked transform. Completion is sent
+    /// only when this exact directive settles; a retarget replaces the epoch.
+    transform_feedback_epoch: Option<u64>,
 
     /// Snapshot to use if this layer is unmapped with a close animation.
     unmap_snapshot: Option<LayerSurfaceUnmapSnapshot>,
@@ -176,6 +180,7 @@ impl MappedLayer {
             // handled by clearing the directive on unmap
             // (clear_transform_directive_on_unmap).
             seen_transform_epoch: 0,
+            transform_feedback_epoch: None,
             unmap_snapshot: None,
             close_tahoe_glass_regions: None,
             clock,
@@ -303,6 +308,11 @@ impl MappedLayer {
             if anim.is_done() {
                 self.presentation_transform = anim.to();
                 self.transform_animation = None;
+                if let Some(epoch) = self.transform_feedback_epoch.take() {
+                    with_states(self.surface.wl_surface(), |states| {
+                        complete_transform_feedback(states, epoch);
+                    });
+                }
             }
         }
     }
@@ -330,15 +340,19 @@ impl MappedLayer {
             return;
         }
         self.seen_transform_epoch = epoch;
+        self.transform_feedback_epoch = Some(epoch);
 
         match directive {
             TahoeGlassTransformDirective::Set(affine) => {
                 self.transform_animation = None;
                 self.presentation_transform = affine;
+                self.complete_applied_transform_feedback();
             }
             TahoeGlassTransformDirective::Target(target, curve) => {
                 let from = self.presentation_affine();
-                self.start_transform_animation(from, target, curve);
+                if !self.start_transform_animation(from, target, curve) {
+                    self.complete_applied_transform_feedback();
+                }
             }
             TahoeGlassTransformDirective::Morph {
                 old_rect,
@@ -351,11 +365,23 @@ impl MappedLayer {
                 // land exactly where the previous morph currently is.
                 let visual = self.presentation_affine().apply_rect(old_rect);
                 let Some(from) = PresentationAffine::mapping_rect(new_rect, visual) else {
+                    self.complete_applied_transform_feedback();
                     return;
                 };
-                self.start_transform_animation(from, PresentationAffine::IDENTITY, curve);
+                if !self.start_transform_animation(from, PresentationAffine::IDENTITY, curve) {
+                    self.complete_applied_transform_feedback();
+                }
             }
         }
+    }
+
+    fn complete_applied_transform_feedback(&mut self) {
+        let Some(epoch) = self.transform_feedback_epoch.take() else {
+            return;
+        };
+        with_states(self.surface.wl_surface(), |states| {
+            complete_transform_feedback(states, epoch);
+        });
     }
 
     fn start_transform_animation(
@@ -363,14 +389,14 @@ impl MappedLayer {
         from: PresentationAffine,
         to: PresentationAffine,
         curve: crate::protocols::tahoe_glass::TahoeTransformCurve,
-    ) {
+    ) -> bool {
         // The animation settles on `to`; record it as the steady state so a
         // dropped animation can never leave a stale transform behind.
         self.presentation_transform = to;
 
         if from == to {
             self.transform_animation = None;
-            return;
+            return false;
         }
 
         let velocity = self
@@ -384,6 +410,7 @@ impl MappedLayer {
             velocity,
             curve,
         ));
+        true
     }
 
     pub fn start_open_animation(

@@ -14,7 +14,7 @@
     all copies or substantial portions of the Software.
   </copyright>
 
-  <interface name="tahoe_glass_manager_v1" version="4">
+  <interface name="tahoe_glass_manager_v1" version="5">
     <description summary="Tahoe compositor-owned glass manager">
       This private protocol lets a client describe exact rounded glass regions
       for a wl_surface. The compositor owns blur, tint, refraction, clipping,
@@ -22,7 +22,8 @@
 
       The manager version is kept in lockstep with tahoe_glass_surface_v1 so
       that surface objects (which inherit the manager's bound version) can
-      negotiate the presentation-transform requests added in version 4.
+      negotiate the presentation-transform requests added in version 4 and
+      the serial-correlated completion feedback added in version 5.
     </description>
 
     <request name="destroy" type="destructor">
@@ -40,7 +41,7 @@
     </request>
   </interface>
 
-  <interface name="tahoe_glass_surface_v1" version="4">
+  <interface name="tahoe_glass_surface_v1" version="5">
     <description summary="per-surface Tahoe glass regions">
       Regions are double-buffered and committed with the associated wl_surface.
       Region coordinates are surface-local logical coordinates.
@@ -51,10 +52,16 @@
       presentation-only — it never affects input, layout, or the protocol
       region geometry itself, and the compositor may restrict it to
       layer-shell surfaces.
+
+      Since version 5 clients can tag a presentation-transform request with a
+      serial and receive exactly one terminal feedback event. This closes the
+      animation lifecycle without changing the version 4 request signatures.
     </description>
 
     <enum name="error">
       <entry name="invalid_region" value="0" summary="region values are invalid"/>
+      <entry name="invalid_serial" value="1" since="5"
+             summary="transform serial is zero or already in flight"/>
     </enum>
 
     <enum name="region_flags" bitfield="true">
@@ -107,6 +114,18 @@
     <enum name="transform_curve" since="4">
       <entry name="spring" value="0" summary="damped spring curve"/>
       <entry name="eased" value="1" summary="cubic-bezier easing curve"/>
+    </enum>
+
+    <enum name="capability" bitfield="true" since="5">
+      <entry name="transform_feedback" value="1"
+             summary="serial-correlated transform completion feedback"/>
+    </enum>
+
+    <enum name="feedback_status" since="5">
+      <entry name="completed" value="0" summary="the tagged transform reached its terminal value"/>
+      <entry name="rejected" value="1" summary="the tagged transform could not be applied"/>
+      <entry name="superseded" value="2" summary="a newer transform replaced the tagged transform"/>
+      <entry name="cancelled" value="3" summary="the tagged transform was cancelled by lifecycle teardown"/>
     </enum>
 
     <request name="set_transform" since="4">
@@ -184,5 +203,48 @@
       <arg name="p4" type="fixed" summary="reserved 0, or bezier x2"/>
       <arg name="p5" type="fixed" summary="reserved 0, or bezier y2"/>
     </request>
+
+    <request name="set_transform_serial" since="5">
+      <description summary="tag the next presentation-transform request">
+        Associates serial with the next set_transform, set_transform_target,
+        or set_region_morph request sent on this object. The tag is consumed by
+        that request and applied with the same wl_surface commit.
+
+        A client must use a non-zero serial that it has not reused for another
+        in-flight transform on this object; violating either rule raises the
+        invalid_serial protocol error. Replacing an unconsumed tag or a
+        tagged transform that has not completed produces superseded feedback
+        for the older serial. A tag not followed by a transform before the next
+        wl_surface commit is rejected.
+
+        Version 1 through 4 clients do not use this request and retain the
+        original silent last-one-wins behavior.
+      </description>
+      <arg name="serial" type="uint" summary="client-selected non-zero request identity"/>
+    </request>
+
+    <event name="capabilities" since="5">
+      <description summary="feedback capabilities supported by the compositor">
+        Sent once when the surface controller is created. A client must wait
+        for this event and confirm the transform_feedback capability before
+        relying on terminal events.
+      </description>
+      <arg name="capabilities" type="uint" enum="capability"/>
+    </event>
+
+    <event name="transform_feedback" since="5">
+      <description summary="terminal state for one tagged transform">
+        Sent exactly once for every accepted non-zero serial while this
+        protocol object remains alive. Replacing an unconsumed tag produces
+        superseded feedback; committing one without a transform produces
+        rejected feedback. completed is emitted only after an animated
+        transform settles (or immediately after a non-animated transform is
+        applied). rejected, superseded, and cancelled are terminal and must
+        not later be followed by completed for the same serial. Destroying
+        this protocol object precludes further wire feedback.
+      </description>
+      <arg name="serial" type="uint" summary="serial supplied by set_transform_serial"/>
+      <arg name="status" type="uint" enum="feedback_status"/>
+    </event>
   </interface>
 </protocol>

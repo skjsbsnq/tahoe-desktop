@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_manager_v1::TahoeGlassManagerV1;
-use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_surface_v1::TahoeGlassSurfaceV1;
+use crate::protocols::raw::tahoe_glass::v1::client::tahoe_glass_surface_v1::{
+    self, TahoeGlassSurfaceV1,
+};
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
@@ -70,6 +72,7 @@ pub struct Client {
     pub connection: Connection,
     pub qh: QueueHandle<State>,
     pub display: WlDisplay,
+    pub registry: WlRegistry,
     pub state: State,
 }
 
@@ -89,6 +92,7 @@ pub struct State {
     pub foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
     pub ext_foreign_toplevel_list: Option<ExtForeignToplevelListV1>,
     pub tahoe_glass_manager: Option<TahoeGlassManagerV1>,
+    pub tahoe_glass_surface_events: HashMap<TahoeGlassSurfaceV1, TahoeGlassSurfaceEvents>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
     pub shm: Option<WlShm>,
@@ -107,6 +111,12 @@ pub struct State {
     /// Creation-order records for coordinated ext ↔ wlr pairing tests (R11).
     pub wlr_foreign_toplevel_meta: Vec<WlrForeignToplevelMeta>,
     pub ext_foreign_toplevels: Vec<ExtForeignToplevelMeta>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TahoeGlassSurfaceEvents {
+    pub capabilities: Vec<u32>,
+    pub transform_feedback: Vec<(u32, u32)>,
 }
 
 /// Client-side snapshot of one wlr foreign-toplevel handle stream event set.
@@ -253,7 +263,7 @@ impl Client {
             .unwrap();
 
         let display = connection.display();
-        let _registry = display.get_registry(&qh, ());
+        let registry = display.get_registry(&qh, ());
         connection.flush().unwrap();
 
         let state = State {
@@ -270,6 +280,7 @@ impl Client {
             foreign_toplevel_manager: None,
             ext_foreign_toplevel_list: None,
             tahoe_glass_manager: None,
+            tahoe_glass_surface_events: HashMap::new(),
             spbm: None,
             viewporter: None,
             shm: None,
@@ -290,6 +301,7 @@ impl Client {
             connection,
             qh,
             display,
+            registry,
             state,
         }
     }
@@ -412,6 +424,22 @@ impl Client {
             .tahoe_glass_manager
             .clone()
             .expect("tahoe_glass_manager global not bound")
+    }
+
+    pub fn bind_tahoe_glass_manager(&self, requested_version: u32) -> TahoeGlassManagerV1 {
+        let global = self
+            .state
+            .globals
+            .iter()
+            .find(|global| global.interface == TahoeGlassManagerV1::interface().name)
+            .expect("tahoe_glass_manager global not advertised");
+        assert!(
+            requested_version <= global.version,
+            "requested TahoeGlass v{requested_version}, server only advertises v{}",
+            global.version
+        );
+        self.registry
+            .bind(global.name, requested_version, &self.qh, ())
     }
 
     pub fn output(&mut self, name: &str) -> WlOutput {
@@ -1205,14 +1233,25 @@ impl Dispatch<TahoeGlassManagerV1, ()> for State {
 
 impl Dispatch<TahoeGlassSurfaceV1, ()> for State {
     fn event(
-        _state: &mut Self,
-        _proxy: &TahoeGlassSurfaceV1,
-        _event: <TahoeGlassSurfaceV1 as wayland_client::Proxy>::Event,
+        state: &mut Self,
+        proxy: &TahoeGlassSurfaceV1,
+        event: <TahoeGlassSurfaceV1 as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        unreachable!()
+        let events = state
+            .tahoe_glass_surface_events
+            .entry(proxy.clone())
+            .or_default();
+        match event {
+            tahoe_glass_surface_v1::Event::Capabilities { capabilities } => {
+                events.capabilities.push(capabilities.into());
+            }
+            tahoe_glass_surface_v1::Event::TransformFeedback { serial, status } => {
+                events.transform_feedback.push((serial, status.into()));
+            }
+        }
     }
 }
 

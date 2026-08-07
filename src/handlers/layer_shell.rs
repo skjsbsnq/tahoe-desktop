@@ -258,8 +258,11 @@ impl State {
             }
         } else {
             // The surface is unmapped.
+            // TahoeGlass directives are published before layer-shell commit
+            // handling. Cancel them even when this surface was already
+            // unmapped and therefore has no MappedLayer entry to remove.
+            crate::protocols::tahoe_glass::clear_transform_directive_on_unmap(surface);
             if let Some(mut mapped) = self.niri.mapped_layer_surfaces.remove(&layer) {
-                crate::protocols::tahoe_glass::clear_transform_directive_on_unmap(surface);
                 self.clear_foreign_toplevel_rects_for_source(surface);
                 needs_output_resize = true;
 
