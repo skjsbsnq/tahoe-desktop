@@ -149,6 +149,7 @@ impl FramebufferEffectElement {
         crop: Rectangle<f64, Logical>,
         transform: Transform,
         band_subrect: Option<(Vec2, Vec2)>,
+        texture_scale: Vec2,
     ) -> [Uniform<'static>; 16] {
         let offset = crop.loc - (self.clip_geo.loc - self.geometry.loc);
         let offset = Vec2::new(offset.x as f32, offset.y as f32);
@@ -169,6 +170,14 @@ impl FramebufferEffectElement {
             input_to_clip_geo =
                 input_to_clip_geo * Mat3::from_scale(scale) * Mat3::from_translation(translate);
         }
+
+        // T10: the retained capacity texture can be larger than the active
+        // (written) region. render_texture_from_to normalizes v_coords by the
+        // *capacity* size, so first map them back into the active region —
+        // otherwise the glass SDF (corner radius, rim, clip) evaluates at
+        // active/capacity × geometry and a transparent band appears around
+        // every panel whose capture size is not 64-aligned.
+        input_to_clip_geo = input_to_clip_geo * Mat3::from_scale(texture_scale);
 
         // Revert the effect of the texture transform.
         let transform_mat = Mat3::from_translation(Vec2::new(0.5, 0.5))
@@ -610,7 +619,12 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 }
                 _ => None,
             };
-            self.compute_uniforms(crop, frame.transformation(), band_subrect)
+            // T10: capacity/active per axis — see compute_uniforms.
+            let texture_scale = Vec2::new(
+                texture.texture.size().w as f32 / texture.active_size.w.max(1) as f32,
+                texture.texture.size().h as f32 / texture.active_size.h.max(1) as f32,
+            );
+            self.compute_uniforms(crop, frame.transformation(), band_subrect, texture_scale)
         });
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 

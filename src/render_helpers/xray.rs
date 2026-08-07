@@ -9,7 +9,7 @@ use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
-use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::{Color32F, Texture as _};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
@@ -274,13 +274,18 @@ impl Xray {
 }
 
 impl XrayElement {
-    fn compute_uniforms(&self) -> [Uniform<'static>; 16] {
+    fn compute_uniforms(&self, texture_scale: Vec2) -> [Uniform<'static>; 16] {
+        // T10: the retained capacity texture can be larger than the active
+        // region; render_texture_from_to normalizes v_coords by the capacity
+        // size, so map them back into the active region first (see
+        // FramebufferEffectElement::compute_uniforms).
+        let input_to_geo = self.input_to_clip_geo * Mat3::from_scale(texture_scale);
         [
             Uniform::new("niri_scale", self.scale),
             Uniform::new("geo_size", <[f32; 2]>::from(self.clip_geo_size)),
             Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
-            mat3_uniform("input_to_geo", self.input_to_clip_geo),
-            mat3_uniform("geo_to_input", self.input_to_clip_geo.inverse()),
+            mat3_uniform("input_to_geo", input_to_geo),
+            mat3_uniform("geo_to_input", input_to_geo.inverse()),
             Uniform::new("noise", self.noise),
             Uniform::new("saturation", self.saturation),
             Uniform::new("bg_color", self.bg_color.components()),
@@ -303,7 +308,14 @@ impl XrayElement {
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
-        let uniforms = self.program.is_some().then(|| self.compute_uniforms());
+        let texture_scale = Vec2::new(
+            texture.texture.size().w as f32 / texture.active_size.w.max(1) as f32,
+            texture.texture.size().h as f32 / texture.active_size.h.max(1) as f32,
+        );
+        let uniforms = self
+            .program
+            .is_some()
+            .then(|| self.compute_uniforms(texture_scale));
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(

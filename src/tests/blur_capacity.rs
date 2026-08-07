@@ -30,6 +30,13 @@ use crate::render_helpers::render_to_texture;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::utils::lifecycle_diag;
 
+crate::niri_render_elements! {
+    TestPanelElements => {
+        Backdrop = SolidColorRenderElement,
+        Panel = crate::render_helpers::framebuffer_effect::FramebufferEffectElement,
+    }
+}
+
 fn make_renderer() -> GlesRenderer {
     let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }
         .expect("creating a surfaceless EGL display");
@@ -662,4 +669,120 @@ fn reused_capacity_rewrites_active_pixels_without_leaking_old_content() {
             );
         }
     }
+}
+
+/// Regression: with capacity slack the glass SDF used to evaluate at
+/// active/capacity × geometry, leaving a transparent (unmaterialed) band
+/// around every non-64-aligned panel. The postprocess input mapping must be
+/// scaled back into the active region.
+#[test]
+fn glass_sdf_reaches_panel_edge_with_capacity_slack() {
+    use smithay::backend::renderer::element::{Element as _, RenderElement as _};
+    use smithay::backend::renderer::{Color32F as C, Frame as _};
+    use smithay::utils::Transform as Tr;
+
+    let _lock = BLUR_BUDGET_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut renderer = make_renderer();
+    let scale = smithay::utils::Scale::from(1.0);
+
+    // A red backdrop covering the whole frame.
+    let backdrop = SolidColorBuffer::new((500., 600.), C::new(1., 0., 0., 1.));
+    let backdrop = SolidColorRenderElement::from_buffer(
+        &backdrop,
+        Point::from((0., 0.)),
+        1.,
+        Kind::Unspecified,
+    );
+
+    // A glass panel at a non-64-aligned size (366x480 -> capacity 384x512)
+    // with a 12px rounded corner on every side.
+    let geometry = smithay::utils::Rectangle::new(
+        Point::from((50., 50.)),
+        Size::<f64, smithay::utils::Logical>::from((366., 480.)),
+    );
+    let radius = niri_config::CornerRadius {
+        top_left: 12.,
+        top_right: 12.,
+        bottom_right: 12.,
+        bottom_left: 12.,
+    };
+    let effect = crate::render_helpers::framebuffer_effect::FramebufferEffect::new();
+    let panel = effect.render(
+        None,
+        crate::render_helpers::background_effect::RenderParams {
+            geometry,
+            alpha: 1.,
+            subregion: None,
+            clip: Some((geometry, radius)),
+            scale: 1.0,
+            draw_clip: None,
+            capture_band: None,
+        },
+        Some(BlurOptions {
+            passes: 3,
+            offset: 4.,
+            downsample_shift: 0,
+        }),
+        0.,
+        1.,
+        crate::render_helpers::background_effect::GlassOptions {
+            tint_color: [0., 0., 1., 1.],
+            tint_amount: 1.,
+            ..Default::default()
+        },
+        BlurTrace::default(),
+    );
+
+    let size = Size::from((500, 600));
+    let elements = [
+        TestPanelElements::Backdrop(backdrop),
+        TestPanelElements::Panel(panel),
+    ];
+    let pixels = crate::render_helpers::render_to_vec(
+        &mut renderer,
+        size,
+        scale,
+        Tr::Normal,
+        Fourcc::Abgr8888,
+        elements.into_iter(),
+    )
+    .expect("rendering the panel scene");
+
+    let px = |x: usize, y: usize| {
+        let p = &pixels[(y * 500 + x) * 4..][..4];
+        (p[0], p[1], p[2])
+    };
+
+    // Panel center: tinted blue.
+    let center = px(50 + 183, 50 + 240);
+    assert!(
+        center.2 > center.0,
+        "panel center must be blue-tinted: {center:?}"
+    );
+
+    // The designed corner arc at the bottom-right is centered at
+    // (366-12, 480-12) with radius 12. At y=476 the material boundary is at
+    // x = 354 + sqrt(144 - 64) = 362.9; x=358 is well inside the material
+    // while x=364 is well inside the transparent cut. Pre-fix the SDF
+    // evaluated at active/capacity × geometry (x=341 resp. x=347), both deep
+    // inside the cut region, so x=358 showed the raw backdrop — the
+    // transparent-corner regression.
+    let corner = px(50 + 358, 50 + 476);
+    assert!(
+        corner.2 > corner.0,
+        "the glass material must reach the designed corner arc: {corner:?}"
+    );
+
+    // Inside the actual cut region: transparent, showing the raw red backdrop.
+    let cut = px(50 + 364, 50 + 476);
+    assert!(cut.0 > cut.2, "the corner cut must be transparent: {cut:?}");
+
+    // Just outside the panel: the raw red backdrop.
+    let outer = px(50 + 366 + 4, 50 + 240);
+    assert!(
+        outer.0 > outer.2,
+        "outside the panel must be the backdrop: {outer:?}"
+    );
 }
