@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use niri_config::{CornerRadius, TahoeGlass, TahoeGlassMaterial};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource as _;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 
@@ -237,6 +238,7 @@ fn render_regions_for_layer(
     }
 
     with_states(surface, |states| {
+        let surface_id = Some(surface.id().protocol_id());
         // A03.2: drain pending damage *before* the empty-regions check. A
         // surface whose committed regions became empty still owes a repaint of
         // the area its glass used to cover; early-returning here would leave
@@ -278,6 +280,7 @@ fn render_regions_for_layer(
             render_region(
                 ctx.r(),
                 ns,
+                surface_id,
                 region,
                 region_renderer,
                 material,
@@ -299,6 +302,7 @@ fn render_regions_for_layer(
 fn render_region(
     mut ctx: RenderCtx<GlesRenderer>,
     ns: Option<usize>,
+    surface_id: Option<u32>,
     region: &TahoeGlassRegion,
     renderer: &mut TahoeGlassRegionRenderer,
     material: TahoeGlassMaterial,
@@ -414,7 +418,9 @@ fn render_region(
         let xray_pos = xray_pos.offset(rect.loc - Point::from((sample_padding, sample_padding)));
         renderer
             .background_effect
-            .render(ctx.r(), ns, &plan, xray_pos, &mut |elem| push(elem.into()));
+            .render(ctx.r(), ns, surface_id, &plan, xray_pos, &mut |elem| {
+                push(elem.into())
+            });
     }
 
     // niri collects render elements front-to-back. Tahoe glass regions are

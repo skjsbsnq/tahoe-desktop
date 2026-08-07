@@ -17,7 +17,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::{GlassOptions, RenderParams};
-use crate::render_helpers::blur::{Blur, BlurOptions};
+use crate::render_helpers::blur::{Blur, BlurOptions, BlurOutput, BlurTrace};
 use crate::render_helpers::renderer::{
     texture_cache_matches, AsGlesFrame as _, ScratchFramebuffer,
 };
@@ -48,6 +48,7 @@ pub struct FramebufferEffectElement {
     /// T-32 R-3a: quantized superset band the capture blit actually read
     /// (`None` = precise element geometry, pre-T-32 behavior).
     capture_band: Option<Rectangle<i32, Physical>>,
+    blur_trace: BlurTrace,
 }
 
 #[derive(Debug)]
@@ -55,7 +56,7 @@ struct Inner {
     renderer_context_id: ContextId<GlesTexture>,
     framebuffer: Option<GlesTexture>,
     blur: Option<Blur>,
-    intermediate: Option<GlesTexture>,
+    intermediate: Option<crate::render_helpers::blur::BlurOutput>,
     /// Reusable storage for subregion-filtered damage rects.
     subregion_damage: Vec<Rectangle<i32, Physical>>,
 }
@@ -103,7 +104,7 @@ impl FramebufferEffect {
         self.commit.increment();
     }
 
-    pub fn render(
+    pub(crate) fn render(
         &self,
         ns: Option<usize>,
         params: RenderParams,
@@ -111,6 +112,7 @@ impl FramebufferEffect {
         noise: f32,
         saturation: f32,
         glass: GlassOptions,
+        blur_trace: BlurTrace,
     ) -> FramebufferEffectElement {
         let (clip_geo, corner_radius) = params
             .clip
@@ -136,6 +138,7 @@ impl FramebufferEffect {
             alpha: params.alpha,
             draw_clip: params.draw_clip,
             capture_band: params.capture_band,
+            blur_trace,
         }
     }
 }
@@ -230,7 +233,6 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         cache: &UserDataMap,
     ) -> Result<(), GlesError> {
         let _span = tracy_client::span!("FramebufferEffectElement::capture_framebuffer");
-        crate::utils::lifecycle_diag::note_fb_effect_capture();
         let location = gpu_span_location!("FramebufferEffectElement::capture_framebuffer");
         frame.with_gpu_span(location, |frame| {
             let output_rect = Rectangle::from_size(frame.output_size());
@@ -340,13 +342,15 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 inner.framebuffer.insert(texture)
             };
 
-            // Prepare blur textures.
+            // Prepare blur textures. Keep the unblurred framebuffer as a valid
+            // fallback if allocation or shader setup fails.
             let mut blur = Option::zip(inner.blur.as_mut(), self.blur_options);
             if let Some((b, options)) = &mut blur {
                 if let Err(err) = b.prepare_textures(
                     |fourcc, size| renderer.create_buffer(fourcc, size),
                     framebuffer,
                     *options,
+                    self.blur_trace,
                 ) {
                     warn!("error preparing blur textures: {err:?}");
                     blur = None;
@@ -359,11 +363,12 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             drop(guard);
 
             // Blit the framebuffer contents.
-            frame.with_context(|gl| unsafe {
+            let blit_result = frame.with_context(|gl| unsafe {
                 while gl.GetError() != ffi::NO_ERROR {}
 
                 let mut current_fbo = 0i32;
                 gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut current_fbo as *mut _);
+                let scissor_enabled = gl.IsEnabled(ffi::SCISSOR_TEST) != ffi::FALSE;
 
                 // BlitFramebuffer is affected by the scissor test, we don't want that.
                 gl.Disable(ffi::SCISSOR_TEST);
@@ -402,18 +407,29 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
 
                 // Restore state set by GlesFrame that we just modified.
                 gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
-                gl.Enable(ffi::SCISSOR_TEST);
+                if scissor_enabled {
+                    gl.Enable(ffi::SCISSOR_TEST);
+                } else {
+                    gl.Disable(ffi::SCISSOR_TEST);
+                }
 
                 if gl.GetError() != ffi::NO_ERROR {
                     Err(GlesError::BlitError)
                 } else {
                     Ok(())
                 }
-            })??;
+            });
+            if blit_result.is_err() {
+                crate::utils::lifecycle_diag::note_blur_gpu_error();
+            }
+            blit_result??;
+            crate::utils::lifecycle_diag::note_fb_effect_capture();
 
             // If blur is off, use the unblurred texture.
             if self.blur_options.is_none() {
-                inner.intermediate = Some(framebuffer.clone());
+                inner.intermediate = Some(
+                    crate::render_helpers::blur::BlurOutput::from_full_texture(framebuffer.clone()),
+                );
                 return Ok(());
             }
 
@@ -424,8 +440,14 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     Ok(blurred) => inner.intermediate = Some(blurred),
                     Err(err) => {
                         warn!("error rendering blur: {err:?}");
+                        crate::utils::lifecycle_diag::note_blur_fallback();
+                        inner.intermediate =
+                            Some(BlurOutput::from_full_texture(framebuffer.clone()));
                     }
                 }
+            } else {
+                crate::utils::lifecycle_diag::note_blur_fallback();
+                inner.intermediate = Some(BlurOutput::from_full_texture(framebuffer.clone()));
             }
 
             Ok(())
@@ -488,8 +510,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     .transformation()
                     .transform_size(q_clamped.size)
                     .to_f64();
-                let x_ratio = texture.size().w as f64 / q_native.w;
-                let y_ratio = texture.size().h as f64 / q_native.h;
+                let x_ratio = texture.active_size.w as f64 / q_native.w;
+                let y_ratio = texture.active_size.h as f64 / q_native.h;
                 Rectangle::new(
                     Point::<f64, Buffer>::from((
                         rel.loc.x as f64 * x_ratio,
@@ -501,7 +523,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     )),
                 )
             }
-            _ => Rectangle::from_size(texture.size().to_f64()),
+            _ => texture.source_rect(),
         };
 
         // Filter damage by subregion, reusing the stored Vec to avoid allocation.
@@ -593,8 +615,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(
-            texture,
-            texture_rect,
+            &texture.texture,
+            texture.map_source_rect(texture_rect),
             clamped_dst,
             damage,
             &[],
@@ -741,6 +763,7 @@ mod tests {
             0.,
             1.,
             GlassOptions::default(),
+            BlurTrace::default(),
         );
 
         assert_eq!(
@@ -810,6 +833,7 @@ mod tests {
             0.,
             1.,
             GlassOptions::default(),
+            BlurTrace::default(),
         );
 
         assert_eq!(
@@ -847,6 +871,7 @@ mod tests {
             0.,
             1.,
             GlassOptions::default(),
+            BlurTrace::default(),
         );
 
         assert_eq!(element.geometry, sample, "capture geometry stays expanded");

@@ -5,9 +5,11 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::Resource as _;
 
 use crate::handlers::background_effect::get_cached_blur_region;
 use crate::niri_render_elements;
+use crate::render_helpers::blur::BlurTrace;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::resolved_effect_plan::{
@@ -232,6 +234,7 @@ impl BackgroundEffect {
         &self,
         ctx: RenderCtx<GlesRenderer>,
         ns: Option<usize>,
+        surface_id: Option<u32>,
         plan: &ResolvedEffectPlan,
         xray_pos: XrayPos,
         push: &mut dyn FnMut(BackgroundEffectElement),
@@ -256,10 +259,14 @@ impl BackgroundEffect {
                 plan.noise,
                 plan.saturation,
                 plan.glass,
+                BlurTrace {
+                    surface_id,
+                    namespace: ns,
+                },
                 &mut |elem| push(elem.into()),
             );
         } else {
-            self.render_live(ns, plan, damage, push);
+            self.render_live(ns, surface_id, plan, damage, push);
         }
     }
 
@@ -270,6 +277,7 @@ impl BackgroundEffect {
     fn render_live(
         &self,
         ns: Option<usize>,
+        surface_id: Option<u32>,
         plan: &ResolvedEffectPlan,
         damage: ExtraDamage,
         push: &mut dyn FnMut(BackgroundEffectElement),
@@ -282,6 +290,10 @@ impl BackgroundEffect {
             plan.noise,
             plan.saturation,
             plan.glass,
+            BlurTrace {
+                surface_id,
+                namespace: ns,
+            },
         );
         push(elem.into());
     }
@@ -563,7 +575,14 @@ pub fn render_for_tile(
         };
 
         let xray_pos = xray_pos.offset(plan.params.geometry.loc - geometry.loc);
-        background_effect.render(ctx, ns, &plan, xray_pos, push);
+        background_effect.render(
+            ctx,
+            ns,
+            Some(surface.id().protocol_id()),
+            &plan,
+            xray_pos,
+            push,
+        );
     });
 }
 
@@ -608,7 +627,15 @@ mod tests {
     fn commits(effect: &BackgroundEffect) -> (CommitCounterProbe, CommitCounterProbe) {
         let fb = effect
             .nonxray
-            .render(None, live_params(), None, 0., 1., GlassOptions::default())
+            .render(
+                None,
+                live_params(),
+                None,
+                0.,
+                1.,
+                GlassOptions::default(),
+                BlurTrace::default(),
+            )
             .current_commit();
         let damage = effect
             .damage
@@ -897,7 +924,7 @@ mod tests {
 
         let damage = effect.damage.render(plan.params.geometry);
         let mut elements = Vec::new();
-        effect.render_live(None, &plan, damage, &mut |elem| elements.push(elem));
+        effect.render_live(None, None, &plan, damage, &mut |elem| elements.push(elem));
 
         assert_eq!(elements.len(), 2);
         assert!(

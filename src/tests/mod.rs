@@ -5,6 +5,7 @@ mod fixture;
 mod server;
 
 mod animations;
+mod blur_capacity;
 mod floating;
 mod foreign_toplevel;
 mod fullscreen;

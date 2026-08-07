@@ -5701,6 +5701,7 @@ impl<W: LayoutElement> Layout<W> {
                 0.018 * alpha,
                 1.12,
                 glass,
+                crate::render_helpers::blur::BlurTrace::default(),
             );
             push(BackgroundEffectElement::from(elem).into());
         }

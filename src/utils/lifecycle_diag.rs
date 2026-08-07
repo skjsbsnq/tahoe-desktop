@@ -30,6 +30,12 @@ static TAHOE_REGION_CAPTURE: AtomicU64 = AtomicU64::new(0);
 // re-blits the framebuffer, and how often a blur pyramid runs (live + xray).
 static FB_EFFECT_CAPTURE: AtomicU64 = AtomicU64::new(0);
 static BLUR_RENDER: AtomicU64 = AtomicU64::new(0);
+static BLUR_TEXTURE_ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
+static BLUR_TEXTURE_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static BLUR_TEXTURE_REUSES: AtomicU64 = AtomicU64::new(0);
+static BLUR_BUDGET_RESERVATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static BLUR_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static BLUR_GPU_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 // R17 redraw-attribution reason counters (cluster apply path only).
 static REDRAW_TARGETED_LIFECYCLE: AtomicU64 = AtomicU64::new(0);
@@ -84,6 +90,12 @@ pub fn reset() {
     TAHOE_REGION_CAPTURE.store(0, Ordering::Relaxed);
     FB_EFFECT_CAPTURE.store(0, Ordering::Relaxed);
     BLUR_RENDER.store(0, Ordering::Relaxed);
+    BLUR_TEXTURE_ALLOCATION_COUNT.store(0, Ordering::Relaxed);
+    BLUR_TEXTURE_ALLOCATIONS.store(0, Ordering::Relaxed);
+    BLUR_TEXTURE_REUSES.store(0, Ordering::Relaxed);
+    BLUR_BUDGET_RESERVATION_FAILURES.store(0, Ordering::Relaxed);
+    BLUR_FALLBACKS.store(0, Ordering::Relaxed);
+    BLUR_GPU_ERRORS.store(0, Ordering::Relaxed);
     REDRAW_TARGETED_LIFECYCLE.store(0, Ordering::Relaxed);
     REDRAW_TARGETED_ACTIVATE.store(0, Ordering::Relaxed);
     REDRAW_TARGETED_MAXIMIZE.store(0, Ordering::Relaxed);
@@ -160,6 +172,40 @@ pub fn note_blur_render() {
         return;
     }
     BLUR_RENDER.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a blur pyramid texture allocation in bytes. This remains a counter
+/// only; detailed attribution is opt-in through `NIRI_BLUR_TRACE`.
+pub fn note_blur_texture_allocation(bytes: u64) {
+    if !is_enabled() {
+        return;
+    }
+    BLUR_TEXTURE_ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    BLUR_TEXTURE_ALLOCATIONS.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub fn note_blur_texture_reuse() {
+    if is_enabled() {
+        BLUR_TEXTURE_REUSES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_blur_budget_reservation_failure() {
+    if is_enabled() {
+        BLUR_BUDGET_RESERVATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_blur_fallback() {
+    if is_enabled() {
+        BLUR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn note_blur_gpu_error() {
+    if is_enabled() {
+        BLUR_GPU_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Targeted lifecycle redraw apply (one apply may queue one or more outputs).
@@ -249,6 +295,12 @@ pub struct Snapshot {
     pub tahoe_region_capture: u64,
     pub fb_effect_capture: u64,
     pub blur_render: u64,
+    pub blur_texture_allocations: u64,
+    pub blur_texture_allocated_bytes: u64,
+    pub blur_texture_reuses: u64,
+    pub blur_budget_reservation_failures: u64,
+    pub blur_fallbacks: u64,
+    pub blur_gpu_errors: u64,
     pub redraw_targeted_lifecycle: u64,
     pub redraw_targeted_activate: u64,
     pub redraw_targeted_maximize: u64,
@@ -274,6 +326,12 @@ pub fn snapshot() -> Snapshot {
         tahoe_region_capture: TAHOE_REGION_CAPTURE.load(Ordering::Relaxed),
         fb_effect_capture: FB_EFFECT_CAPTURE.load(Ordering::Relaxed),
         blur_render: BLUR_RENDER.load(Ordering::Relaxed),
+        blur_texture_allocations: BLUR_TEXTURE_ALLOCATION_COUNT.load(Ordering::Relaxed),
+        blur_texture_allocated_bytes: BLUR_TEXTURE_ALLOCATIONS.load(Ordering::Relaxed),
+        blur_texture_reuses: BLUR_TEXTURE_REUSES.load(Ordering::Relaxed),
+        blur_budget_reservation_failures: BLUR_BUDGET_RESERVATION_FAILURES.load(Ordering::Relaxed),
+        blur_fallbacks: BLUR_FALLBACKS.load(Ordering::Relaxed),
+        blur_gpu_errors: BLUR_GPU_ERRORS.load(Ordering::Relaxed),
         redraw_targeted_lifecycle: REDRAW_TARGETED_LIFECYCLE.load(Ordering::Relaxed),
         redraw_targeted_activate: REDRAW_TARGETED_ACTIVATE.load(Ordering::Relaxed),
         redraw_targeted_maximize: REDRAW_TARGETED_MAXIMIZE.load(Ordering::Relaxed),
@@ -334,7 +392,8 @@ pub fn maybe_log_periodic() {
     if let Some(prev) = *guard {
         info!(
             "lifecycle-diag 5s delta: redraw_all +{} redraw +{} tahoe_capture +{} \
-             fb_capture +{} blur +{}",
+             fb_capture +{} blur +{} blur_alloc +{} ({} bytes) blur_reuse +{} \
+             blur_budget_fail +{} blur_fallback +{} blur_gpu_error +{}",
             current
                 .queue_redraw_all
                 .saturating_sub(prev.queue_redraw_all),
@@ -346,6 +405,20 @@ pub fn maybe_log_periodic() {
                 .fb_effect_capture
                 .saturating_sub(prev.fb_effect_capture),
             current.blur_render.saturating_sub(prev.blur_render),
+            current
+                .blur_texture_allocations
+                .saturating_sub(prev.blur_texture_allocations),
+            current
+                .blur_texture_allocated_bytes
+                .saturating_sub(prev.blur_texture_allocated_bytes),
+            current
+                .blur_texture_reuses
+                .saturating_sub(prev.blur_texture_reuses),
+            current
+                .blur_budget_reservation_failures
+                .saturating_sub(prev.blur_budget_reservation_failures),
+            current.blur_fallbacks.saturating_sub(prev.blur_fallbacks),
+            current.blur_gpu_errors.saturating_sub(prev.blur_gpu_errors),
         );
     }
     *guard = Some(current);
@@ -391,6 +464,12 @@ mod tests {
             note_tahoe_region_request();
             note_tahoe_region_commit();
             note_tahoe_region_capture();
+            note_blur_render();
+            note_blur_texture_allocation(4096);
+            note_blur_texture_reuse();
+            note_blur_budget_reservation_failure();
+            note_blur_fallback();
+            note_blur_gpu_error();
             note_redraw_skip_unmapped();
 
             let s = snapshot();
@@ -402,6 +481,13 @@ mod tests {
             assert_eq!(s.tahoe_region_request, 1);
             assert_eq!(s.tahoe_region_commit, 1);
             assert_eq!(s.tahoe_region_capture, 1);
+            assert_eq!(s.blur_render, 1);
+            assert_eq!(s.blur_texture_allocations, 1);
+            assert_eq!(s.blur_texture_allocated_bytes, 4096);
+            assert_eq!(s.blur_texture_reuses, 1);
+            assert_eq!(s.blur_budget_reservation_failures, 1);
+            assert_eq!(s.blur_fallbacks, 1);
+            assert_eq!(s.blur_gpu_errors, 1);
             assert_eq!(s.redraw_skip_unmapped, 1);
         });
     }

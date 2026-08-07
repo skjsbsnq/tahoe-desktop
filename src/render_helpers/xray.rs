@@ -6,7 +6,7 @@ use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
 use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
+    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::Color32F;
@@ -15,6 +15,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::{GlassOptions, RenderParams};
+use crate::render_helpers::blur::BlurTrace;
 use crate::render_helpers::effect_buffer::EffectBuffer;
 use crate::render_helpers::renderer::AsGlesFrame as _;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
@@ -102,7 +103,7 @@ impl Xray {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    pub(crate) fn render(
         &self,
         ctx: RenderCtx<GlesRenderer>,
         params: RenderParams,
@@ -111,6 +112,7 @@ impl Xray {
         noise: f32,
         saturation: f32,
         glass: GlassOptions,
+        trace: BlurTrace,
         push: &mut dyn FnMut(XrayElement),
     ) {
         let program = Shaders::get(ctx.renderer).postprocess_and_clip.clone();
@@ -135,7 +137,7 @@ impl Xray {
 
         let mut background = self.background[ctx.target as usize].borrow_mut();
         let prev = background.commit();
-        if background.prepare(ctx.renderer, blur) {
+        if background.prepare(ctx.renderer, blur, trace) {
             if background.commit() != prev {
                 trace!("background damaged");
             }
@@ -224,7 +226,7 @@ impl Xray {
         }
 
         let prev = backdrop.commit();
-        if backdrop.prepare(ctx.renderer, blur) {
+        if backdrop.prepare(ctx.renderer, blur, trace) {
             if backdrop.commit() != prev {
                 trace!("backdrop damaged");
             }
@@ -296,7 +298,7 @@ impl XrayElement {
     fn draw_texture(
         &self,
         frame: &mut GlesFrame<'_, '_>,
-        texture: &GlesTexture,
+        texture: &crate::render_helpers::blur::BlurOutput,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
@@ -305,8 +307,8 @@ impl XrayElement {
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(
-            texture,
-            src,
+            &texture.texture,
+            texture.map_source_rect(src),
             dst,
             damage,
             // FIXME: opaque regions need to be filtered like damage.

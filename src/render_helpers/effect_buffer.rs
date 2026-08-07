@@ -12,7 +12,7 @@ use smithay::backend::renderer::{
 use smithay::utils::{Buffer, Logical, Physical, Scale, Size, Transform};
 
 use crate::niri::OutputRenderElements;
-use crate::render_helpers::blur::{Blur, BlurOptions};
+use crate::render_helpers::blur::{Blur, BlurOptions, BlurOutput, BlurTrace};
 
 #[derive(Debug)]
 pub struct EffectBuffer {
@@ -63,7 +63,7 @@ struct Offscreen {
     /// Rendered blurred version of the texture.
     ///
     /// When texture needs to be reblurred, this field must be reset to `None`.
-    blurred: Option<GlesTexture>,
+    blurred: Option<BlurOutput>,
 }
 
 impl Default for Elements {
@@ -139,16 +139,20 @@ impl EffectBuffer {
         elements
     }
 
-    pub fn prepare(&mut self, renderer: &mut GlesRenderer, blur: bool) -> bool {
+    pub(crate) fn prepare(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        blur: bool,
+        trace: BlurTrace,
+    ) -> bool {
         if let Err(err) = self.prepare_offscreen(renderer) {
             warn!("error preparing offscreen: {err:?}");
             return false;
         };
 
         if blur {
-            if let Err(err) = self.prepare_blur(renderer) {
+            if let Err(err) = self.prepare_blur(renderer, trace) {
                 warn!("error preparing blur: {err:?}");
-                return false;
             }
         }
 
@@ -245,6 +249,7 @@ impl EffectBuffer {
                 .render_output(renderer, &mut target, 1, &elements, Color32F::TRANSPARENT)
                 .context("error rendering")?
         };
+        crate::utils::lifecycle_diag::note_fb_effect_capture();
 
         offscreen.states = res.states;
 
@@ -262,7 +267,11 @@ impl EffectBuffer {
         Ok(())
     }
 
-    fn prepare_blur(&mut self, renderer: &mut GlesRenderer) -> anyhow::Result<()> {
+    fn prepare_blur(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        trace: BlurTrace,
+    ) -> anyhow::Result<()> {
         let offscreen = self.offscreen.as_mut().context("missing offscreen")?;
         if offscreen.blurred.is_some() {
             // Already rendered.
@@ -295,29 +304,46 @@ impl EffectBuffer {
             |fourcc, size| renderer.create_buffer(fourcc, size),
             &offscreen.texture,
             self.blur_options,
+            trace,
         )
         .context("error preparing blur textures")?;
 
         Ok(())
     }
 
-    pub fn render(&mut self, frame: &mut GlesFrame, blur: bool) -> anyhow::Result<GlesTexture> {
+    pub(crate) fn render(
+        &mut self,
+        frame: &mut GlesFrame,
+        blur: bool,
+    ) -> anyhow::Result<BlurOutput> {
         let offscreen = self.offscreen.as_mut().context("offscreen is missing")?;
 
         if !blur {
-            return Ok(offscreen.texture.clone());
+            return Ok(BlurOutput::from_full_texture(offscreen.texture.clone()));
         }
 
         let texture = if let Some(texture) = &offscreen.blurred {
             texture.clone()
-        } else {
-            let blur = self.blur.as_mut().context("blur is missing")?;
+        } else if let Some(blur) = self.blur.as_mut() {
+            let source = offscreen.texture.clone();
             let mut guard = frame.renderer();
             let renderer = guard.as_mut();
-            let blurred = blur
-                .render(renderer, &offscreen.texture, self.blur_options)
-                .context("error rendering blur")?;
+            let blurred = match blur.render(renderer, &source, self.blur_options) {
+                Ok(blurred) => blurred,
+                Err(err) => {
+                    warn!("error rendering effect-buffer blur: {err:?}");
+                    crate::utils::lifecycle_diag::note_blur_fallback();
+                    // Do not cache the fallback: a transient failure must be
+                    // retried on the next frame (same as FramebufferEffect).
+                    return Ok(BlurOutput::from_full_texture(source));
+                }
+            };
             offscreen.blurred.insert(blurred).clone()
+        } else {
+            crate::utils::lifecycle_diag::note_blur_fallback();
+            // Missing blur program: fall back unblurred without caching so a
+            // later recreate (shader reload / renderer reset) is picked up.
+            return Ok(BlurOutput::from_full_texture(offscreen.texture.clone()));
         };
 
         Ok(texture)
