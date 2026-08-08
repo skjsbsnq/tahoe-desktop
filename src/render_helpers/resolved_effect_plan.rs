@@ -226,6 +226,10 @@ impl ResolvedEffectPlan {
         geometry_animating: bool,
         fast_motion: bool,
     ) -> Option<Self> {
+        if params.alpha <= 0. {
+            return None;
+        }
+
         let options = Self::resolve_options(blur_config, effect, has_blur_region);
         if !options.is_visible() {
             return None;
@@ -483,6 +487,88 @@ mod tests {
             false,
         );
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn plan_none_when_alpha_is_zero_and_restores_when_visible() {
+        let mut effect = BackgroundEffect::default();
+        effect.blur = Some(true);
+        effect.xray = Some(false);
+        effect.tint_amount = Some(0.25);
+
+        let geo = Rectangle::new(Point::from((0., 0.)), Size::from((100., 60.)));
+        let mut params = base_params(geo, true);
+        params.alpha = 0.0;
+
+        assert!(
+            ResolvedEffectPlan::build(
+                Blur::default(),
+                effect,
+                true,
+                CornerRadius::default(),
+                params.clone(),
+                false,
+                false,
+            )
+            .is_none(),
+            "zero-alpha glass must not build a capture/blur plan"
+        );
+
+        params.alpha = 1.0;
+        assert!(
+            ResolvedEffectPlan::build(
+                Blur::default(),
+                effect,
+                true,
+                CornerRadius::default(),
+                params,
+                false,
+                false,
+            )
+            .is_some(),
+            "restoring alpha must make the first visible frame renderable"
+        );
+    }
+
+    #[test]
+    fn alpha_gate_preserves_live_and_xray_routing_after_restore() {
+        let geo = Rectangle::new(Point::from((0., 0.)), Size::from((100., 60.)));
+
+        for xray in [false, true] {
+            let mut effect = BackgroundEffect::default();
+            effect.blur = Some(true);
+            effect.xray = Some(xray);
+            effect.tint_amount = Some(0.25);
+
+            let mut params = base_params(geo, true);
+            params.alpha = 0.0;
+            assert!(
+                ResolvedEffectPlan::build(
+                    Blur::default(),
+                    effect,
+                    true,
+                    CornerRadius::default(),
+                    params.clone(),
+                    false,
+                    false,
+                )
+                .is_none(),
+                "alpha zero must be a no-op for xray={xray}"
+            );
+
+            params.alpha = 1.0;
+            let plan = ResolvedEffectPlan::build(
+                Blur::default(),
+                effect,
+                true,
+                CornerRadius::default(),
+                params,
+                false,
+                false,
+            )
+            .expect("restored alpha must resolve a visible plan");
+            assert_eq!(plan.xray, xray);
+        }
     }
 
     #[test]

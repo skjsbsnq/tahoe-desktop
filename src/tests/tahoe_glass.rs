@@ -8,10 +8,13 @@
 //! Task 19 extends coverage to abnormal client disconnect and output
 //! redraw/damage queueing when committed glass is cleared.
 
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::Color32F;
 use smithay::desktop::layer_map_for_output;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
-use smithay::utils::IsAlive;
+use smithay::utils::{IsAlive, Scale, Size, Transform};
 use smithay::wayland::compositor::with_states;
 use wayland_client::protocol::wl_surface::WlSurface;
 
@@ -27,6 +30,13 @@ use crate::protocols::tahoe_glass::{
 use crate::render_helpers::shaders::Shaders;
 use crate::tests::client::LayerConfigureProps;
 use crate::utils::lifecycle_diag;
+
+crate::niri_render_elements! {
+    TahoeGlassSceneElement => {
+        Backdrop = crate::render_helpers::solid_color::SolidColorRenderElement,
+        Glass = crate::render_helpers::tahoe_glass::TahoeGlassElement,
+    }
+}
 
 #[test]
 fn postprocess_shader_compiles_and_invalid_source_is_rejected() {
@@ -116,6 +126,16 @@ fn count_outputs_queued(niri: &crate::niri::Niri) -> (usize, usize) {
         })
         .count();
     (queued, total)
+}
+
+fn is_output_queued(niri: &crate::niri::Niri, output: &smithay::output::Output) -> bool {
+    use crate::niri::RedrawState;
+    matches!(
+        niri.output_state
+            .get(output)
+            .map(|state| &state.redraw_state),
+        Some(RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_))
+    )
 }
 
 fn glass_events(
@@ -815,6 +835,45 @@ fn set_and_commit_region(
     glass: &TahoeGlassSurfaceV1,
     region_id: u32,
 ) {
+    set_and_commit_region_with_alpha(f, id, client_surface, glass, region_id, 1.0);
+}
+
+fn set_and_commit_region_with_alpha(
+    f: &mut Fixture,
+    id: client::ClientId,
+    client_surface: &WlSurface,
+    glass: &TahoeGlassSurfaceV1,
+    region_id: u32,
+    material_alpha: f64,
+) {
+    glass.set_region(
+        region_id,
+        8,
+        4,
+        128,
+        32,
+        8,
+        8,
+        8,
+        8,
+        String::from("panel"),
+        7,
+        0.0.into(),
+        material_alpha.into(),
+    );
+    f.client(id).connection.flush().unwrap();
+    f.roundtrip(id);
+    f.client(id).layer(client_surface).commit();
+    f.double_roundtrip(id);
+}
+
+fn set_and_commit_region_before_redraw(
+    f: &mut Fixture,
+    id: client::ClientId,
+    client_surface: &WlSurface,
+    glass: &TahoeGlassSurfaceV1,
+    region_id: u32,
+) {
     glass.set_region(
         region_id,
         8,
@@ -833,7 +892,241 @@ fn set_and_commit_region(
     f.client(id).connection.flush().unwrap();
     f.roundtrip(id);
     f.client(id).layer(client_surface).commit();
-    f.double_roundtrip(id);
+    f.roundtrip_protocol_only(id);
+}
+
+fn render_tahoe_scene(
+    f: &mut Fixture,
+    server_surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    config: &niri_config::TahoeGlass,
+    backdrop_color: Color32F,
+) -> (Vec<u8>, usize, Option<bool>) {
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+    use crate::render_helpers::tahoe_glass::{render_for_layer, TahoeGlassElement};
+    use crate::render_helpers::xray::XrayPos;
+    use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
+
+    f.niri_state()
+        .backend
+        .with_primary_renderer(|renderer| {
+            let mut glass = Vec::new();
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            assert!(render_for_layer(
+                ctx,
+                None,
+                server_surface,
+                "tahoe-glass-test",
+                (0., 0.).into(),
+                1.0,
+                config,
+                1.0,
+                None,
+                XrayPos::default(),
+                false,
+                &mut |element| glass.push(element),
+            ));
+
+            let material_index = glass
+                .iter()
+                .position(|element| matches!(element, TahoeGlassElement::BackgroundEffect(_)));
+            let shadow_index = glass
+                .iter()
+                .position(|element| matches!(element, TahoeGlassElement::Shadow(_)));
+            let order = material_index
+                .zip(shadow_index)
+                .map(|(material, shadow)| material < shadow);
+            let glass_count = glass.len();
+
+            let backdrop_buffer = SolidColorBuffer::new((256., 256.), backdrop_color);
+            let backdrop = SolidColorRenderElement::from_buffer(
+                &backdrop_buffer,
+                (0., 0.),
+                1.,
+                Kind::Unspecified,
+            );
+            let mut scene = vec![TahoeGlassSceneElement::Backdrop(backdrop)];
+            scene.extend(glass.into_iter().map(TahoeGlassSceneElement::Glass));
+            let pixels = render_to_vec(
+                renderer,
+                Size::from((256, 256)),
+                Scale::from(1.),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                scene.into_iter(),
+            )
+            .expect("rendering production Tahoe glass elements");
+
+            (pixels, glass_count, order)
+        })
+        .expect("primary renderer")
+}
+
+/// A zero-alpha region must stop before plan/capture accounting, while the
+/// first restored frame must go through the normal Tahoe render path again.
+#[test]
+fn zero_alpha_skips_capture_and_restore_renders_first_visible_frame() {
+    use crate::render_helpers::tahoe_glass::render_for_layer;
+    use crate::render_helpers::xray::XrayPos;
+    use crate::render_helpers::{RenderCtx, RenderTarget};
+
+    let mut f = Fixture::new();
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let client_surface = create_mapped_layer(&mut f, id);
+    let glass_manager = f.client(id).tahoe_glass_manager();
+    let qh = f.client(id).qh.clone();
+    let glass = glass_manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    let server_surface = server_surface_for_client_layer(&mut f, &client_surface);
+    let config = niri_config::TahoeGlass::default();
+
+    set_and_commit_region_with_alpha(&mut f, id, &client_surface, &glass, 1, 0.0);
+    let mut zero_alpha_elements = Vec::new();
+    lifecycle_diag::with_enabled_for_test(|| {
+        f.niri_state()
+            .backend
+            .with_primary_renderer(|renderer| {
+                let ctx = RenderCtx {
+                    renderer,
+                    target: RenderTarget::Output,
+                    xray: None,
+                };
+                let rendered = render_for_layer(
+                    ctx,
+                    None,
+                    &server_surface,
+                    "tahoe-glass-test",
+                    (0., 0.).into(),
+                    1.0,
+                    &config,
+                    1.0,
+                    None,
+                    XrayPos::default(),
+                    false,
+                    &mut |element| zero_alpha_elements.push(element),
+                );
+                assert!(
+                    rendered,
+                    "the committed region is present even though its alpha is zero"
+                );
+            })
+            .unwrap();
+
+        let zero = lifecycle_diag::snapshot();
+        assert!(zero_alpha_elements.is_empty());
+        assert_eq!(zero.tahoe_region_capture, 0);
+        assert_eq!(zero.fb_effect_capture, 0);
+        assert_eq!(zero.blur_render, 0);
+    });
+
+    let ((hidden_pixels, hidden_count, hidden_order), hidden_diag) =
+        lifecycle_diag::with_enabled_for_test(|| {
+            let rendered = render_tahoe_scene(
+                &mut f,
+                &server_surface,
+                &config,
+                Color32F::new(0.9, 0.9, 0.9, 1.),
+            );
+            (rendered, lifecycle_diag::snapshot())
+        });
+    assert_eq!(hidden_count, 0);
+    assert_eq!(hidden_order, None);
+    assert_eq!(hidden_diag.tahoe_region_capture, 0);
+    assert_eq!(hidden_diag.fb_effect_capture, 0);
+    assert_eq!(hidden_diag.blur_render, 0);
+
+    let ((hidden_dark_pixels, hidden_dark_count, hidden_dark_order), hidden_dark_diag) =
+        lifecycle_diag::with_enabled_for_test(|| {
+            let rendered = render_tahoe_scene(
+                &mut f,
+                &server_surface,
+                &config,
+                Color32F::new(0.1, 0.1, 0.1, 1.),
+            );
+            (rendered, lifecycle_diag::snapshot())
+        });
+    assert_eq!(hidden_dark_count, 0);
+    assert_eq!(hidden_dark_order, None);
+    assert_eq!(hidden_dark_diag.tahoe_region_capture, 0);
+    assert_eq!(hidden_dark_diag.fb_effect_capture, 0);
+    assert_eq!(hidden_dark_diag.blur_render, 0);
+
+    let hidden_center = |pixels: &[u8]| {
+        let offset = (20 * 256 + 72) * 4;
+        pixels[offset..offset + 4].to_owned()
+    };
+    assert_ne!(
+        hidden_center(&hidden_pixels),
+        hidden_center(&hidden_dark_pixels),
+        "the backdrop must change while the glass is transparent"
+    );
+
+    set_and_commit_region_with_alpha(&mut f, id, &client_surface, &glass, 1, 1.0);
+    let ((_bright_pixels, bright_count, bright_order), bright_diag) =
+        lifecycle_diag::with_enabled_for_test(|| {
+            let rendered = render_tahoe_scene(
+                &mut f,
+                &server_surface,
+                &config,
+                Color32F::new(0.9, 0.9, 0.9, 1.),
+            );
+            (rendered, lifecycle_diag::snapshot())
+        });
+    let ((dark_pixels, dark_count, dark_order), dark_diag) =
+        lifecycle_diag::with_enabled_for_test(|| {
+            let rendered = render_tahoe_scene(
+                &mut f,
+                &server_surface,
+                &config,
+                Color32F::new(0.1, 0.1, 0.1, 1.),
+            );
+            (rendered, lifecycle_diag::snapshot())
+        });
+
+    let sample = |pixels: &[u8], x: usize, y: usize| {
+        let offset = (y * 256 + x) * 4;
+        pixels[offset..offset + 4].to_owned()
+    };
+    assert_eq!(sample(&_bright_pixels, 0, 0), [225, 225, 225, 255]);
+    assert_eq!(sample(&_bright_pixels, 72, 20), [244, 244, 244, 255]);
+    assert_eq!(sample(&_bright_pixels, 72, 4), [247, 247, 247, 255]);
+    assert_eq!(sample(&_bright_pixels, 72, 0), [214, 214, 214, 255]);
+    assert_eq!(sample(&dark_pixels, 0, 0), [25, 25, 25, 255]);
+    assert_eq!(sample(&dark_pixels, 72, 20), [43, 43, 43, 255]);
+    assert_eq!(sample(&dark_pixels, 72, 4), [50, 50, 50, 255]);
+    assert_eq!(sample(&dark_pixels, 72, 0), [23, 23, 23, 255]);
+
+    assert!(bright_diag.tahoe_region_capture >= 1);
+    assert!(bright_diag.fb_effect_capture >= 1);
+    assert!(bright_diag.blur_render >= 1);
+    assert!(dark_diag.tahoe_region_capture >= 1);
+    assert!(dark_diag.fb_effect_capture >= 1);
+    assert!(dark_diag.blur_render >= 1);
+    assert!(
+        bright_count >= 2,
+        "restored frame must include material and shadow"
+    );
+    assert!(
+        dark_count >= 2,
+        "restored frame must include material and shadow"
+    );
+    assert_eq!(bright_order, Some(true));
+    assert_eq!(dark_order, Some(true));
+
+    assert_ne!(
+        hidden_center(&hidden_dark_pixels),
+        hidden_center(&dark_pixels),
+        "the restored first frame must render the changed backdrop through glass"
+    );
+
+    assert!(
+        bright_order == Some(true) && dark_order == Some(true),
+        "glass material must be emitted before its shadow so the shadow cannot cover it"
+    );
 }
 
 /// Abnormal client disconnect: controller is destroyed with the client.
@@ -905,12 +1198,15 @@ fn destroy_controller_queues_redraw_only_on_root_output() {
 
     let server_surface = server_surface_for_client_layer(&mut f, &client_surface);
     assert_eq!(committed_count(&server_surface), 1);
+    let root_output = f.niri_output(1);
+    let other_output = f.niri_output(2);
 
+    force_idle_redraw_states(f.niri());
     let _counter_guard = test_redraw_counter_lock();
     test_reset_redraw_counters();
     glass.destroy();
     f.client(id).connection.flush().unwrap();
-    f.roundtrip(id);
+    f.roundtrip_protocol_only(id);
 
     assert_eq!(committed_count(&server_surface), 0);
     assert!(
@@ -921,6 +1217,14 @@ fn destroy_controller_queues_redraw_only_on_root_output() {
         test_fallback_redraw_all_count(),
         0,
         "mapped root must not fall back to queue_redraw_all"
+    );
+    assert!(
+        is_output_queued(f.niri(), &root_output),
+        "glass destroy must queue the root output"
+    );
+    assert!(
+        !is_output_queued(f.niri(), &other_output),
+        "glass destroy must leave the other output idle"
     );
     // set_and_commit_region uses rect (8,4)-(128,32).
     assert!(
@@ -948,6 +1252,8 @@ fn commit_queues_redraw_via_unified_handler_on_root_output() {
     let glass_manager = f.client(id).tahoe_glass_manager();
     let qh = f.client(id).qh.clone();
     let glass = glass_manager.get_tahoe_glass_surface(&client_surface, &qh, ());
+    let root_output = f.niri_output(1);
+    let other_output = f.niri_output(2);
 
     // Hold the counter lock for the full reset→commit→assert window so other
     // counter-based tests cannot interleave a reset. Concurrent glass tests may
@@ -955,7 +1261,8 @@ fn commit_queues_redraw_via_unified_handler_on_root_output() {
     // fired ( >= 1 ) and that this commit did not take the unlocatable fallback.
     let _counter_guard = test_redraw_counter_lock();
     test_reset_redraw_counters();
-    set_and_commit_region(&mut f, id, &client_surface, &glass, 1);
+    force_idle_redraw_states(f.niri());
+    set_and_commit_region_before_redraw(&mut f, id, &client_surface, &glass, 1);
 
     let server_surface = server_surface_for_client_layer(&mut f, &client_surface);
     assert_eq!(committed_count(&server_surface), 1);
@@ -971,6 +1278,14 @@ fn commit_queues_redraw_via_unified_handler_on_root_output() {
     assert_eq!(
         fallback, 0,
         "mapped root commit must not fall back to queue_redraw_all (targeted={targeted})"
+    );
+    assert!(
+        is_output_queued(f.niri(), &root_output),
+        "glass commit must queue the root output"
+    );
+    assert!(
+        !is_output_queued(f.niri(), &other_output),
+        "glass commit must leave the other output idle"
     );
 }
 
@@ -1047,6 +1362,10 @@ fn unmapped_destroyed_root_skips_redraw_without_queueing_all() {
         queued, 0,
         "skip disposition must leave every output unqueued"
     );
+    let root_output = f.niri_output(1);
+    let other_output = f.niri_output(2);
+    assert!(!is_output_queued(f.niri(), &root_output));
+    assert!(!is_output_queued(f.niri(), &other_output));
 
     // Controller Destroy must still clear glass without panicking.
     test_reset_redraw_counters();
@@ -1091,12 +1410,15 @@ fn subsurface_glass_commit_attributes_to_root_output() {
     glass.set_transform(10.0.into(), 5.0.into(), 0.8.into(), 0.8.into());
     f.client(id).connection.flush().unwrap();
     f.roundtrip(id);
+    let root_output = f.niri_output(1);
+    let other_output = f.niri_output(2);
 
     let _counter_guard = test_redraw_counter_lock();
     test_reset_redraw_counters();
+    force_idle_redraw_states(f.niri());
     child.commit();
     f.client(id).connection.flush().unwrap();
-    f.double_roundtrip(id);
+    f.roundtrip_protocol_only(id);
 
     let targeted = test_targeted_redraw_count();
     let fallback = test_fallback_redraw_all_count();
@@ -1107,6 +1429,14 @@ fn subsurface_glass_commit_attributes_to_root_output() {
     assert_eq!(
         fallback, 0,
         "subsurface glass commit must not degrade to queue_redraw_all (targeted={targeted})"
+    );
+    assert!(
+        is_output_queued(f.niri(), &root_output),
+        "subsurface glass commit must queue the root output"
+    );
+    assert!(
+        !is_output_queued(f.niri(), &other_output),
+        "subsurface glass commit must leave the other output idle"
     );
 
     glass.destroy();

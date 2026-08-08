@@ -26,14 +26,15 @@ use smithay::utils::{Point, Scale, Size, Transform};
 /// the process-global byte-budget accounting never interleaves.
 use crate::render_helpers::blur::BLUR_BUDGET_TEST_LOCK as BLUR_BUDGET_LOCK;
 use crate::render_helpers::blur::{retained_blur_texture_bytes, Blur, BlurOptions, BlurTrace};
-use crate::render_helpers::render_to_texture;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::{render_to_texture, render_to_vec};
 use crate::utils::lifecycle_diag;
 
 crate::niri_render_elements! {
     TestPanelElements => {
         Backdrop = SolidColorRenderElement,
         Panel = crate::render_helpers::framebuffer_effect::FramebufferEffectElement,
+        Shadow = crate::render_helpers::shadow::ShadowRenderElement,
     }
 }
 
@@ -677,8 +678,7 @@ fn reused_capacity_rewrites_active_pixels_without_leaking_old_content() {
 /// scaled back into the active region.
 #[test]
 fn glass_sdf_reaches_panel_edge_with_capacity_slack() {
-    use smithay::backend::renderer::element::{Element as _, RenderElement as _};
-    use smithay::backend::renderer::{Color32F as C, Frame as _};
+    use smithay::backend::renderer::Color32F as C;
     use smithay::utils::Transform as Tr;
 
     let _lock = BLUR_BUDGET_LOCK
@@ -785,4 +785,106 @@ fn glass_sdf_reaches_panel_edge_with_capacity_slack() {
         outer.0 > outer.2,
         "outside the panel must be the backdrop: {outer:?}"
     );
+}
+
+#[test]
+fn glass_shadow_edge_pixels_are_stable_on_bright_and_dark_backdrops() {
+    let _lock = BLUR_BUDGET_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut renderer = make_renderer();
+    crate::render_helpers::resources::init(&mut renderer);
+    let frame_size = Size::from((256, 256));
+    let scale = Scale::from(1.0);
+    let geometry = smithay::utils::Rectangle::new(
+        Point::from((64., 64.)),
+        Size::<f64, smithay::utils::Logical>::from((128., 96.)),
+    );
+    let radius = niri_config::CornerRadius {
+        top_left: 12.,
+        top_right: 12.,
+        bottom_right: 12.,
+        bottom_left: 12.,
+    };
+
+    let render_scene = |renderer: &mut GlesRenderer, backdrop_color: Color32F| {
+        let backdrop_buffer = SolidColorBuffer::new((256., 256.), backdrop_color);
+        let backdrop = SolidColorRenderElement::from_buffer(
+            &backdrop_buffer,
+            Point::from((0., 0.)),
+            1.,
+            Kind::Unspecified,
+        );
+
+        let effect = crate::render_helpers::framebuffer_effect::FramebufferEffect::new();
+        let panel = effect.render(
+            None,
+            crate::render_helpers::background_effect::RenderParams {
+                geometry,
+                alpha: 1.,
+                subregion: None,
+                clip: Some((geometry, radius)),
+                scale: 1.,
+                draw_clip: None,
+                capture_band: None,
+            },
+            None,
+            0.,
+            1.,
+            crate::render_helpers::background_effect::GlassOptions {
+                tint_color: [0.8, 0.9, 1., 1.],
+                tint_amount: 0.2,
+                ..Default::default()
+            },
+            BlurTrace::default(),
+        );
+
+        let material = niri_config::TahoeGlass::default().material("panel");
+        let mut shadow = crate::layout::shadow::Shadow::new(material.shadow);
+        shadow.update_render_elements(geometry.size, true, radius, 1., 1.);
+        let mut shadows = Vec::new();
+        shadow.render(renderer, geometry.loc, &mut |element| shadows.push(element));
+        assert!(
+            !shadows.is_empty(),
+            "the configured panel shadow must render"
+        );
+
+        let mut elements = vec![TestPanelElements::Backdrop(backdrop)];
+        elements.push(TestPanelElements::Panel(panel));
+        elements.extend(shadows.into_iter().map(TestPanelElements::Shadow));
+
+        render_to_vec(
+            renderer,
+            frame_size,
+            scale,
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements.into_iter(),
+        )
+        .expect("rendering the glass/shadow scene")
+    };
+
+    let bright = render_scene(&mut renderer, Color32F::new(0.9, 0.9, 0.9, 1.));
+    let dark = render_scene(&mut renderer, Color32F::new(0.1, 0.1, 0.1, 1.));
+    let px = |pixels: &[u8], x: usize, y: usize| {
+        let p = &pixels[(y * 256 + x) * 4..][..4];
+        (p[0], p[1], p[2], p[3])
+    };
+
+    assert_eq!(px(&bright, 32, 32), (229, 229, 229, 255));
+    assert_eq!(px(&dark, 32, 32), (25, 25, 25, 255));
+    assert_eq!(px(&bright, 128, 112), (224, 229, 234, 255));
+    assert_eq!(px(&dark, 128, 112), (61, 66, 71, 255));
+    assert_eq!(
+        px(&bright, 128, 64),
+        px(&bright, 128, 112),
+        "bright panel inner edge must not gain a self-shadow"
+    );
+    assert_eq!(
+        px(&dark, 128, 64),
+        px(&dark, 128, 112),
+        "dark panel inner edge must not gain a self-shadow"
+    );
+    assert_eq!(px(&bright, 128, 58), (216, 216, 216, 255));
+    assert_eq!(px(&dark, 128, 58), (24, 24, 24, 255));
 }

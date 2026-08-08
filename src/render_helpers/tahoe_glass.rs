@@ -315,46 +315,27 @@ fn render_region(
     push: &mut dyn FnMut(TahoeGlassElement),
 ) {
     let _span = tracy_client::span!("TahoeGlass::render_region");
-    crate::utils::lifecycle_diag::note_tahoe_region_capture();
 
     let rect = region.rect.to_f64();
     let geometry = Rectangle::new(surface_location + rect.loc, rect.size);
     let material_alpha = region.material_alpha.clamp(0., 1.) * layer_alpha.clamp(0., 1.);
 
+    // A fully transparent material has no visible contribution. Return before
+    // resolving a plan or recording a capture so alpha-only fades do not pay
+    // for a framebuffer/blur pass that cannot be seen.
+    if material_alpha <= 0. {
+        return;
+    }
+    crate::utils::lifecycle_diag::note_tahoe_region_capture();
+
     // Parse-time resolved kernel (R13); not the global blur owner.
     let blur_kernel = material.kernel;
-
-    let mut effect = material.background_effect;
-    if !region.flags.blur {
-        effect.blur = Some(false);
-    }
-
-    // Compositor-side material easing: `material_alpha` fades the material in
-    // and out for popup/backdrop enter/exit without touching region geometry.
-    // `interaction` then boosts the refractive terms for hover/press/active states.
-    let fade = |v: Option<f64>| v.map(|x| x * f64::from(material_alpha));
-    let fade_from_one = |v: Option<f64>| v.map(|x| 1.0 + (x - 1.0) * f64::from(material_alpha));
-    effect.tint_amount = fade(effect.tint_amount);
-    effect.contrast = fade_from_one(effect.contrast);
-    effect.edge_highlight = fade(effect.edge_highlight);
-    effect.refraction = fade(effect.refraction);
-    effect.inner_shadow = fade(effect.inner_shadow);
-    effect.chromatic = fade(effect.chromatic);
-    effect.lens_depth = fade(effect.lens_depth);
-
-    let interaction = region.interaction as f64;
-    if interaction > 0.0 && material_alpha > 0.0 {
-        let boost = |v: Option<f64>| v.map(|x| x * (1.0 + interaction));
-        let boost_from_one = |v: Option<f64>| v.map(|x| 1.0 + (x - 1.0) * (1.0 + interaction));
-        effect.contrast = boost_from_one(effect.contrast);
-        effect.edge_highlight = boost(effect.edge_highlight);
-        effect.refraction = boost(effect.refraction);
-        effect.inner_shadow = boost(effect.inner_shadow);
-        effect.chromatic = boost(effect.chromatic);
-        effect.lens_depth = boost(effect.lens_depth);
-    }
-
-    let sample_padding = glass_sample_padding(region, effect, blur_kernel);
+    let (effect, sample_padding) = resolve_glass_effect_and_padding(
+        region,
+        material.background_effect,
+        blur_kernel,
+        material_alpha,
+    );
     // Capture/sample geometry may expand beyond the protocol region so blur
     // and refraction have enough context. Draw/visible geometry must stay
     // exactly on the protocol region — sample padding must never become a
@@ -442,6 +423,60 @@ fn render_region(
     }
 }
 
+/// Resolve draw-side material easing separately from structural capture needs.
+/// The sample envelope is derived from the maximum interaction state so hover
+/// and alpha animation can only change visual uniforms, not the capture geometry.
+fn resolve_glass_effect_and_padding(
+    region: &TahoeGlassRegion,
+    material_effect: niri_config::BackgroundEffect,
+    blur_kernel: niri_config::Blur,
+    material_alpha: f32,
+) -> (niri_config::BackgroundEffect, f64) {
+    // Interaction is a draw-side multiplier, but the capture must cover its
+    // entire protocol range. Resolve the envelope at the peak interaction
+    // value, then keep the actual frame's effect independent below.
+    let mut structural_effect = material_effect;
+    apply_interaction_boost(&mut structural_effect, 1.0);
+    let sample_padding = glass_sample_padding(region, structural_effect, blur_kernel);
+    let mut effect = material_effect;
+    if !region.flags.blur {
+        effect.blur = Some(false);
+    }
+
+    // Compositor-side material easing: `material_alpha` fades the material in
+    // and out for popup/backdrop enter/exit without touching region geometry.
+    // `interaction` then boosts the refractive terms for hover/press/active states.
+    let fade = |v: Option<f64>| v.map(|x| x * f64::from(material_alpha));
+    let fade_from_one = |v: Option<f64>| v.map(|x| 1.0 + (x - 1.0) * f64::from(material_alpha));
+    effect.tint_amount = fade(effect.tint_amount);
+    effect.contrast = fade_from_one(effect.contrast);
+    effect.edge_highlight = fade(effect.edge_highlight);
+    effect.refraction = fade(effect.refraction);
+    effect.inner_shadow = fade(effect.inner_shadow);
+    effect.chromatic = fade(effect.chromatic);
+    effect.lens_depth = fade(effect.lens_depth);
+
+    apply_interaction_boost(&mut effect, f64::from(region.interaction));
+
+    (effect, sample_padding)
+}
+
+fn apply_interaction_boost(effect: &mut niri_config::BackgroundEffect, interaction: f64) {
+    let interaction = interaction.clamp(0., 1.);
+    if interaction <= 0. {
+        return;
+    }
+
+    let boost = |v: Option<f64>| v.map(|x| x * (1. + interaction));
+    let boost_from_one = |v: Option<f64>| v.map(|x| 1. + (x - 1.) * (1. + interaction));
+    effect.contrast = boost_from_one(effect.contrast);
+    effect.edge_highlight = boost(effect.edge_highlight);
+    effect.refraction = boost(effect.refraction);
+    effect.inner_shadow = boost(effect.inner_shadow);
+    effect.chromatic = boost(effect.chromatic);
+    effect.lens_depth = boost(effect.lens_depth);
+}
+
 fn region_area(region: &TahoeGlassRegion) -> i64 {
     i64::from(region.rect.size.w.max(0)) * i64::from(region.rect.size.h.max(0))
 }
@@ -460,9 +495,13 @@ fn glass_sample_padding(
 
     let refraction = effect.refraction.unwrap_or(0.).abs();
     let lens_depth = effect.lens_depth.unwrap_or(0.).abs();
+    let chromatic = effect.chromatic.unwrap_or(0.).abs();
     if refraction > 0.0 || lens_depth > 0.0 {
         let short_edge = f64::from(region.rect.size.w.min(region.rect.size.h).max(1));
-        padding = padding.max((refraction + lens_depth) * short_edge * 2.0 + 4.0);
+        let refractive_padding = (refraction + lens_depth) * short_edge * 2.0 + 4.0;
+        // The RGB split samples farther along the same displacement vector;
+        // reserve its bounded multiplier in the same structural envelope.
+        padding = padding.max(refractive_padding * (1. + chromatic * 6.));
     }
 
     padding.clamp(2.0, 64.0)
@@ -926,5 +965,59 @@ mod tests {
         assert_eq!(params.draw_clip, draw_clip);
         assert_eq!(params.scale, 2.0);
         assert!(params.clip.is_some());
+    }
+
+    #[test]
+    fn material_animation_keeps_structural_padding_and_changes_visual_effect() {
+        use niri_config::{BackgroundEffect, Blur};
+
+        let region = TahoeGlassRegion {
+            id: 1,
+            rect: Rectangle::new(Point::from((0, 0)), Size::from((320, 180))),
+            radius: CornerRadius::default(),
+            material: "panel".into(),
+            flags: crate::protocols::tahoe_glass::TahoeGlassFlags {
+                blur: true,
+                shadow: false,
+                clip: true,
+            },
+            interaction: 0.4,
+            material_alpha: 1.0,
+        };
+        let base = BackgroundEffect {
+            refraction: Some(0.025),
+            lens_depth: Some(0.01),
+            tint_amount: Some(0.4),
+            ..BackgroundEffect::default()
+        };
+        let blur = Blur {
+            offset: 2.0,
+            passes: 2,
+            ..Blur::default()
+        };
+
+        let at_rest_padding = glass_sample_padding(&region, base, blur);
+        let mut peak_effect = base;
+        apply_interaction_boost(&mut peak_effect, 1.0);
+        let peak_padding = glass_sample_padding(&region, peak_effect, blur);
+        let (resting, resting_padding) = resolve_glass_effect_and_padding(&region, base, blur, 1.0);
+        let (faded, faded_padding) = resolve_glass_effect_and_padding(&region, base, blur, 0.5);
+
+        assert_eq!(
+            resting_padding, faded_padding,
+            "material fade and interaction must not change structural capture padding"
+        );
+        assert_eq!(
+            resting_padding, peak_padding,
+            "the stable envelope must cover the interaction peak"
+        );
+        assert!(
+            peak_padding > at_rest_padding + f64::EPSILON,
+            "test material must exercise a larger interaction envelope"
+        );
+        assert_ne!(
+            resting, faded,
+            "material animation must still change draw-side visual parameters"
+        );
     }
 }

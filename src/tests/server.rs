@@ -36,4 +36,15 @@ impl Server {
             .unwrap();
         self.state.refresh_and_flush_clients();
     }
+
+    /// Dispatch Wayland requests without running the compositor refresh pass.
+    ///
+    /// Tests use this narrow observation window to inspect state immediately
+    /// after a protocol handler and before queued redraws are consumed.
+    pub fn dispatch_protocol_only(&mut self) {
+        self.event_loop
+            .dispatch(Duration::ZERO, &mut self.state)
+            .unwrap();
+        self.state.niri.display_handle.flush_clients().unwrap();
+    }
 }

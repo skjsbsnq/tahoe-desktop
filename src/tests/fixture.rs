@@ -242,6 +242,17 @@ impl Fixture {
         }
     }
 
+    /// Complete a sync after protocol dispatch but before compositor refresh.
+    /// This is only for assertions that must observe a just-queued redraw.
+    pub fn roundtrip_protocol_only(&mut self, id: ClientId) {
+        let client = self.state.client(id);
+        let data = client.send_sync();
+        while !data.done.load(Ordering::Relaxed) {
+            self.state.server.dispatch_protocol_only();
+            self.state.client(id).dispatch();
+        }
+    }
+
     /// Roundtrip twice in a row.
     ///
     /// For some reason, when running tests on many threads at once, a single roundtrip is
