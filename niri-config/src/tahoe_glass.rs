@@ -170,30 +170,30 @@ impl Default for TahoeGlass {
         let mut materials = BTreeMap::new();
         materials.insert(
             "panel".to_owned(),
-            material_profile(0.005, 1.10, 1.0, 0.34, 0.14, 0.004, 0.06, 0., 0.),
+            material_profile(0.005, 1.10, 1.0, 0.18, 0.22, 0.008, 0.06, 0., 0.),
         );
         materials.insert(
             "pill".to_owned(),
-            material_profile(0.005, 1.12, 1.0, 0.30, 0.32, 0.013, 0.07, 0., 0.010),
+            material_profile(0.005, 1.12, 1.0, 0.14, 0.40, 0.016, 0.07, 0., 0.010),
         );
         materials.insert(
             "launcher".to_owned(),
-            material_profile(0.005, 1.08, 1.0, 0.34, 0.15, 0.004, 0.055, 0., 0.003),
+            material_profile(0.005, 1.08, 1.0, 0.18, 0.22, 0.008, 0.055, 0., 0.003),
         );
         materials.insert(
             "dock".to_owned(),
-            material_profile(0.005, 1.10, 1.0, 0.36, 0.18, 0.007, 0.07, 0., 0.006),
+            material_profile(0.005, 1.10, 1.0, 0.20, 0.28, 0.012, 0.07, 0., 0.006),
         );
         materials.insert(
             "menu".to_owned(),
-            material_profile(0.004, 1.08, 1.0, 0.32, 0.26, 0.004, 0.10, 0., 0.),
+            material_profile(0.004, 1.08, 1.0, 0.16, 0.34, 0.008, 0.10, 0., 0.),
         );
         materials.insert(
             "toast".to_owned(),
-            material_profile(0.005, 1.09, 1.0, 0.32, 0.24, 0.005, 0.09, 0., 0.),
+            material_profile(0.005, 1.09, 1.0, 0.15, 0.32, 0.010, 0.09, 0., 0.),
         );
 
-        let mut backdrop = material_profile(0.003, 1.04, 1.0, 0.28, 0.05, 0.002, 0., 0., 0.);
+        let mut backdrop = material_profile(0.003, 1.04, 1.0, 0.14, 0.10, 0.004, 0., 0., 0.);
         backdrop.shadow.on = false;
         materials.insert("backdrop".to_owned(), backdrop);
 
