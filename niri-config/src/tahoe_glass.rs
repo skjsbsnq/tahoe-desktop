@@ -182,7 +182,7 @@ impl Default for TahoeGlass {
         );
         materials.insert(
             "dock".to_owned(),
-            material_profile(0.005, 1.40, 1.0, 0.14, 0.55, 0.016, 0.07, 0., 0.006),
+            material_profile(0.005, 1.40, 1.0, 0.14, 0.35, 0.016, 0.07, 0., 0.006),
         );
         materials.insert(
             "menu".to_owned(),
