@@ -20,6 +20,7 @@ mod r16_genie_identity;
 mod r17_redraw_attribution;
 mod remove_output;
 mod t12_shared_backdrop_gate;
+mod t13_linear_blur_gate;
 mod tahoe_glass;
 mod thumbnail_budget;
 mod transactions;
