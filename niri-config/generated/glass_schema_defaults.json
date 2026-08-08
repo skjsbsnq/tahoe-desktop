@@ -1,8 +1,22 @@
 {
   "schema_version": 1,
   "default_blur_kernel_name": "default",
-  "material_names": ["panel", "pill", "launcher", "dock", "menu", "toast", "backdrop"],
-  "settings_fields": ["edge-highlight", "refraction", "inner-shadow", "chromatic", "lens-depth"],
+  "material_names": [
+    "panel",
+    "pill",
+    "launcher",
+    "dock",
+    "menu",
+    "toast",
+    "backdrop"
+  ],
+  "settings_fields": [
+    "edge-highlight",
+    "refraction",
+    "inner-shadow",
+    "chromatic",
+    "lens-depth"
+  ],
   "blur": {
     "off": false,
     "passes": 3,
@@ -12,50 +26,50 @@
   },
   "materials": {
     "panel": {
-      "edge_highlight": 0.14,
-      "refraction": 0.004,
+      "edge_highlight": 0.45,
+      "refraction": 0.012,
       "inner_shadow": 0.06,
       "chromatic": 0.0,
       "lens_depth": 0.0
     },
     "pill": {
-      "edge_highlight": 0.32,
-      "refraction": 0.013,
+      "edge_highlight": 0.6,
+      "refraction": 0.02,
       "inner_shadow": 0.07,
       "chromatic": 0.0,
       "lens_depth": 0.01
     },
     "launcher": {
-      "edge_highlight": 0.15,
-      "refraction": 0.004,
+      "edge_highlight": 0.45,
+      "refraction": 0.012,
       "inner_shadow": 0.055,
       "chromatic": 0.0,
       "lens_depth": 0.003
     },
     "dock": {
-      "edge_highlight": 0.18,
-      "refraction": 0.007,
+      "edge_highlight": 0.55,
+      "refraction": 0.016,
       "inner_shadow": 0.07,
       "chromatic": 0.0,
       "lens_depth": 0.006
     },
     "menu": {
-      "edge_highlight": 0.26,
-      "refraction": 0.004,
+      "edge_highlight": 0.55,
+      "refraction": 0.014,
       "inner_shadow": 0.1,
       "chromatic": 0.0,
       "lens_depth": 0.0
     },
     "toast": {
-      "edge_highlight": 0.24,
-      "refraction": 0.005,
+      "edge_highlight": 0.5,
+      "refraction": 0.014,
       "inner_shadow": 0.09,
       "chromatic": 0.0,
       "lens_depth": 0.0
     },
     "backdrop": {
-      "edge_highlight": 0.05,
-      "refraction": 0.002,
+      "edge_highlight": 0.25,
+      "refraction": 0.006,
       "inner_shadow": 0.0,
       "chromatic": 0.0,
       "lens_depth": 0.0
