@@ -174,7 +174,7 @@ impl Default for TahoeGlass {
         );
         materials.insert(
             "pill".to_owned(),
-            material_profile(0.005, 1.45, 1.0, 0.10, 0.25, 0.012, 0.07, 0., 0.010),
+            material_profile(0.005, 1.0, 1.0, 0.10, 0.0, 0.0, 0.07, 0., 0.010),
         );
         materials.insert(
             "launcher".to_owned(),
