@@ -191,16 +191,18 @@ fn minimize_releases_only_target_window_visibility() {
     );
 
     // Hit-test path must agree (B-C2): after the per-window release, clicking the
-    // revealed area of the back tile must hit it (not the minimized target, and not
-    // fall through). Probe the center of window 3's tile (dynamic geometry).
+    // revealed area of a back tile must hit it (not the minimized target, and not
+    // fall through). Probe the center of window 2's tile (dynamic geometry; window 2
+    // sits in the viewport while window 3's column can be scrolled off-screen after
+    // the re-maximize).
     let output = layout.outputs().next().unwrap().clone();
     let (tile_pos, tile_size) = layout
         .active_workspace()
         .unwrap()
         .tiles_with_render_positions()
-        .find(|(tile, _, _)| *tile.window().id() == 3)
+        .find(|(tile, _, _)| *tile.window().id() == 2)
         .map(|(tile, pos, _)| (pos, tile.tile_size()))
-        .expect("window 3 tile");
+        .expect("window 2 tile");
     let pos = Point::from((
         tile_pos.x + tile_size.w / 2.,
         tile_pos.y + tile_size.h / 2.,
@@ -209,7 +211,7 @@ fn minimize_releases_only_target_window_visibility() {
         layout
             .window_under(&output, pos)
             .map(|(win, _)| *win.id()),
-        Some(3),
+        Some(2),
         "hit-test must reveal the back tile after per-window release"
     );
 }

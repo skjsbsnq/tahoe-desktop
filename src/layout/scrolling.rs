@@ -1682,6 +1682,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         if minimized {
+            // BI-1: minimizing the maximize target ends its exclusivity immediately —
+            // the window is leaving the maximize transition's scope, so the transition
+            // must not keep filtering the column's other live tiles until it settles.
+            // Per-window (BI-2): only the target's own minimize releases; minimizing an
+            // unrelated window keeps the transition (and the exclusivity) intact.
+            if self
+                .maximize_transition
+                .as_ref()
+                .is_some_and(|transition| transition.targets(window))
+            {
+                self.clear_maximize_transition(MaximizeVisualClear::Cancelled);
+            }
+
             if let Some(event) = self.minimize_restore.reverse_to_minimize(
                 window,
                 self.options.animations.window_minimize_anim(),

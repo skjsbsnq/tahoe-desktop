@@ -119,6 +119,8 @@ impl<Id> MaximizeVisualFsm<Id> {
     /// Target window committed maximized under Mapped configure/ack/commit serial semantics.
     ///
     /// Applies to both pending and timed-out phases (late valid commit resumes exclusivity).
+    /// Not applicable once the target left the maximize scope (removed, minimized — the
+    /// holder clears the transition in those paths, so this is a no-op on `None`).
     pub fn on_target_maximized_commit(&mut self) {
         match self.phase {
             MaximizeVisualPhase::PendingConfigure
