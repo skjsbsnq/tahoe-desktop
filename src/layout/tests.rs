@@ -14,6 +14,7 @@ use smithay::utils::Rectangle;
 use super::*;
 
 mod animations;
+mod b1_maximize_exclusivity;
 mod coords;
 mod fullscreen;
 mod lifecycle_controller;
