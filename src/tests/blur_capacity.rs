@@ -873,7 +873,10 @@ fn glass_shadow_edge_pixels_are_stable_on_bright_and_dark_backdrops() {
 
     assert_eq!(px(&bright, 32, 32), (229, 229, 229, 255));
     assert_eq!(px(&dark, 32, 32), (25, 25, 25, 255));
-    assert_eq!(px(&bright, 128, 112), (224, 229, 234, 255));
+    // The panel interior is backdrop-adaptive (postprocess.frag): over a bright
+    // backdrop the material darkens so it stays visible, over a dark one it
+    // still lightens. Only the bright value moved when that landed.
+    assert_eq!(px(&bright, 128, 112), (184, 189, 193, 255));
     assert_eq!(px(&dark, 128, 112), (61, 66, 71, 255));
     assert_eq!(
         px(&bright, 128, 64),

@@ -26,6 +26,65 @@ vec3 saturate(vec3 color, float sat) {
     return mix(vec3(dot(color, w)), color, sat);
 }
 
+// Backdrop-adaptive tint. A single fixed tint cannot serve both a dark
+// wallpaper and white application content: the near-white tint that gives the
+// glass its body over a dark backdrop is an identity operation over white, so
+// the material, its border and its rim all disappear and only the blur bleed
+// outside the panel stays visible.
+//
+// The material keeps its configured tint at full strength everywhere and gains
+// a separate darkening factor that only grows over a light backdrop. The two
+// are layered, not cross-faded: cross-fading a lighten against a darken makes
+// them cancel at mid gray, which would move the invisible-panel bug from white
+// to gray rather than fixing it.
+//
+// Both windows start above the darkest backdrops, so over a dark wallpaper
+// `light_backdrop` and `rim_backdrop` are 0 and every material renders exactly
+// as it did before this term existed. Below GLASS_RIM_LUMA_LOW (backdrop code
+// ~46) that is bit-identical; between there and the fill window the body is
+// still untouched while the rim darkens slightly (a few percent), which is
+// what lets a surface cross a midtone wallpaper without a step. That keeps the
+// tuned dark-wallpaper look, and it means surfaces whose own fill is a
+// near-opaque plate (the Dynamic Island, LeftSidebar, SettingsPanel) are not
+// disturbed either. No material recipe needs a compensating change.
+//
+// One crossing is unavoidable. Any curve that brightens a dark backdrop and
+// darkens a light one must equal its backdrop exactly once in between, so the
+// fill alone cannot carry every case. The rim therefore inverts on its own,
+// earlier window (GLASS_RIM_*): where the fill approaches its crossing the rim
+// is already darkening, so a material with an edge light keeps a readable
+// boundary there. A material configured with `edge-highlight 0` (the Dynamic
+// Island) has no rim to invert and relies on its own opaque fill instead.
+//
+// Both windows are expressed in the same non-linear space as the sampled color
+// (the framebuffer is sRGB-encoded) and are smoothstep-ed, so a surface dragged
+// across a wallpaper/content boundary never pops.
+#define GLASS_LIGHT_DARKEN 0.18
+#define GLASS_ADAPT_LUMA_LOW 0.34
+#define GLASS_ADAPT_LUMA_HIGH 0.95
+#define GLASS_RIM_DARKEN 0.34
+#define GLASS_RIM_LUMA_LOW 0.18
+#define GLASS_RIM_LUMA_HIGH 0.62
+
+// Luma of the already-blurred backdrop sample, un-premultiplied so a partially
+// transparent region is judged by its color rather than by its coverage.
+float glass_backdrop_luma(vec4 color) {
+    const vec3 w = vec3(0.2126, 0.7152, 0.0722);
+    float a = max(color.a, 0.0001);
+
+    return clamp(dot(color.rgb / a, w), 0.0, 1.0);
+}
+
+// 0 = dark backdrop (tint only), 1 = light backdrop (tint plus full darkening).
+float glass_tint_inversion(float backdrop_luma) {
+    return smoothstep(GLASS_ADAPT_LUMA_LOW, GLASS_ADAPT_LUMA_HIGH, backdrop_luma);
+}
+
+// The rim leads the fill so the two never lose the surface at the same backdrop.
+float glass_rim_inversion(float backdrop_luma) {
+    return smoothstep(GLASS_RIM_LUMA_LOW, GLASS_RIM_LUMA_HIGH, backdrop_luma);
+}
+
 vec3 apply_contrast(vec3 color, float amount, float alpha) {
     float pivot = 0.5 * alpha;
     return clamp((color - vec3(pivot)) * amount + vec3(pivot), vec3(0.0), vec3(alpha));
@@ -248,21 +307,39 @@ vec4 postprocess(vec4 color, vec2 coords_geo) {
     // Mix bg_color behind the texture (both premultiplied alpha).
     color = color + bg_color * (1.0 - color.a);
 
+    // Backdrop-adaptive tint direction. `tint_color` is the light-on-dark
+    // recipe (near-white); on a light backdrop that recipe is a no-op, because
+    // mixing white toward white cannot separate the surface from what is behind
+    // it. Over light content the same material must darken instead, or the
+    // panel, its rim and its border all collapse into the background and only
+    // the blur bleed stays visible.
+    float backdrop_luma = glass_backdrop_luma(color);
+    float light_backdrop = glass_tint_inversion(backdrop_luma);
+    float rim_backdrop = glass_rim_inversion(backdrop_luma);
+
     float tint_mix = clamp(tint_amount * tint_color.a, 0.0, 1.0);
     if (tint_mix > 0.0) {
         color.rgb = mix(color.rgb, tint_color.rgb * color.a, tint_mix);
     }
+    // Layered on top of the tint rather than cross-faded with it, so the two
+    // cannot cancel on a mid-gray backdrop.
+    color.rgb *= 1.0 - GLASS_LIGHT_DARKEN * light_backdrop;
 
     float contrast_amount = clamp(contrast, 0.0, 3.0);
     if (contrast_amount != 1.0) {
         color.rgb = apply_contrast(color.rgb, contrast_amount, color.a);
     }
 
+    // The rim follows the same inversion on an earlier window. Additive
+    // specular light is invisible on a light backdrop (it saturates at white),
+    // so there the same edge term darkens the rim and becomes the surface's
+    // readable boundary while the fill is near its crossing point.
     float highlight_amount = clamp(edge_highlight, 0.0, 2.0);
     if (highlight_amount > 0.0) {
         float highlight = glass_light_strength(coords_geo) * highlight_amount
             * (0.38 + glass_surface_detail() * 0.62) * glass_small_surface_boost();
-        color.rgb += vec3(highlight * color.a * 0.28);
+        color.rgb += vec3(highlight * color.a * 0.28 * (1.0 - light_backdrop));
+        color.rgb *= 1.0 - highlight * GLASS_RIM_DARKEN * rim_backdrop;
     }
 
     float inner_amount = clamp(inner_shadow, 0.0, 0.5);

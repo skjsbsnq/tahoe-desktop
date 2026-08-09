@@ -9,6 +9,7 @@ mod blur_capacity;
 mod floating;
 mod foreign_toplevel;
 mod fullscreen;
+mod glass_backdrop_adaptive_tint;
 mod layer_lock_scope;
 mod layer_shell;
 mod lifecycle_command;

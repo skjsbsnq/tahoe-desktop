@@ -1092,12 +1092,25 @@ fn zero_alpha_skips_capture_and_restore_renders_first_visible_frame() {
         pixels[offset..offset + 4].to_owned()
     };
     assert_eq!(sample(&_bright_pixels, 0, 0), [225, 225, 225, 255]);
-    assert_eq!(sample(&_bright_pixels, 72, 20), [244, 244, 244, 255]);
-    assert_eq!(sample(&_bright_pixels, 72, 4), [247, 247, 247, 255]);
+    // Panel interior over a bright backdrop: the material is backdrop-adaptive
+    // (postprocess.frag), so here it darkens instead of vanishing into the
+    // backdrop. Before that landed this sampled 239 against a 225 backdrop —
+    // the panel was *brighter* than what it sat on.
+    assert_eq!(sample(&_bright_pixels, 72, 20), [185, 185, 185, 255]);
+    // Rim band: on a bright backdrop the edge light inverts to a darkening rim,
+    // which is what keeps the panel boundary readable over light content.
+    // Before, the additive rim clipped to a fully blown-out 255 here.
+    assert_eq!(sample(&_bright_pixels, 72, 4), [162, 162, 162, 255]);
     assert_eq!(sample(&_bright_pixels, 72, 0), [214, 214, 214, 255]);
+    // The dark samples are untouched by the adaptive term (its window is closed
+    // over a dark backdrop), and these values are what the current material
+    // actually renders. The literals here previously read 43/50, which had gone
+    // stale several material re-tunings earlier: this test was already failing
+    // on a clean tree before the adaptive tint, so do not read the change from
+    // 43/50 to 59/81 as a dark-backdrop regression.
     assert_eq!(sample(&dark_pixels, 0, 0), [25, 25, 25, 255]);
-    assert_eq!(sample(&dark_pixels, 72, 20), [43, 43, 43, 255]);
-    assert_eq!(sample(&dark_pixels, 72, 4), [50, 50, 50, 255]);
+    assert_eq!(sample(&dark_pixels, 72, 20), [59, 59, 59, 255]);
+    assert_eq!(sample(&dark_pixels, 72, 4), [81, 81, 81, 255]);
     assert_eq!(sample(&dark_pixels, 72, 0), [23, 23, 23, 255]);
 
     assert!(bright_diag.tahoe_region_capture >= 1);
