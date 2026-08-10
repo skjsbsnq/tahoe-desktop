@@ -104,9 +104,9 @@ fn r16_render_genie_source_has_zero_per_frame_constructors() {
     let start = src
         .find("fn render_genie(")
         .expect("render_genie must exist");
-    // Function body ends at the next top-level `fn` / impl item at column 0 after indent of 4 spaces
-    // for methods — take until the matching closing of this method by scanning to the next
-    // `    fn ` or `    pub` at the same indent after the body starts, or the end of impl.
+    // Function body ends at the next top-level `fn` / impl item at column 0 after indent of 4
+    // spaces for methods — take until the matching closing of this method by scanning to the
+    // next `    fn ` or `    pub` at the same indent after the body starts, or the end of impl.
     let after = &src[start..];
     let body_start = after.find('{').expect("render_genie body");
     let body = &after[body_start..];
@@ -562,7 +562,10 @@ fn r16_genie_retarget_noop_without_active_animation() {
         .unwrap()
         .scrolling()
         .test_for_each_minimize_restore(|_, _, _| count += 1);
-    assert_eq!(count, 0, "minimize animation must complete and drop its entry");
+    assert_eq!(
+        count, 0,
+        "minimize animation must complete and drop its entry"
+    );
 
     // A late set_rectangle finds no active animation to retarget (no-op, no panic).
     f.client(id)

@@ -1165,13 +1165,15 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
     ) {
         match event {
             zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } => {
-                state.wlr_foreign_toplevel_meta.push(WlrForeignToplevelMeta {
-                    handle: toplevel.clone(),
-                    title: None,
-                    app_id: None,
-                    done: false,
-                    closed: false,
-                });
+                state
+                    .wlr_foreign_toplevel_meta
+                    .push(WlrForeignToplevelMeta {
+                        handle: toplevel.clone(),
+                        title: None,
+                        app_id: None,
+                        done: false,
+                        closed: false,
+                    });
                 state.foreign_toplevels.push(toplevel);
             }
             zwlr_foreign_toplevel_manager_v1::Event::Finished => (),

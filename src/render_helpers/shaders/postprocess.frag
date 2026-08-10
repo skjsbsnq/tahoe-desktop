@@ -8,6 +8,7 @@ uniform float edge_highlight;
 uniform float refraction;
 uniform float inner_shadow;
 uniform float lens_depth;
+uniform float detail_floor;
 uniform mat3 geo_to_input;
 // Note: `chromatic` is declared in clipped_surface.frag (where the RGB-split
 // sampling lives) and shared with this translation unit. Declaring it here too
@@ -103,13 +104,23 @@ float value_noise(vec2 p) {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+// Surface detail factor in [0, 1]: 1 evaluates the full material (height-field
+// normals, turbulence, caustics, specular), 0 takes the cheap directional path.
+//
+// Size drives it down because those terms cost per pixel and a large surface
+// pays for every one of them; `detail_floor` is the material's say in that
+// trade. A material whose look is worth the cost at any size sets the floor to
+// 1 and keeps full detail; left at 0 the size fade decides alone, which is what
+// ordinary window blur wants. The floor raises the result rather than replacing
+// the fade, so this stays one decision with two inputs.
 float glass_surface_detail() {
     float long_edge = max(max(geo_size.x, geo_size.y), 1.0);
     float area = max(geo_size.x * geo_size.y, 1.0);
     float long_fade = 1.0 - smoothstep(620.0, 980.0, long_edge);
     float area_fade = 1.0 - smoothstep(180000.0, 420000.0, area);
+    float size_detail = min(long_fade, area_fade);
 
-    return clamp(min(long_fade, area_fade), 0.0, 1.0);
+    return clamp(max(size_detail, detail_floor), 0.0, 1.0);
 }
 
 float glass_large_surface_fade() {

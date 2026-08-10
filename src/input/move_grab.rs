@@ -120,9 +120,10 @@ impl MoveGrab {
         // dirty set (activation/insertion) and redraw the outputs the dragged window overlapped
         // plus the cursor output.
         if overview_was_open {
-            data.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::all(
-                crate::redraw_attribution::RedrawFallbackReason::GlobalUi,
-            ));
+            data.niri
+                .apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::all(
+                    crate::redraw_attribution::RedrawFallbackReason::GlobalUi,
+                ));
         } else {
             data.niri
                 .apply_layout_dirty_redraw(crate::redraw_attribution::RedrawReason::Activate);

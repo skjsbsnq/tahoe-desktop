@@ -423,10 +423,12 @@ impl XdgShellHandler for State {
             // T-31: redraw the outputs the maximize dirtied.
             let dirty = self.niri.layout.take_dirty_outputs();
             if !dirty.is_empty() {
-                self.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::outputs(
-                    dirty,
-                    crate::redraw_attribution::RedrawReason::Maximize,
-                ));
+                self.niri.apply_redraw_attribution(
+                    crate::redraw_attribution::RedrawAttribution::outputs(
+                        dirty,
+                        crate::redraw_attribution::RedrawReason::Maximize,
+                    ),
+                );
             }
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
@@ -515,10 +517,12 @@ impl XdgShellHandler for State {
             // T-31: redraw the outputs the unmaximize dirtied.
             let dirty = self.niri.layout.take_dirty_outputs();
             if !dirty.is_empty() {
-                self.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::outputs(
-                    dirty,
-                    crate::redraw_attribution::RedrawReason::Maximize,
-                ));
+                self.niri.apply_redraw_attribution(
+                    crate::redraw_attribution::RedrawAttribution::outputs(
+                        dirty,
+                        crate::redraw_attribution::RedrawReason::Maximize,
+                    ),
+                );
             }
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {

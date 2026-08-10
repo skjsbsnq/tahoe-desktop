@@ -392,14 +392,25 @@ fn r11_pair_shell_first_then_create_windows() {
     let id = f.add_client();
     // Shell already bound both managers via registry (no windows yet).
     f.double_roundtrip(id);
-    assert!(f.client(id).pair_ext_wlr_by_creation_order().unwrap().is_empty());
+    assert!(f
+        .client(id)
+        .pair_ext_wlr_by_creation_order()
+        .unwrap()
+        .is_empty());
 
     let _a = create_window(&mut f, id);
     let _b = create_window(&mut f, id);
     assert_pairs_match_mapped_ids(&mut f, id);
 
     // Same app_id/title must still pair by stream order, not fuzzy title.
-    for surface in f.client(id).state.windows.iter().map(|w| w.surface.clone()).collect::<Vec<_>>() {
+    for surface in f
+        .client(id)
+        .state
+        .windows
+        .iter()
+        .map(|w| w.surface.clone())
+        .collect::<Vec<_>>()
+    {
         let window = f.client(id).window(&surface);
         window.set_app_id("org.same.App");
         window.set_title("Identical");

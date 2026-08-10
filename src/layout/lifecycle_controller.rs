@@ -5,8 +5,8 @@
 //!
 //! - minimize/restore: per-window active animation, reverse reusing the same snapshot/texture,
 //!   advance + completion cleanup, restore-period live-tile visibility lease, overlay enum
-//! - closing: `ClosingWindow` set ownership, advance + completion cleanup (texture drop),
-//!   overlay enumeration; transaction leaf ownership stays inside `ClosingWindow`
+//! - closing: `ClosingWindow` set ownership, advance + completion cleanup (texture drop), overlay
+//!   enumeration; transaction leaf ownership stays inside `ClosingWindow`
 //!
 //! Space adapters supply tile lookup/position (including scrolling column-delete compensation
 //! and floating stacking/position), snapshot capture, layout-specific focus, and where
@@ -439,14 +439,16 @@ impl ClosingAnimationLane {
         });
     }
 
-    /// Iterate overlays oldest-first (render typically uses `.rev()` via [`Self::render_overlays`]).
+    /// Iterate overlays oldest-first (render typically uses `.rev()` via
+    /// [`Self::render_overlays`]).
     pub fn for_each(&self, mut f: impl FnMut(&ClosingWindow)) {
         for entry in &self.entries {
             f(entry);
         }
     }
 
-    /// Render all closing overlays into `view_rect` (adapter chooses workspace-content vs view space).
+    /// Render all closing overlays into `view_rect` (adapter chooses workspace-content vs view
+    /// space).
     pub fn render_overlays(
         &self,
         mut ctx: RenderCtx<GlesRenderer>,

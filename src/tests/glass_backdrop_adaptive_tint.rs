@@ -66,16 +66,29 @@ fn make_renderer() -> GlesRenderer {
 /// `noise` is forced to 0 so the readback is deterministic; every other
 /// parameter is the deployed `panel` recipe.
 fn render_glass_over(renderer: &mut GlesRenderer, code: u8) -> Vec<u8> {
+    render_glass_sized(renderer, code, SIZE, SIZE, 0.)
+}
+
+/// Same as [`render_glass_over`] but with an explicit region size and detail
+/// floor, so a test can put the shader on a surface large enough for the size
+/// fade to reach for the cheap path.
+fn render_glass_sized(
+    renderer: &mut GlesRenderer,
+    code: u8,
+    width: i32,
+    height: i32,
+    detail_floor: f32,
+) -> Vec<u8> {
     let value = f32::from(code) / 255.;
     let buffer = SolidColorBuffer::new(
-        (f64::from(SIZE), f64::from(SIZE)),
+        (f64::from(width), f64::from(height)),
         Color32F::new(value, value, value, 1.),
     );
     let element =
         SolidColorRenderElement::from_buffer(&buffer, Point::from((0., 0.)), 1., Kind::Unspecified);
     let (backdrop, _sync) = render_to_texture(
         renderer,
-        Size::from((SIZE, SIZE)),
+        Size::from((width, height)),
         Scale::from(1.),
         Transform::Normal,
         Fourcc::Abgr8888,
@@ -92,7 +105,7 @@ fn render_glass_over(renderer: &mut GlesRenderer, code: u8) -> Vec<u8> {
     // input coords and geometry coords coincide.
     let uniforms = [
         Uniform::new("niri_scale", 1.0f32),
-        Uniform::new("geo_size", (SIZE as f32, SIZE as f32)),
+        Uniform::new("geo_size", (width as f32, height as f32)),
         Uniform::new("corner_radius", [0f32, 0., 0., 0.]),
         mat3_uniform("input_to_geo", Mat3::IDENTITY),
         mat3_uniform("geo_to_input", Mat3::IDENTITY),
@@ -107,22 +120,26 @@ fn render_glass_over(renderer: &mut GlesRenderer, code: u8) -> Vec<u8> {
         Uniform::new("inner_shadow", PANEL_INNER_SHADOW),
         Uniform::new("chromatic", 0.0f32),
         Uniform::new("lens_depth", 0.0f32),
+        Uniform::new("detail_floor", detail_floor),
     ];
 
     // Drive the program the same way FramebufferEffectElement does in
     // production: render_texture_from_to with the postprocess program bound.
-    let mut out = create_texture(renderer, Size::from((SIZE, SIZE)), Fourcc::Abgr8888)
+    let mut out = create_texture(renderer, Size::from((width, height)), Fourcc::Abgr8888)
         .expect("creating the output texture");
     {
         let mut target = renderer.bind(&mut out).expect("binding the output");
         let mut frame = renderer
-            .render(&mut target, Size::from((SIZE, SIZE)), Transform::Normal)
+            .render(&mut target, Size::from((width, height)), Transform::Normal)
             .expect("starting a frame");
-        let full = Rectangle::from_size(Size::from((SIZE, SIZE)));
+        let full = Rectangle::from_size(Size::from((width, height)));
         frame
             .render_texture_from_to(
                 &backdrop,
-                Rectangle::<f64, Buffer>::from_size(Size::from((f64::from(SIZE), f64::from(SIZE)))),
+                Rectangle::<f64, Buffer>::from_size(Size::from((
+                    f64::from(width),
+                    f64::from(height),
+                ))),
                 full,
                 &[full],
                 &[],
@@ -169,6 +186,18 @@ fn luma_extremes(pixels: &[u8]) -> (f64, f64) {
         hi = hi.max(l);
     }
     (lo, hi)
+}
+
+/// Standard deviation of luma over the whole region. Height-field normals,
+/// turbulence and caustics all vary per pixel, so they show up here; a flat
+/// directional shade does not.
+fn luma_stddev(pixels: &[u8]) -> f64 {
+    let lumas: Vec<f64> = pixels
+        .chunks_exact(4)
+        .map(|px| 0.2126 * f64::from(px[0]) + 0.7152 * f64::from(px[1]) + 0.0722 * f64::from(px[2]))
+        .collect();
+    let mean = lumas.iter().sum::<f64>() / lumas.len() as f64;
+    (lumas.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / lumas.len() as f64).sqrt()
 }
 
 /// WCAG contrast ratio between two 0..255 luma codes treated as gray.
@@ -372,5 +401,62 @@ fn dark_wallpaper_midtones_move_only_within_a_bounded_rim_band() {
     assert!(
         rim_at_open > rim_below,
         "a brighter backdrop must still give a brighter rim: {rim_below:.1} -> {rim_at_open:.1}"
+    );
+}
+
+/// A Dock-shaped surface is past the size fade, so without a floor the shader
+/// takes the cheap directional path and the material reads flat. The floor is
+/// what buys the full look back; this pins that it actually changes the pixels
+/// rather than only compiling.
+///
+/// Sizes come from the deployed Dock: 1518x84 logical is past both the
+/// long-edge cutoff (980) and well under the area cutoff, so the long edge
+/// alone drives the fade to 0.
+#[test]
+fn detail_floor_restores_full_material_on_a_large_surface() {
+    let mut renderer = make_renderer();
+
+    const W: i32 = 1518;
+    const H: i32 = 84;
+
+    let cheap = render_glass_sized(&mut renderer, 128, W, H, 0.);
+    let full = render_glass_sized(&mut renderer, 128, W, H, 1.);
+
+    let (cheap_lo, cheap_hi) = luma_extremes(&cheap);
+    let (full_lo, full_hi) = luma_extremes(&full);
+
+    // The edge light is scaled by 0.38 + detail * 0.62, so lifting detail to 1
+    // must raise the brightest pixel the surface produces.
+    assert!(
+        full_hi > cheap_hi + 1.0,
+        "detail floor must brighten the rim on a large surface: {cheap_hi:.1} -> {full_hi:.1}"
+    );
+
+    // Inner shadow is scaled by 0.55 + detail * 0.45, but it is applied after
+    // the (additive, and much larger) edge highlight, so the darkest pixel is
+    // not a reliable witness. What the floor is really for is structure: the
+    // full path evaluates height-field normals, turbulence and caustics, and a
+    // flat surface has none of them. Spread across the surface measures that
+    // directly.
+    let cheap_spread = luma_stddev(&cheap);
+    let full_spread = luma_stddev(&full);
+    assert!(
+        full_spread > cheap_spread * 1.05,
+        "the full path must add visible surface structure: \
+         stddev {cheap_spread:.2} -> {full_spread:.2}"
+    );
+
+    eprintln!(
+        "[glass] {W}x{H} detail floor 0 -> 1: lo {cheap_lo:.1}->{full_lo:.1} \
+         hi {cheap_hi:.1}->{full_hi:.1} stddev {cheap_spread:.2}->{full_spread:.2}"
+    );
+
+    // A small surface is already at full detail from the size fade alone, so
+    // the floor must be a no-op there -- it raises, never overrides.
+    let small_bare = render_glass_sized(&mut renderer, 128, SIZE, SIZE, 0.);
+    let small_floored = render_glass_sized(&mut renderer, 128, SIZE, SIZE, 1.);
+    assert_eq!(
+        small_bare, small_floored,
+        "the floor must not change a surface the size fade already leaves at full detail"
     );
 }

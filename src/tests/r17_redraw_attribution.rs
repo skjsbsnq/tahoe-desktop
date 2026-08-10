@@ -739,8 +739,7 @@ fn r17_directed_helpers_queue_only_overlapping_outputs() {
     let geo1 = f.niri().global_space.output_geometry(&out1).unwrap();
     let geo2 = f.niri().global_space.output_geometry(&out2).unwrap();
     let x1 = geo1.loc.x.min(geo2.loc.x) as f64;
-    let x2 = (geo1.loc.x + i32::from(geo1.size.w))
-        .max(geo2.loc.x + i32::from(geo2.size.w)) as f64;
+    let x2 = (geo1.loc.x + i32::from(geo1.size.w)).max(geo2.loc.x + i32::from(geo2.size.w)) as f64;
     let rect = Rectangle::new(Point::from((x1, 0.)), Size::from((x2 - x1, 10.)));
     f.niri().queue_redraw_overlapping(rect);
     assert!(is_output_queued(f.niri(), &out1));
@@ -802,7 +801,6 @@ fn r17_do_action_source_has_zero_queue_redraw_all() {
         "do_action must apply redraw attribution"
     );
 }
-
 
 /// T-31: non-do_action activation paths must drain the layout dirty set so both the window
 /// output and the previous active output are redrawn (adversarial finding: focus ring /

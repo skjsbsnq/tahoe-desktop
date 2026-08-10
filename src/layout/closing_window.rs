@@ -332,8 +332,7 @@ mod tests {
 
     use approx::assert_relative_eq;
 
-    use super::native_scale;
-    use super::AnimationState;
+    use super::{native_scale, AnimationState};
     use crate::animation::{Animation, Clock};
     use crate::utils::transaction::{Transaction, TransactionBlocker};
 

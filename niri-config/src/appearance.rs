@@ -1081,6 +1081,15 @@ pub struct BackgroundEffectRule {
     pub chromatic: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub lens_depth: Option<FloatOrInt<0, 1000>>,
+    /// Floor for the shader's size-driven detail factor, in [0, 1].
+    ///
+    /// The shader fades surface detail out on large surfaces because the
+    /// height-field normals, turbulence and caustics it drives cost per pixel.
+    /// A material that is worth the cost at any size raises the floor; 1 keeps
+    /// full detail regardless of how large the surface gets. Left unset the
+    /// size fade alone decides, which is what window blur wants.
+    #[knuffel(child, unwrap(argument))]
+    pub detail: Option<FloatOrInt<0, 1>>,
 }
 
 /// Resolved background effect rule.
@@ -1111,6 +1120,7 @@ pub struct BackgroundEffect {
     pub inner_shadow: Option<f64>,
     pub chromatic: Option<f64>,
     pub lens_depth: Option<f64>,
+    pub detail: Option<f64>,
 }
 
 impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
@@ -1151,6 +1161,10 @@ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
 
         if let Some(x) = part.lens_depth {
             self.lens_depth = Some(x.0);
+        }
+
+        if let Some(x) = part.detail {
+            self.detail = Some(x.0);
         }
     }
 }

@@ -320,7 +320,8 @@ pub mod uniform_value {
         uniform.value = UniformValue::_4f(value[0], value[1], value[2], value[3]);
     }
 
-    /// Overwrite a pre-seeded `Matrix3x3` slot without reallocating the matrices `Vec` when possible.
+    /// Overwrite a pre-seeded `Matrix3x3` slot without reallocating the matrices `Vec` when
+    /// possible.
     pub fn set_mat3(uniform: &mut Uniform<'static>, mat: Mat3) {
         let cols = mat.to_cols_array();
         match &mut uniform.value {

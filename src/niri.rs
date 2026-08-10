@@ -1088,7 +1088,10 @@ impl State {
         let dirty = self.niri.layout.take_dirty_outputs();
         if !dirty.is_empty() {
             self.niri
-                .apply_redraw_attribution(RedrawAttribution::outputs(dirty, RedrawReason::Activate));
+                .apply_redraw_attribution(RedrawAttribution::outputs(
+                    dirty,
+                    RedrawReason::Activate,
+                ));
         }
     }
 
@@ -1489,19 +1492,22 @@ impl State {
             // focus targets keep an auditable all-outputs fallback.
             let dirty = self.niri.layout.take_dirty_outputs();
             if !dirty.is_empty() {
-                self.niri.apply_redraw_attribution(RedrawAttribution::outputs(
-                    dirty,
-                    RedrawReason::Activate,
-                ));
+                self.niri
+                    .apply_redraw_attribution(RedrawAttribution::outputs(
+                        dirty,
+                        RedrawReason::Activate,
+                    ));
             } else {
                 let output = match &self.niri.keyboard_focus {
-                    KeyboardFocus::Layout { surface: Some(surface) }
+                    KeyboardFocus::Layout {
+                        surface: Some(surface),
+                    }
                     | KeyboardFocus::LayerShell { surface } => {
                         self.niri.output_for_root(surface).cloned()
                     }
-                    KeyboardFocus::LockScreen { surface: Some(surface) } => {
-                        self.niri.output_for_root(surface).cloned()
-                    }
+                    KeyboardFocus::LockScreen {
+                        surface: Some(surface),
+                    } => self.niri.output_for_root(surface).cloned(),
                     KeyboardFocus::Layout { surface: None }
                     | KeyboardFocus::LockScreen { surface: None } => {
                         self.niri.layout.active_output().cloned()
@@ -3711,9 +3717,7 @@ impl Niri {
             .filter_map(|output| {
                 let geo = self.global_space.output_geometry(output)?;
                 let geo = Rectangle::new(geo.loc.to_f64(), geo.size.to_f64());
-                geo.intersection(rect)
-                    .is_some()
-                    .then(|| output.clone())
+                geo.intersection(rect).is_some().then(|| output.clone())
             })
             .collect();
         for output in overlapping {

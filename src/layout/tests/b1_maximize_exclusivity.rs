@@ -2,18 +2,18 @@
 //!
 //! These started as red baselines (B1) and turned green with the B2/B3 fixes:
 //! - B2 (`minimize_maximized_window_reveals_column_tiles_at_animation_start`,
-//!   `minimize_releases_only_target_window_visibility`): minimizing the maximize
-//!   target ends the exclusivity immediately (per-window, BI-1/BI-2).
-//! - B3 (`restore_minimized_window_keeps_other_windows_visible`): the restore must
-//!   not keep `suppress_floating_live_tiles` active.
+//!   `minimize_releases_only_target_window_visibility`): minimizing the maximize target ends the
+//!   exclusivity immediately (per-window, BI-1/BI-2).
+//! - B3 (`restore_minimized_window_keeps_other_windows_visible`): the restore must not keep
+//!   `suppress_floating_live_tiles` active.
 //! See `research-report.md` B-1/B-2/B-3 and `constraints.md` B-C2/BI-1/BI-2/BI-3:
 //!
-//! 1. Minimize of a maximized window: the other tiles of its column must rejoin the
-//!    visible set at animation *start*, not only when the maximize transition settles.
-//! 2. Exclusivity release is per-window: unrelated windows must not change visibility,
-//!    and releasing the target must not flip the whole column at once.
-//! 3. Restoring a minimized window must not leave the maximize exclusivity (and with
-//!    it `suppress_floating_live_tiles`) active.
+//! 1. Minimize of a maximized window: the other tiles of its column must rejoin the visible set at
+//!    animation *start*, not only when the maximize transition settles.
+//! 2. Exclusivity release is per-window: unrelated windows must not change visibility, and
+//!    releasing the target must not flip the whole column at once.
+//! 3. Restoring a minimized window must not leave the maximize exclusivity (and with it
+//!    `suppress_floating_live_tiles`) active.
 //!
 //! Both render-path (`tiles_with_render_positions`) and hit-test-path (`window_under`)
 //! visibility are asserted, per B-C2/BI-3: the two must never diverge.
@@ -36,8 +36,8 @@ fn sorted_visible_ids(layout: &Layout<TestWindow>) -> Vec<usize> {
     ids
 }
 
-/// 1. Minimize a maximized window whose column still has other live tiles → those tiles
-///    must be visible in the render set immediately (before any animation completes).
+/// 1. Minimize a maximized window whose column still has other live tiles → those tiles must be
+///    visible in the render set immediately (before any animation completes).
 ///
 /// Red today: `tiles_in_display_order` keeps `.take(1)` for the whole `CommittedSettling`
 /// phase, which is only cleared by `finish_maximize_transition_if_settled()` — the
@@ -113,22 +113,17 @@ fn minimize_maximized_window_reveals_column_tiles_at_animation_start() {
         .find(|(tile, _, _)| *tile.window().id() == 3)
         .map(|(tile, pos, _)| (pos, tile.tile_size()))
         .expect("window 3 tile");
-    let pos = Point::from((
-        tile_pos.x + tile_size.w / 2.,
-        tile_pos.y + tile_size.h / 2.,
-    ));
+    let pos = Point::from((tile_pos.x + tile_size.w / 2., tile_pos.y + tile_size.h / 2.));
     assert_eq!(
-        layout
-            .window_under(&output, pos)
-            .map(|(win, _)| *win.id()),
+        layout.window_under(&output, pos).map(|(win, _)| *win.id()),
         Some(3),
         "hit-test must reveal back tiles at minimize animation start"
     );
 }
 
-/// 2. Exclusivity must be released per-window: after the maximized window is
-///    minimized, only the target's own visibility may change; unrelated windows
-///    must keep the exact visibility they had before.
+/// 2. Exclusivity must be released per-window: after the maximized window is minimized, only the
+///    target's own visibility may change; unrelated windows must keep the exact visibility they had
+///    before.
 ///
 /// Red today (B-2): `.take(1)` is an all-or-nothing boolean — the moment the
 /// transition stops filtering, the *whole* column flips back, so the two unrelated
@@ -207,21 +202,16 @@ fn minimize_releases_only_target_window_visibility() {
         .find(|(tile, _, _)| *tile.window().id() == 2)
         .map(|(tile, pos, _)| (pos, tile.tile_size()))
         .expect("window 2 tile");
-    let pos = Point::from((
-        tile_pos.x + tile_size.w / 2.,
-        tile_pos.y + tile_size.h / 2.,
-    ));
+    let pos = Point::from((tile_pos.x + tile_size.w / 2., tile_pos.y + tile_size.h / 2.));
     assert_eq!(
-        layout
-            .window_under(&output, pos)
-            .map(|(win, _)| *win.id()),
+        layout.window_under(&output, pos).map(|(win, _)| *win.id()),
         Some(2),
         "hit-test must reveal the back tile after per-window release"
     );
 }
 
-/// 3. Restoring a minimized window must not leave the maximize exclusivity active:
-///    the restore path must not keep suppressing other windows' visibility.
+/// 3. Restoring a minimized window must not leave the maximize exclusivity active: the restore path
+///    must not keep suppressing other windows' visibility.
 ///
 /// Setup mirrors the user's report: a column `[1, 2]` where 2 is maximized and then
 /// minimized; restoring 2 from the Dock must not keep the maximize exclusivity (and
@@ -310,7 +300,11 @@ fn restore_minimized_window_keeps_other_windows_visible() {
         "restoring window 2 must not keep suppress_floating_live_tiles active; obs={obs:?}"
     );
     assert!(
-        !layout.active_workspace().unwrap().scrolling().maximize_transition_is_ongoing(),
+        !layout
+            .active_workspace()
+            .unwrap()
+            .scrolling()
+            .maximize_transition_is_ongoing(),
         "no maximize transition may remain after the restore"
     );
 
@@ -332,14 +326,9 @@ fn restore_minimized_window_keeps_other_windows_visible() {
         .find(|(tile, _, _)| *tile.window().id() == 2)
         .map(|(tile, pos, _)| (pos, tile.tile_size()))
         .expect("window 2 tile");
-    let pos = Point::from((
-        tile_pos.x + tile_size.w / 2.,
-        tile_pos.y + tile_size.h / 2.,
-    ));
+    let pos = Point::from((tile_pos.x + tile_size.w / 2., tile_pos.y + tile_size.h / 2.));
     assert_eq!(
-        layout
-            .window_under(&output, pos)
-            .map(|(win, _)| *win.id()),
+        layout.window_under(&output, pos).map(|(win, _)| *win.id()),
         Some(2),
         "window 2 must be hit-testable after restoring window 2"
     );

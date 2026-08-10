@@ -704,7 +704,8 @@ impl ForeignToplevelHandler for State {
         // (invalid_rectangle) before this handler runs. Treat them as programmer bugs.
         debug_assert!(width >= 0 && height >= 0);
 
-        let Some((mapped, window_output)) = self.niri.layout.find_window_and_output(&wl_surface) else {
+        let Some((mapped, window_output)) = self.niri.layout.find_window_and_output(&wl_surface)
+        else {
             return;
         };
         let mapped_id = mapped.id();
@@ -888,10 +889,12 @@ impl ExtWorkspaceHandler for State {
             // T-31: redraw only the outputs the workspace switch dirtied.
             let dirty = self.niri.layout.take_dirty_outputs();
             if !dirty.is_empty() {
-                self.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::outputs(
-                    dirty,
-                    crate::redraw_attribution::RedrawReason::Activate,
-                ));
+                self.niri.apply_redraw_attribution(
+                    crate::redraw_attribution::RedrawAttribution::outputs(
+                        dirty,
+                        crate::redraw_attribution::RedrawReason::Activate,
+                    ),
+                );
             }
         }
     }
@@ -1101,9 +1104,11 @@ impl XdgActivationHandler for State {
                 if token_data.user_data.get::<UrgentOnlyMarker>().is_some() {
                     mapped.set_urgent(true);
                     // Urgent state is consumed by taskbars across outputs.
-                    self.niri.apply_redraw_attribution(crate::redraw_attribution::RedrawAttribution::all(
-                        crate::redraw_attribution::RedrawFallbackReason::GlobalUi,
-                    ));
+                    self.niri.apply_redraw_attribution(
+                        crate::redraw_attribution::RedrawAttribution::all(
+                            crate::redraw_attribution::RedrawFallbackReason::GlobalUi,
+                        ),
+                    );
                 } else {
                     self.niri.layout.activate_window(&window);
                     self.niri.layer_shell_on_demand_focus = None;

@@ -5684,6 +5684,7 @@ impl<W: LayoutElement> Layout<W> {
                 inner_shadow: 0.10 * alpha,
                 chromatic: 0.0,
                 lens_depth: 0.03 * alpha,
+                detail: 0.,
             };
             let params = RenderParams {
                 geometry: rect,

@@ -394,9 +394,9 @@ mod tests {
 
                 // Central finite difference with a tight step.
                 let h = 1e-6;
-                let numerical =
-                    (spring.oscillate(t.as_secs_f64() + h) - spring.oscillate(t.as_secs_f64() - h))
-                        / (2. * h);
+                let numerical = (spring.oscillate(t.as_secs_f64() + h)
+                    - spring.oscillate(t.as_secs_f64() - h))
+                    / (2. * h);
 
                 assert!(
                     (analytical - numerical).abs() < 1e-6,
@@ -435,9 +435,6 @@ mod tests {
 
         // Underdamped: no clamp.
         let under = SpringParams::new(0.5, 300., 0.001);
-        assert_eq!(
-            Spring::clamp_initial_velocity(0., 100., huge, under),
-            huge
-        );
+        assert_eq!(Spring::clamp_initial_velocity(0., 100., huge, under), huge);
     }
 }

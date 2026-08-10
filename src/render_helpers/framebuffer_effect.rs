@@ -150,7 +150,7 @@ impl FramebufferEffectElement {
         transform: Transform,
         band_subrect: Option<(Vec2, Vec2)>,
         texture_scale: Vec2,
-    ) -> [Uniform<'static>; 16] {
+    ) -> [Uniform<'static>; 17] {
         let offset = crop.loc - (self.clip_geo.loc - self.geometry.loc);
         let offset = Vec2::new(offset.x as f32, offset.y as f32);
         let crop_size = Vec2::new(crop.size.w as f32, crop.size.h as f32);
@@ -205,6 +205,7 @@ impl FramebufferEffectElement {
             Uniform::new("inner_shadow", self.glass.inner_shadow),
             Uniform::new("chromatic", self.glass.chromatic),
             Uniform::new("lens_depth", self.glass.lens_depth),
+            Uniform::new("detail_floor", self.glass.detail),
         ]
     }
 }

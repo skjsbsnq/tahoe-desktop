@@ -134,6 +134,7 @@ impl Shaders {
                     UniformName::new("inner_shadow", UniformType::_1f),
                     UniformName::new("chromatic", UniformType::_1f),
                     UniformName::new("lens_depth", UniformType::_1f),
+                    UniformName::new("detail_floor", UniformType::_1f),
                 ],
             )
             .map_err(|err| {

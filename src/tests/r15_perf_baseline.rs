@@ -6,8 +6,9 @@
 //! R16–R19 decisions depend on.
 //!
 //! Go/no-go thresholds are locked in
-//! `docs/window-lifecycle-maintainability-remediation-2026-07-22/acceptance/R15-baseline-2026-07-24.md`
-//! *before* interpreting these samples; tests only collect reproducible data.
+//! `docs/window-lifecycle-maintainability-remediation-2026-07-22/acceptance/
+//! R15-baseline-2026-07-24.md` *before* interpreting these samples; tests only collect reproducible
+//! data.
 
 use std::time::Duration;
 

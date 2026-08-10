@@ -1631,7 +1631,11 @@ mod tests {
         let clamped = region(2, 90, 4, 10, 32);
 
         assert_eq!(
-            validate_regions_for_surface_geo(Some(surface_geo), &[inside.clone(), overflowing], &[]),
+            validate_regions_for_surface_geo(
+                Some(surface_geo),
+                &[inside.clone(), overflowing],
+                &[]
+            ),
             Some((vec![inside, clamped], false))
         );
     }

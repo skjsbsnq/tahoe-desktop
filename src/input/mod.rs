@@ -46,11 +46,11 @@ use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
-use crate::redraw_attribution::{RedrawAttribution, RedrawFallbackReason, RedrawReason};
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::lifecycle_command::{LifecycleAnchorInput, LifecycleCommand, LifecycleInvocationSource};
 use crate::niri::{CastTarget, PendingOnDemandFocusClearKind, PointerVisibility, State};
+use crate::redraw_attribution::{RedrawAttribution, RedrawFallbackReason, RedrawReason};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -287,15 +287,13 @@ impl State {
 
         // Do this last so that screenshot still gets it.
         if hide_hotkey_overlay && self.niri.hotkey_overlay.hide() {
-            self.niri.apply_redraw_attribution(RedrawAttribution::all(
-                RedrawFallbackReason::GlobalUi,
-            ));
+            self.niri
+                .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
         }
 
         if hide_exit_confirm_dialog && self.niri.exit_confirm_dialog.hide() {
-            self.niri.apply_redraw_attribution(RedrawAttribution::all(
-                RedrawFallbackReason::GlobalUi,
-            ));
+            self.niri
+                .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
         }
     }
 
@@ -1112,7 +1110,6 @@ impl State {
                     self.niri.layout.move_left();
                     self.maybe_warp_cursor_to_focus();
                 }
-
             }
             Action::MoveColumnRight => {
                 if self.niri.screenshot_ui.is_open() {
@@ -1121,7 +1118,6 @@ impl State {
                     self.niri.layout.move_right();
                     self.maybe_warp_cursor_to_focus();
                 }
-
             }
             Action::MoveColumnToFirst => {
                 self.niri.layout.move_column_to_first();
@@ -1146,7 +1142,6 @@ impl State {
                     self.niri.layout.move_left();
                     self.maybe_warp_cursor_to_focus();
                 }
-
             }
             Action::MoveColumnRightOrToMonitorRight => {
                 if self.niri.screenshot_ui.is_open() {
@@ -1163,7 +1158,6 @@ impl State {
                     self.niri.layout.move_right();
                     self.maybe_warp_cursor_to_focus();
                 }
-
             }
             Action::MoveWindowDown => {
                 if self.niri.screenshot_ui.is_open() {
@@ -1172,7 +1166,6 @@ impl State {
                     self.niri.layout.move_down();
                     self.maybe_warp_cursor_to_focus();
                 }
-
             }
             Action::MoveWindowUp => {
                 if self.niri.screenshot_ui.is_open() {
@@ -1181,7 +1174,6 @@ impl State {
                     self.niri.layout.move_up();
                     self.maybe_warp_cursor_to_focus();
                 }
-
             }
             Action::MoveWindowDownOrToWorkspaceDown => {
                 if self.niri.screenshot_ui.is_open() {
@@ -1300,7 +1292,6 @@ impl State {
                     self.maybe_warp_cursor_to_focus();
                 }
                 self.niri.layer_shell_on_demand_focus = None;
-
             }
             Action::FocusWindowOrMonitorDown => {
                 if let Some(output) = self.niri.output_down() {
@@ -1316,7 +1307,6 @@ impl State {
                     self.maybe_warp_cursor_to_focus();
                 }
                 self.niri.layer_shell_on_demand_focus = None;
-
             }
             Action::FocusColumnOrMonitorLeft => {
                 if let Some(output) = self.niri.output_left() {
@@ -1332,7 +1322,6 @@ impl State {
                     self.maybe_warp_cursor_to_focus();
                 }
                 self.niri.layer_shell_on_demand_focus = None;
-
             }
             Action::FocusColumnOrMonitorRight => {
                 if let Some(output) = self.niri.output_right() {
@@ -1348,7 +1337,6 @@ impl State {
                     self.maybe_warp_cursor_to_focus();
                 }
                 self.niri.layer_shell_on_demand_focus = None;
-
             }
             Action::FocusWindowDown => {
                 self.niri.layout.focus_down();
@@ -1452,7 +1440,6 @@ impl State {
                         self.niri.layout.move_to_workspace(None, index, activate);
                         self.maybe_warp_cursor_to_focus();
                     }
-
                 }
             }
             Action::MoveWindowToWorkspaceById {
@@ -1506,7 +1493,6 @@ impl State {
                                 self.maybe_warp_cursor_to_focus();
                             }
                         }
-
                     }
                 }
             }
@@ -1541,7 +1527,6 @@ impl State {
                             self.maybe_warp_cursor_to_focus();
                         }
                     }
-
                 }
             }
             Action::MoveColumnToIndex(idx) => {
@@ -1604,7 +1589,6 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                     self.niri.layer_shell_on_demand_focus = None;
-
                 }
             }
             Action::FocusWorkspacePrevious => {
@@ -2970,7 +2954,8 @@ impl State {
                         .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
 
                     // T-31: the grab and cursor live on the output under the pointer.
-                    self.niri.queue_redraw_output_under(pointer.current_location());
+                    self.niri
+                        .queue_redraw_output_under(pointer.current_location());
                     return;
                 }
             }
@@ -3005,7 +2990,8 @@ impl State {
                         .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
 
                     // T-31: the grab and cursor live on the output under the pointer.
-                    self.niri.queue_redraw_output_under(pointer.current_location());
+                    self.niri
+                        .queue_redraw_output_under(pointer.current_location());
 
                     // Don't activate the window under the cursor to avoid unnecessary
                     // scrolling when e.g. Mod+MMB clicking on a partially off-screen window.
@@ -3092,9 +3078,9 @@ impl State {
                                     self.niri.layout.reset_window_height(Some(&window));
                                 }
                                 // T-31: drain layout dirty (activation + resize) and the cursor.
+                                self.niri.apply_layout_dirty_redraw(RedrawReason::Activate);
                                 self.niri
-                                    .apply_layout_dirty_redraw(RedrawReason::Activate);
-                                self.niri.queue_redraw_output_under(pointer.current_location());
+                                    .queue_redraw_output_under(pointer.current_location());
                                 return;
                             }
                         }
@@ -3132,7 +3118,8 @@ impl State {
                 } else {
                     // T-31: drain layout dirty (window output + previous active) plus cursor.
                     self.niri.apply_layout_dirty_redraw(RedrawReason::Activate);
-                    self.niri.queue_redraw_output_under(pointer.current_location());
+                    self.niri
+                        .queue_redraw_output_under(pointer.current_location());
                 }
             } else if let Some((output, ws)) = is_overview_open
                 .then(|| self.niri.workspace_under_cursor(false))
@@ -3529,7 +3516,8 @@ impl State {
 
                 if redraw {
                     // T-31: swipe gestures affect the output under the pointer.
-                    self.niri.queue_redraw_output_under(pointer.current_location());
+                    self.niri
+                        .queue_redraw_output_under(pointer.current_location());
                 }
 
                 return;
@@ -3552,7 +3540,8 @@ impl State {
                 }
                 if redraw {
                     // T-31: swipe gestures affect the output under the pointer.
-                    self.niri.queue_redraw_output_under(pointer.current_location());
+                    self.niri
+                        .queue_redraw_output_under(pointer.current_location());
                 }
             }
 
@@ -4043,9 +4032,8 @@ impl State {
         } else if event.fingers() == 4 {
             self.niri.layout.overview_gesture_begin();
             // Overview gesture spans every output.
-            self.niri.apply_redraw_attribution(RedrawAttribution::all(
-                RedrawFallbackReason::GlobalUi,
-            ));
+            self.niri
+                .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
 
             // We handled this event.
             return;
@@ -4211,9 +4199,8 @@ impl State {
         let res = self.niri.layout.overview_gesture_end();
         if res {
             // Overview gesture spans every output.
-            self.niri.apply_redraw_attribution(RedrawAttribution::all(
-                RedrawFallbackReason::GlobalUi,
-            ));
+            self.niri
+                .apply_redraw_attribution(RedrawAttribution::all(RedrawFallbackReason::GlobalUi));
             handled = true;
         }
 
@@ -5477,10 +5464,7 @@ mod tests {
     fn constraint_origin_prefers_live_over_cached() {
         let cached = Point::from((10.0_f64, 20.0));
         let live = Point::from((50.0_f64, 60.0));
-        assert_eq!(
-            resolve_constraint_surface_origin(cached, Some(live)),
-            live
-        );
+        assert_eq!(resolve_constraint_surface_origin(cached, Some(live)), live);
         assert_eq!(resolve_constraint_surface_origin(cached, None), cached);
     }
 

@@ -1,11 +1,11 @@
 //! Maximize visual transition FSM (scrolling exclusivity + settling).
 //!
 //! Ownership:
-//! - This module owns the **visual** maximize transition phase only: live-tile exclusivity
-//!   while entering maximized, timeout fallback that temporarily releases exclusivity, and
-//!   settle/cancel completion.
-//! - Column/Mapped still own pending and committed maximized (protocol sizing). This FSM does
-//!   not invent a second sizing model.
+//! - This module owns the **visual** maximize transition phase only: live-tile exclusivity while
+//!   entering maximized, timeout fallback that temporarily releases exclusivity, and settle/cancel
+//!   completion.
+//! - Column/Mapped still own pending and committed maximized (protocol sizing). This FSM does not
+//!   invent a second sizing model.
 //!
 //! Phases intentionally exclude the old bool pair `committed && timed_out` (ambiguous under the
 //! previous `MaximizeTransition { committed, timed_out }` record). Cancelled and Finished clear

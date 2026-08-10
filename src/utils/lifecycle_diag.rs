@@ -375,7 +375,10 @@ pub fn maybe_log_periodic() {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
     // Monotonic clock so a wall-clock jump can never suppress the log.
-    let now_ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let now_ms = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
     let last_ms = LAST_LOG_MS.load(Ordering::Relaxed);
     if now_ms.saturating_sub(last_ms) < 5_000 && last_ms != 0 {
         return;

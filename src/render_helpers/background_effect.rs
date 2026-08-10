@@ -56,6 +56,11 @@ pub struct GlassOptions {
     pub inner_shadow: f32,
     pub chromatic: f32,
     pub lens_depth: f32,
+    /// Floor for the shader's size-driven detail factor, in [0, 1].
+    ///
+    /// 0 leaves the size fade in sole control (window blur); 1 keeps full
+    /// detail no matter how large the surface is.
+    pub detail: f32,
 }
 
 impl Default for GlassOptions {
@@ -69,6 +74,7 @@ impl Default for GlassOptions {
             inner_shadow: 0.,
             chromatic: 0.,
             lens_depth: 0.,
+            detail: 0.,
         }
     }
 }
@@ -89,6 +95,7 @@ impl GlassOptions {
             inner_shadow: effect.inner_shadow.unwrap_or(0.) as f32,
             chromatic: effect.chromatic.unwrap_or(0.) as f32,
             lens_depth: effect.lens_depth.unwrap_or(0.) as f32,
+            detail: effect.detail.unwrap_or(0.).clamp(0., 1.) as f32,
         }
     }
 

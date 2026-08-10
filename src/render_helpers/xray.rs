@@ -274,7 +274,7 @@ impl Xray {
 }
 
 impl XrayElement {
-    fn compute_uniforms(&self, texture_scale: Vec2) -> [Uniform<'static>; 16] {
+    fn compute_uniforms(&self, texture_scale: Vec2) -> [Uniform<'static>; 17] {
         // T10: the retained capacity texture can be larger than the active
         // region; render_texture_from_to normalizes v_coords by the capacity
         // size, so map them back into the active region first (see
@@ -297,6 +297,7 @@ impl XrayElement {
             Uniform::new("inner_shadow", self.glass.inner_shadow),
             Uniform::new("chromatic", self.glass.chromatic),
             Uniform::new("lens_depth", self.glass.lens_depth),
+            Uniform::new("detail_floor", self.glass.detail),
         ]
     }
 

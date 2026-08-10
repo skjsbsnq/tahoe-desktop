@@ -1,16 +1,16 @@
 //! Workspace expanded-mode orchestration (fullscreen / maximize / return placement).
 //!
 //! Ownership:
-//! - This module owns **typed return placement** and **pure orchestration decisions** for
-//!   entering and leaving maximized/fullscreen, including floating ↔ scrolling migration
-//!   when the window must return to floating.
-//! - Column still owns layout size calculation (`is_pending_fullscreen` /
-//!   `is_pending_maximized` + tile sizes).
+//! - This module owns **typed return placement** and **pure orchestration decisions** for entering
+//!   and leaving maximized/fullscreen, including floating ↔ scrolling migration when the window
+//!   must return to floating.
+//! - Column still owns layout size calculation (`is_pending_fullscreen` / `is_pending_maximized` +
+//!   tile sizes).
 //! - Mapped / window still owns protocol pending and committed sizing mode.
-//! - Workspace is the sole production executor of these decisions (public
-//!   `set_fullscreen` / `set_maximized` / top-snap / interactive-move entry points).
-//! - R08 `MaximizeVisualFsm` remains the visual exclusivity owner; this module does not
-//!   duplicate pending/committed visual phases.
+//! - Workspace is the sole production executor of these decisions (public `set_fullscreen` /
+//!   `set_maximized` / top-snap / interactive-move entry points).
+//! - R08 `MaximizeVisualFsm` remains the visual exclusivity owner; this module does not duplicate
+//!   pending/committed visual phases.
 //!
 //! Desired mode (request), committed mode (protocol), and visual transition (R08 FSM) are
 //! intentionally separate. Fullscreen and maximized remain non-exclusive at the column

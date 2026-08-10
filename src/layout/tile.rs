@@ -515,9 +515,8 @@ impl<W: LayoutElement> Tile<W> {
                     let fullscreen_progress = (fullscreen_from != fullscreen_to).then(|| {
                         anim.restarted(fullscreen_from, fullscreen_to, fullscreen_progress_vel)
                     });
-                    let expanded_progress = (expanded_from != expanded_to).then(|| {
-                        anim.restarted(expanded_from, expanded_to, expanded_progress_vel)
-                    });
+                    let expanded_progress = (expanded_from != expanded_to)
+                        .then(|| anim.restarted(expanded_from, expanded_to, expanded_progress_vel));
 
                     self.resize_animation = Some(ResizeAnimation {
                         anim,

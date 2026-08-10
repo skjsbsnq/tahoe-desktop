@@ -2436,6 +2436,9 @@ mod tests {
                             lens_depth: Some(
                                 0.0,
                             ),
+                            detail: Some(
+                                1.0,
+                            ),
                         },
                         shadow: Shadow {
                             on: false,
@@ -2509,6 +2512,9 @@ mod tests {
                             ),
                             lens_depth: Some(
                                 0.006,
+                            ),
+                            detail: Some(
+                                1.0,
                             ),
                         },
                         shadow: Shadow {
@@ -2584,6 +2590,9 @@ mod tests {
                             lens_depth: Some(
                                 0.003,
                             ),
+                            detail: Some(
+                                1.0,
+                            ),
                         },
                         shadow: Shadow {
                             on: true,
@@ -2657,6 +2666,9 @@ mod tests {
                             ),
                             lens_depth: Some(
                                 0.0,
+                            ),
+                            detail: Some(
+                                1.0,
                             ),
                         },
                         shadow: Shadow {
@@ -2732,6 +2744,9 @@ mod tests {
                             lens_depth: Some(
                                 0.0,
                             ),
+                            detail: Some(
+                                1.0,
+                            ),
                         },
                         shadow: Shadow {
                             on: true,
@@ -2806,6 +2821,9 @@ mod tests {
                             lens_depth: Some(
                                 0.01,
                             ),
+                            detail: Some(
+                                1.0,
+                            ),
                         },
                         shadow: Shadow {
                             on: true,
@@ -2879,6 +2897,9 @@ mod tests {
                             ),
                             lens_depth: Some(
                                 0.0,
+                            ),
+                            detail: Some(
+                                1.0,
                             ),
                         },
                         shadow: Shadow {
@@ -3155,6 +3176,7 @@ mod tests {
                         inner_shadow: None,
                         chromatic: None,
                         lens_depth: None,
+                        detail: None,
                     },
                     popups: PopupsRule {
                         opacity: None,
@@ -3172,6 +3194,7 @@ mod tests {
                             inner_shadow: None,
                             chromatic: None,
                             lens_depth: None,
+                            detail: None,
                         },
                     },
                 },
@@ -3222,6 +3245,7 @@ mod tests {
                         inner_shadow: None,
                         chromatic: None,
                         lens_depth: None,
+                        detail: None,
                     },
                     popups: PopupsRule {
                         opacity: None,
@@ -3239,6 +3263,7 @@ mod tests {
                             inner_shadow: None,
                             chromatic: None,
                             lens_depth: None,
+                            detail: None,
                         },
                     },
                     animations: None,

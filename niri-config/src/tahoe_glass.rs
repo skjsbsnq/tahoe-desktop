@@ -106,6 +106,8 @@ pub struct TahoeGlassMaterialRule {
     pub chromatic: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub lens_depth: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub detail: Option<FloatOrInt<0, 1>>,
     #[knuffel(child, default)]
     pub shadow: ShadowRule,
 }
@@ -244,6 +246,12 @@ impl Default for TahoeGlassMaterial {
                 inner_shadow: Some(0.),
                 chromatic: Some(0.),
                 lens_depth: Some(0.),
+                // Every Tahoe material dresses a shell surface, where the full
+                // material is the whole point — the Dock and the Launchpad
+                // backdrop are long or fullscreen and would otherwise fall to
+                // the cheap path and read as flat translucency. Window blur
+                // leaves this unset and keeps the size fade.
+                detail: Some(1.),
                 ..Default::default()
             },
             shadow: Shadow {
@@ -300,6 +308,7 @@ impl MergeWith<TahoeGlassMaterialRule> for TahoeGlassMaterial {
             inner_shadow: part.inner_shadow,
             chromatic: part.chromatic,
             lens_depth: part.lens_depth,
+            detail: part.detail,
         });
         self.shadow.merge_with(&part.shadow);
     }

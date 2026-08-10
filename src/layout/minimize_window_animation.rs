@@ -2,18 +2,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
+use niri_config::BlockOutFrom;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::element::{Kind, RenderElement};
 #[cfg(test)]
 use smithay::backend::renderer::element::Element;
+use smithay::backend::renderer::element::{Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform, UniformValue};
 use smithay::backend::renderer::Texture;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Transform};
-
-use niri_config::BlockOutFrom;
 
 use crate::animation::Animation;
 use crate::layout::coords::{OutputLocalPoint, OutputLocalRectF};
