@@ -2405,10 +2405,10 @@ mod tests {
                                 0.003,
                             ),
                             saturation: Some(
-                                1.04,
+                                1.25,
                             ),
                             contrast: Some(
-                                1.03,
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2419,13 +2419,13 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.07,
+                                0.1,
                             ),
                             edge_highlight: Some(
-                                0.05,
+                                0.25,
                             ),
                             refraction: Some(
-                                0.002,
+                                0.006,
                             ),
                             inner_shadow: Some(
                                 0.0,
@@ -2479,10 +2479,10 @@ mod tests {
                                 0.005,
                             ),
                             saturation: Some(
-                                1.1,
+                                1.4,
                             ),
                             contrast: Some(
-                                1.06,
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2493,13 +2493,13 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.06,
+                                0.14,
                             ),
                             edge_highlight: Some(
-                                0.18,
+                                0.35,
                             ),
                             refraction: Some(
-                                0.007,
+                                0.016,
                             ),
                             inner_shadow: Some(
                                 0.07,
@@ -2553,10 +2553,10 @@ mod tests {
                                 0.005,
                             ),
                             saturation: Some(
-                                1.08,
+                                1.35,
                             ),
                             contrast: Some(
-                                1.08,
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2567,13 +2567,13 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.085,
+                                0.12,
                             ),
                             edge_highlight: Some(
-                                0.15,
+                                0.45,
                             ),
                             refraction: Some(
-                                0.004,
+                                0.012,
                             ),
                             inner_shadow: Some(
                                 0.055,
@@ -2627,10 +2627,10 @@ mod tests {
                                 0.004,
                             ),
                             saturation: Some(
-                                1.08,
+                                1.4,
                             ),
                             contrast: Some(
-                                1.11,
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2641,13 +2641,13 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.11,
+                                0.1,
                             ),
                             edge_highlight: Some(
-                                0.26,
+                                0.55,
                             ),
                             refraction: Some(
-                                0.004,
+                                0.014,
                             ),
                             inner_shadow: Some(
                                 0.1,
@@ -2701,10 +2701,10 @@ mod tests {
                                 0.005,
                             ),
                             saturation: Some(
-                                1.1,
+                                1.35,
                             ),
                             contrast: Some(
-                                1.1,
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2715,13 +2715,13 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.105,
+                                0.12,
                             ),
                             edge_highlight: Some(
-                                0.14,
+                                0.45,
                             ),
                             refraction: Some(
-                                0.004,
+                                0.012,
                             ),
                             inner_shadow: Some(
                                 0.06,
@@ -2775,10 +2775,10 @@ mod tests {
                                 0.005,
                             ),
                             saturation: Some(
-                                1.12,
+                                1.0,
                             ),
                             contrast: Some(
-                                1.05,
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2789,13 +2789,13 @@ mod tests {
                                 },
                             ),
                             tint_amount: Some(
-                                0.052,
+                                0.1,
                             ),
                             edge_highlight: Some(
-                                0.32,
+                                0.0,
                             ),
                             refraction: Some(
-                                0.013,
+                                0.0,
                             ),
                             inner_shadow: Some(
                                 0.07,
@@ -2849,10 +2849,10 @@ mod tests {
                                 0.005,
                             ),
                             saturation: Some(
-                                1.09,
+                                1.4,
                             ),
                             contrast: Some(
-                                1.1,
+                                1.0,
                             ),
                             tint_color: Some(
                                 Color {
@@ -2866,10 +2866,10 @@ mod tests {
                                 0.1,
                             ),
                             edge_highlight: Some(
-                                0.24,
+                                0.5,
                             ),
                             refraction: Some(
-                                0.005,
+                                0.014,
                             ),
                             inner_shadow: Some(
                                 0.09,

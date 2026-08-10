@@ -1,22 +1,8 @@
 {
   "schema_version": 1,
   "default_blur_kernel_name": "default",
-  "material_names": [
-    "panel",
-    "pill",
-    "launcher",
-    "dock",
-    "menu",
-    "toast",
-    "backdrop"
-  ],
-  "settings_fields": [
-    "edge-highlight",
-    "refraction",
-    "inner-shadow",
-    "chromatic",
-    "lens-depth"
-  ],
+  "material_names": ["panel", "pill", "launcher", "dock", "menu", "toast", "backdrop"],
+  "settings_fields": ["edge-highlight", "refraction", "inner-shadow", "chromatic", "lens-depth"],
   "blur": {
     "off": false,
     "passes": 3,

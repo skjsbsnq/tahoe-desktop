@@ -337,7 +337,7 @@ mod tests {
         );
         assert_eq!(
             config.material("launcher").background_effect.refraction,
-            Some(0.004)
+            Some(0.012)
         );
         assert_eq!(
             config.material("menu").background_effect.chromatic,
