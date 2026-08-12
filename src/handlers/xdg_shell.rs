@@ -58,6 +58,7 @@ impl XdgShellHandler for State {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface().clone();
         let unmapped = Unmapped::new(Window::new_wayland_window(surface));
+        crate::utils::lifecycle_diag::note_unmapped_inserted();
         let existing = self.niri.unmapped_windows.insert(wl_surface, unmapped);
         assert!(existing.is_none());
     }
@@ -869,6 +870,7 @@ impl XdgShellHandler for State {
             .remove(surface.wl_surface())
             .is_some()
         {
+            crate::utils::lifecycle_diag::note_unmapped_removed();
             // An unmapped toplevel got destroyed.
             return;
         }
@@ -888,6 +890,7 @@ impl XdgShellHandler for State {
         let output = output.cloned();
 
         let id = mapped.id();
+        crate::utils::lifecycle_diag::note_window_closed();
         self.niri
             .stop_casts_for_target(CastTarget::Window { id: id.get() });
 

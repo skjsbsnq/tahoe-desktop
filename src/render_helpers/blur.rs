@@ -78,6 +78,11 @@ const SHRINK_HYSTERESIS_PREPARES: u8 = 8;
 static RETAINED_BLUR_TEXTURE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// D1 diagnostics: current retained blur texture bytes (live budget counter).
+pub fn retained_blur_bytes() -> u64 {
+    RETAINED_BLUR_TEXTURE_BYTES.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
 #[cfg(test)]
 pub(crate) fn retained_blur_texture_bytes() -> usize {
     RETAINED_BLUR_TEXTURE_BYTES.load(std::sync::atomic::Ordering::Relaxed)

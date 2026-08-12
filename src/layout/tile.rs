@@ -1819,6 +1819,13 @@ impl<W: LayoutElement> Tile<W> {
         self.unmap_snapshot.take()
     }
 
+    /// D1 diagnostics: whether this tile currently retains an unmap snapshot
+    /// (a full-size render snapshot that must be taken by the closing path or
+    /// dropped with the tile).
+    pub fn has_unmap_snapshot(&self) -> bool {
+        self.unmap_snapshot.is_some()
+    }
+
     pub fn border(&self) -> &FocusRing {
         &self.border
     }

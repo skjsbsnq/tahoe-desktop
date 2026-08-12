@@ -107,6 +107,12 @@ pub fn reset() {
     REDRAW_FALLBACK_GLOBAL_UI.store(0, Ordering::Relaxed);
     REDRAW_SKIP_UNMAPPED.store(0, Ordering::Relaxed);
     THUMBNAIL_RENDER.store(0, Ordering::Relaxed);
+    WINDOW_CLOSED.store(0, Ordering::Relaxed);
+    UNMAPPED_INSERTED.store(0, Ordering::Relaxed);
+    UNMAPPED_REMOVED.store(0, Ordering::Relaxed);
+    DMABUF_HOOK_ADDED.store(0, Ordering::Relaxed);
+    DMABUF_HOOK_REMOVED.store(0, Ordering::Relaxed);
+    SURFACE_DESTROYED.store(0, Ordering::Relaxed);
 }
 
 pub fn note_queue_redraw_all() {
@@ -276,10 +282,65 @@ pub fn note_redraw_skip_unmapped() {
 // (cache hits and rejected/skipped requests are not counted).
 static THUMBNAIL_RENDER: AtomicU64 = AtomicU64::new(0);
 
+// D1: window-close VRAM leak observation. These counters track lifecycle events
+// that could retain a window's GPU texture after close. Live counts of the
+// maps/lanes are logged separately by `Niri::maybe_log_vram_diag`; these
+// counters give the cumulative deltas between the 5s samples.
+static WINDOW_CLOSED: AtomicU64 = AtomicU64::new(0);
+static UNMAPPED_INSERTED: AtomicU64 = AtomicU64::new(0);
+static UNMAPPED_REMOVED: AtomicU64 = AtomicU64::new(0);
+static DMABUF_HOOK_ADDED: AtomicU64 = AtomicU64::new(0);
+static DMABUF_HOOK_REMOVED: AtomicU64 = AtomicU64::new(0);
+static SURFACE_DESTROYED: AtomicU64 = AtomicU64::new(0);
+
 /// Record a real thumbnail GPU capture (T05).
 pub fn note_thumbnail_render() {
     if is_enabled() {
         THUMBNAIL_RENDER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a mapped window entering the close path (toplevel_destroyed or the
+/// on-commit unmap branch).
+pub fn note_window_closed() {
+    if is_enabled() {
+        WINDOW_CLOSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record an entry inserted into `Niri::unmapped_windows`.
+pub fn note_unmapped_inserted() {
+    if is_enabled() {
+        UNMAPPED_INSERTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record an entry removed from `Niri::unmapped_windows`.
+pub fn note_unmapped_removed() {
+    if is_enabled() {
+        UNMAPPED_REMOVED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a default dmabuf pre-commit hook added for a surface.
+pub fn note_dmabuf_hook_added() {
+    if is_enabled() {
+        DMABUF_HOOK_ADDED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a default dmabuf pre-commit hook removed for a surface.
+pub fn note_dmabuf_hook_removed() {
+    if is_enabled() {
+        DMABUF_HOOK_REMOVED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a `WlSurface::destroyed` callback (the point where smithay frees the
+/// per-surface imported textures).
+pub fn note_surface_destroyed() {
+    if is_enabled() {
+        SURFACE_DESTROYED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -312,6 +373,12 @@ pub struct Snapshot {
     pub redraw_fallback_global_ui: u64,
     pub redraw_skip_unmapped: u64,
     pub thumbnail_render: u64,
+    pub window_closed: u64,
+    pub unmapped_inserted: u64,
+    pub unmapped_removed: u64,
+    pub dmabuf_hook_added: u64,
+    pub dmabuf_hook_removed: u64,
+    pub surface_destroyed: u64,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -343,6 +410,12 @@ pub fn snapshot() -> Snapshot {
         redraw_fallback_global_ui: REDRAW_FALLBACK_GLOBAL_UI.load(Ordering::Relaxed),
         redraw_skip_unmapped: REDRAW_SKIP_UNMAPPED.load(Ordering::Relaxed),
         thumbnail_render: THUMBNAIL_RENDER.load(Ordering::Relaxed),
+        window_closed: WINDOW_CLOSED.load(Ordering::Relaxed),
+        unmapped_inserted: UNMAPPED_INSERTED.load(Ordering::Relaxed),
+        unmapped_removed: UNMAPPED_REMOVED.load(Ordering::Relaxed),
+        dmabuf_hook_added: DMABUF_HOOK_ADDED.load(Ordering::Relaxed),
+        dmabuf_hook_removed: DMABUF_HOOK_REMOVED.load(Ordering::Relaxed),
+        surface_destroyed: SURFACE_DESTROYED.load(Ordering::Relaxed),
     }
 }
 
@@ -396,7 +469,8 @@ pub fn maybe_log_periodic() {
         info!(
             "lifecycle-diag 5s delta: redraw_all +{} redraw +{} tahoe_capture +{} \
              fb_capture +{} blur +{} blur_alloc +{} ({} bytes) blur_reuse +{} \
-             blur_budget_fail +{} blur_fallback +{} blur_gpu_error +{}",
+             blur_budget_fail +{} blur_fallback +{} blur_gpu_error +{} \
+             window_closed +{} unmapped +{}/-{} dmabuf_hook +{}/-{} surface_destroyed +{}",
             current
                 .queue_redraw_all
                 .saturating_sub(prev.queue_redraw_all),
@@ -422,6 +496,20 @@ pub fn maybe_log_periodic() {
                 .saturating_sub(prev.blur_budget_reservation_failures),
             current.blur_fallbacks.saturating_sub(prev.blur_fallbacks),
             current.blur_gpu_errors.saturating_sub(prev.blur_gpu_errors),
+            current.window_closed.saturating_sub(prev.window_closed),
+            current
+                .unmapped_inserted
+                .saturating_sub(prev.unmapped_inserted),
+            current.unmapped_removed.saturating_sub(prev.unmapped_removed),
+            current
+                .dmabuf_hook_added
+                .saturating_sub(prev.dmabuf_hook_added),
+            current
+                .dmabuf_hook_removed
+                .saturating_sub(prev.dmabuf_hook_removed),
+            current
+                .surface_destroyed
+                .saturating_sub(prev.surface_destroyed),
         );
     }
     *guard = Some(current);
@@ -474,6 +562,12 @@ mod tests {
             note_blur_fallback();
             note_blur_gpu_error();
             note_redraw_skip_unmapped();
+            note_window_closed();
+            note_unmapped_inserted();
+            note_unmapped_removed();
+            note_dmabuf_hook_added();
+            note_dmabuf_hook_removed();
+            note_surface_destroyed();
 
             let s = snapshot();
             assert_eq!(s.queue_redraw_all, 1);
@@ -492,6 +586,12 @@ mod tests {
             assert_eq!(s.blur_fallbacks, 1);
             assert_eq!(s.blur_gpu_errors, 1);
             assert_eq!(s.redraw_skip_unmapped, 1);
+            assert_eq!(s.window_closed, 1);
+            assert_eq!(s.unmapped_inserted, 1);
+            assert_eq!(s.unmapped_removed, 1);
+            assert_eq!(s.dmabuf_hook_added, 1);
+            assert_eq!(s.dmabuf_hook_removed, 1);
+            assert_eq!(s.surface_destroyed, 1);
         });
     }
 

@@ -365,6 +365,13 @@ impl<W: LayoutElement> Workspace<W> {
         self.scale
     }
 
+    /// D1 diagnostics: (closing lane entries, tiles retaining an unmap snapshot).
+    pub fn diag_live_counts(&self) -> (usize, usize) {
+        let (sc, st) = self.scrolling.diag_live_counts();
+        let (fc, ft) = self.floating.diag_live_counts();
+        (sc + fc, st + ft)
+    }
+
     pub fn advance_animations(&mut self) {
         self.scrolling.advance_animations();
         self.floating.advance_animations();

@@ -485,6 +485,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
+    /// D1 diagnostics: (closing lane entries, tiles retaining an unmap snapshot).
+    pub fn diag_live_counts(&self) -> (usize, usize) {
+        (
+            self.closing.len(),
+            self.columns
+                .iter()
+                .flat_map(|col| &col.tiles)
+                .filter(|tile| tile.has_unmap_snapshot())
+                .count(),
+        )
+    }
+
     pub fn advance_animations(&mut self) {
         if let ViewOffset::Animation(anim) = &self.view_offset {
             if anim.is_done() {

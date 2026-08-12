@@ -2942,6 +2942,22 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// D1 diagnostics: (closing lane entries, tiles retaining an unmap snapshot)
+    /// across every workspace on every monitor.
+    pub fn diag_live_counts(&self) -> (usize, usize) {
+        match &self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors
+                .iter()
+                .flat_map(|mon| &mon.workspaces)
+                .map(Workspace::diag_live_counts)
+                .fold((0, 0), |(c, t), (wc, wt)| (c + wc, t + wt)),
+            MonitorSet::NoOutputs { workspaces, .. } => workspaces
+                .iter()
+                .map(Workspace::diag_live_counts)
+                .fold((0, 0), |(c, t), (wc, wt)| (c + wc, t + wt)),
+        }
+    }
+
     pub fn advance_animations(&mut self) {
         let _span = tracy_client::span!("Layout::advance_animations");
 

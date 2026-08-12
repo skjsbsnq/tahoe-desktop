@@ -95,6 +95,7 @@ impl CompositorHandler for State {
             if let Entry::Occupied(entry) = self.niri.unmapped_windows.entry(surface.clone()) {
                 if is_mapped(surface) {
                     // The toplevel got mapped.
+                    crate::utils::lifecycle_diag::note_unmapped_removed();
                     let Unmapped {
                         window,
                         state,
@@ -286,6 +287,8 @@ impl CompositorHandler for State {
                 // Must start the close animation before window.on_commit().
                 let transaction = Transaction::new();
                 if !is_mapped {
+                    crate::utils::lifecycle_diag::note_window_closed();
+
                     // Store the unmap snapshot before on_commit() so the close
                     // animation has a buffer to render from. The toplevel-destroyed
                     // path (xdg_shell.rs) already stores; this on-commit unmap path
@@ -335,6 +338,7 @@ impl CompositorHandler for State {
                     // Newly-unmapped toplevels must perform the initial commit-configure sequence
                     // afresh.
                     let unmapped = Unmapped::new(window);
+                    crate::utils::lifecycle_diag::note_unmapped_inserted();
                     self.niri.unmapped_windows.insert(surface.clone(), unmapped);
 
                     if let Some(output) = output {
@@ -505,6 +509,8 @@ impl CompositorHandler for State {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        crate::utils::lifecycle_diag::note_surface_destroyed();
+
         // A destroyed surface changes the window's rendered content even
         // without any following commit: advance the thumbnail content epoch
         // before the root-surface cache below drops the lookup key.
@@ -541,6 +547,7 @@ impl CompositorHandler for State {
         // So, this may come out empty, and then the toplevel pre-commit hook will be removed in the
         // subsequent toplevel_destroyed() call.
         if let Some(hook) = self.niri.dmabuf_pre_commit_hook.remove(surface) {
+            crate::utils::lifecycle_diag::note_dmabuf_hook_removed();
             remove_pre_commit_hook(surface, &hook);
         }
     }
@@ -605,12 +612,15 @@ impl State {
         let s = surface.clone();
         if let Some(prev) = self.niri.dmabuf_pre_commit_hook.insert(s, hook) {
             error!("tried to add dmabuf pre-commit hook when there was already one");
+            crate::utils::lifecycle_diag::note_dmabuf_hook_removed();
             remove_pre_commit_hook(surface, &prev);
         }
+        crate::utils::lifecycle_diag::note_dmabuf_hook_added();
     }
 
     pub fn remove_default_dmabuf_pre_commit_hook(&mut self, surface: &WlSurface) {
         if let Some(hook) = self.niri.dmabuf_pre_commit_hook.remove(surface) {
+            crate::utils::lifecycle_diag::note_dmabuf_hook_removed();
             remove_pre_commit_hook(surface, &hook);
         } else {
             error!("tried to remove dmabuf pre-commit hook but there was none");

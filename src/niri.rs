@@ -842,6 +842,66 @@ impl State {
         Ok(state)
     }
 
+    /// D1 diagnostics: log live retention counts at most once every 5 seconds.
+    ///
+    /// Gated on `NIRI_LIFECYCLE_DIAG`; production cost is two relaxed atomic
+    /// loads per call (disabled fast path), plus one monotonic timestamp read
+    /// per call while enabled.
+    pub fn maybe_log_vram_diag(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+        use std::time::Instant;
+
+        if !crate::utils::lifecycle_diag::is_enabled() {
+            return;
+        }
+
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static START: OnceLock<Instant> = OnceLock::new();
+        let now_ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        let last = LAST.load(Ordering::Relaxed);
+        if last == 0 {
+            // First call: record the baseline and skip the immediate log so the
+            // 5-second window starts now instead of logging on every frame
+            // during startup.
+            let _ = LAST.compare_exchange(
+                0,
+                now_ms.max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            return;
+        }
+        if now_ms.saturating_sub(last) < 5_000 {
+            return;
+        }
+        if LAST
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let (closing_entries, unmap_snapshot_tiles) = self.niri.layout.diag_live_counts();
+        let windows = self.niri.layout.windows().count();
+        let retained_blur_bytes =
+            crate::render_helpers::blur::retained_blur_bytes();
+        tracing::info!(
+            "vram-diag live: windows={} unmapped_windows={} root_surface={} thumbnail_epochs={} \
+             layer_surfaces={} closing_layers={} closing_entries={} unmap_snapshot_tiles={} \
+             retained_blur_mib={:.1}",
+            windows,
+            self.niri.unmapped_windows.len(),
+            self.niri.root_surface.len(),
+            self.niri.thumbnail_content_epochs.len(),
+            self.niri.mapped_layer_surfaces.len(),
+            self.niri.closing_layers.len(),
+            closing_entries,
+            unmap_snapshot_tiles,
+            retained_blur_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+
     pub fn refresh_and_flush_clients(&mut self) {
         let _span = tracy_client::span!("State::refresh_and_flush_clients");
 
@@ -852,6 +912,7 @@ impl State {
         // it's good to advance every now and then so the workspace clean-up and animations don't
         // build up (the 1 second frame callback timer will call this line).
         self.niri.advance_animations();
+        self.maybe_log_vram_diag();
 
         self.niri.redraw_queued_outputs(&mut self.backend);
 

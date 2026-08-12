@@ -275,6 +275,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
+    /// D1 diagnostics: (closing lane entries, tiles retaining an unmap snapshot).
+    pub fn diag_live_counts(&self) -> (usize, usize) {
+        (
+            self.closing.len(),
+            self.tiles.iter().filter(|tile| tile.has_unmap_snapshot()).count(),
+        )
+    }
+
     pub fn advance_animations(&mut self) {
         for tile in &mut self.tiles {
             tile.advance_animations();
